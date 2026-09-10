@@ -1,7 +1,64 @@
 from datetime import datetime, timedelta
+import json
 
 from obmanage.scheduler import Scheduler
 from obmanage.settings import AppSettings, SettingsStore
+
+
+def test_direction_switch_keeps_endpoints_and_clears_automatic_binding():
+    settings = configured()
+    local, portable = settings.local_path, settings.portable_path
+    settings.set_direction("to_local")
+    assert (settings.source, settings.target) == (portable, local)
+    assert (settings.local_path, settings.portable_path) == (local, portable)
+    assert not settings.schedule_enabled
+    assert not settings.bound_source and not settings.bound_target
+    settings.set_direction("to_portable")
+    assert (settings.source, settings.target) == (local, portable)
+
+
+def test_reverse_direction_settings_roundtrip(tmp_path):
+    settings = configured()
+    settings.set_direction("to_local")
+    store = SettingsStore(tmp_path)
+    store.save(settings)
+    restored = store.load()
+    assert restored.direction == "to_local"
+    assert restored.source == "H:\\mirror"
+    assert restored.local_path == "C:\\source"
+    assert restored.portable_path == "H:\\mirror"
+
+
+def test_legacy_reverse_settings_preserve_source_and_target(tmp_path):
+    store = SettingsStore(tmp_path)
+    raw = {"source": "H:\\移动仓库", "target": "C:\\本机仓库", "schedule_enabled": True,
+           "bound_source": "H:\\移动仓库", "bound_target": "C:\\本机仓库"}
+    store.path.write_text(json.dumps(raw), encoding="utf-8")
+    settings = store.load()
+    assert settings.direction == "to_local"
+    assert settings.source == raw["source"] and settings.target == raw["target"]
+    assert settings.local_path == raw["target"]
+    assert settings.portable_path == raw["source"]
+    assert not settings.schedule_enabled
+
+
+def test_legacy_forward_settings_preserve_paths_but_pause_old_timer(tmp_path):
+    store = SettingsStore(tmp_path)
+    raw = {"source": "C:\\工作库", "target": "H:\\副本", "schedule_enabled": True,
+           "bound_source": "C:\\工作库", "bound_target": "H:\\副本"}
+    store.path.write_text(json.dumps(raw), encoding="utf-8")
+    settings = store.load()
+    assert settings.direction == "to_portable"
+    assert (settings.source, settings.target) == (raw["source"], raw["target"])
+    assert not settings.schedule_enabled
+
+
+def test_edit_endpoint_while_reversed_keeps_source_role():
+    settings = configured()
+    settings.set_direction("to_local")
+    settings.set_endpoints("D:\\笔记本", "F:\\移动盘")
+    assert (settings.source, settings.target) == ("F:\\移动盘", "D:\\笔记本")
+    assert settings.direction == "to_local"
 
 
 def configured(**kwargs):

@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import json
+import ntpath
 import os
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
+
+DEFAULT_LOCAL = str(Path.home() / "Desktop" / "Obsidian仓库")
+DEFAULT_PORTABLE = "H:\\ObsidianVault\\Obsidian仓库"
+DIRECTIONS = ("to_portable", "to_local")
 
 
 def default_state_dir() -> Path:
@@ -13,8 +18,8 @@ def default_state_dir() -> Path:
 
 @dataclass
 class AppSettings:
-    source: str = str(Path.home() / "Desktop" / "Obsidian仓库")
-    target: str = "H:\\ObsidianVault\\Obsidian仓库"
+    source: str = DEFAULT_LOCAL
+    target: str = DEFAULT_PORTABLE
     recent_targets: list[str] = field(default_factory=list)
     schedule_enabled: bool = False
     schedule_mode: str = "interval"
@@ -22,6 +27,31 @@ class AppSettings:
     daily_time: str = "20:00"
     bound_source: str = ""
     bound_target: str = ""
+    direction: str = "to_portable"
+
+    @property
+    def local_path(self) -> str:
+        return self.source if self.direction == "to_portable" else self.target
+
+    @property
+    def portable_path(self) -> str:
+        return self.target if self.direction == "to_portable" else self.source
+
+    def set_endpoints(self, local_path: str, portable_path: str, direction: str | None = None) -> None:
+        selected = self.direction if direction is None else direction
+        if selected not in DIRECTIONS:
+            raise ValueError("同步方向无效")
+        previous = (self.source, self.target, self.direction)
+        self.direction = selected
+        self.source, self.target = ((local_path, portable_path) if selected == "to_portable"
+                                    else (portable_path, local_path))
+        if previous != (self.source, self.target, self.direction):
+            self.schedule_enabled = False
+            self.bound_source = ""
+            self.bound_target = ""
+
+    def set_direction(self, direction: str) -> None:
+        self.set_endpoints(self.local_path, self.portable_path, direction)
 
 
 class SettingsStore:
@@ -39,6 +69,21 @@ class SettingsStore:
             if not isinstance(raw, dict):
                 raise ValueError("设置内容必须为对象")
             known = {item.name for item in fields(AppSettings)}
+            if "direction" not in raw:
+                # Preserve the legacy effective source/target exactly. For the
+                # known H -> system-drive workflow, label the fixed endpoints
+                # correctly. Unknown custom pairs retain source-as-local.
+                source_drive = ntpath.splitdrive(str(raw.get("source", DEFAULT_LOCAL)))[0].casefold()
+                target_drive = ntpath.splitdrive(str(raw.get("target", DEFAULT_PORTABLE)))[0].casefold()
+                portable_drive = ntpath.splitdrive(DEFAULT_PORTABLE)[0].casefold()
+                local_drive = ntpath.splitdrive(DEFAULT_LOCAL)[0].casefold()
+                raw["direction"] = ("to_local" if source_drive == portable_drive and target_drive == local_drive
+                                     else "to_portable")
+                # Upgrade requires re-enabling an automatic direction in the
+                # new explicit UI; never replay a legacy timer silently.
+                raw["schedule_enabled"] = False
+                raw["bound_source"] = ""
+                raw["bound_target"] = ""
             settings = AppSettings(**{key: value for key, value in raw.items() if key in known})
             self._validate(settings)
             return settings
@@ -48,6 +93,8 @@ class SettingsStore:
 
     @staticmethod
     def _validate(settings: AppSettings) -> None:
+        if settings.direction not in DIRECTIONS:
+            raise ValueError("同步方向无效")
         for name in ("source", "target", "bound_source", "bound_target"):
             if not isinstance(getattr(settings, name), str):
                 raise ValueError(f"{name} 必须为路径文本")

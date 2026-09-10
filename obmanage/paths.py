@@ -132,6 +132,13 @@ def volume_identity(path: str) -> str:
     return f"{name.casefold()}:{serial.value:08x}:{filesystem.value}"
 
 
+def pair_identity(source: str, target: str, source_volume: str, target_volume: str) -> str:
+    """An ordered path/volume key, kept compatible with existing local records."""
+    return hashlib.sha256(json.dumps(
+        [os.path.normcase(source), os.path.normcase(target), source_volume, target_volume],
+        ensure_ascii=False).encode("utf-8")).hexdigest()
+
+
 def validate_roots(source: str, target: str) -> dict:
     if not source.strip() or not target.strip():
         raise SyncError("请选择源目录和目标目录。")
@@ -159,9 +166,9 @@ def validate_roots(source: str, target: str) -> dict:
         raise SyncError(f"源目录不存在或磁盘未连接：{source}")
     anchor = existing_anchor(target)
     src_volume, dst_volume = volume_identity(source), volume_identity(target)
-    pair_id = hashlib.sha256(json.dumps([src_key, dst_key, src_volume, dst_volume],
-                                       ensure_ascii=False).encode("utf-8")).hexdigest()
+    pair_id = pair_identity(source, target, src_volume, dst_volume)
     return {"source": source, "target": target, "pair_id": pair_id,
+            "reverse_pair_id": pair_identity(target, source, dst_volume, src_volume),
             "source_volume": src_volume, "target_volume": dst_volume,
             "source_root": src_state, "target_root": dst_state,
             "target_anchor": anchor, "target_anchor_state": snapshot(anchor)}

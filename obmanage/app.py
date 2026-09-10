@@ -11,6 +11,7 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
 from .settings import AppSettings, default_state_dir
+from . import __version__
 
 
 def setup_logging(state_dir: Path) -> None:
@@ -70,7 +71,7 @@ def main(argv: list[str] | None = None) -> int:
     logging.info("Creating QApplication")
     app = QApplication(sys.argv[:1])
     app.setApplicationName("ObManage")
-    app.setApplicationVersion("1.0.0")
+    app.setApplicationVersion(__version__)
     app.setOrganizationName("ObManage")
     app.setQuitOnLastWindowClosed(False)
     app.setFont(QFont("Microsoft YaHei UI", 10))

@@ -14,7 +14,7 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 
 from obmanage.models import SyncCancelled
 from obmanage.settings import SettingsStore
-from obmanage.ui import MainWindow
+from obmanage.ui import FILTERS, MainWindow
 
 
 @pytest.fixture(scope="module")
@@ -30,7 +30,7 @@ def pump_until(app, condition, timeout=12):
         app.processEvents()
         if condition():
             return
-        QTest.qWait(10)
+        time.sleep(0.01)
     assert condition(), "The UI operation did not complete within the test timeout"
 
 
@@ -72,8 +72,11 @@ def test_manual_preview_then_sync_and_repeat(application, window):
     assert widget.plan.can_execute
     assert widget.plan.counts["delete"] == 1
     assert widget.plan.counts["skip"] == 1
+    assert not widget.sync_button.isEnabled()
+    widget.confirm_direction_checkbox.setChecked(True)
     assert widget.sync_button.isEnabled()
-    widget.filter_tabs.setCurrentIndex(3)
+    widget.filter_tabs.setCurrentIndex(next(i for i, (_, actions) in enumerate(FILTERS)
+                                           if actions == {"delete", "rmdir"}))
     assert widget.table.model().rowCount() == 1
     widget.filter_tabs.setCurrentIndex(0)
     preview = Path(__file__).resolve().parents[1] / "artifacts" / "ui-preview-test.png"
@@ -143,6 +146,7 @@ def test_empty_source_manual_no_then_yes(application, window, monkeypatch):
     (target / "删除.md").write_text("old", encoding="utf-8")
     widget.analyze()
     pump_until(application, lambda: not widget.busy)
+    widget.confirm_direction_checkbox.setChecked(True)
     monkeypatch.setattr(QMessageBox, "warning", lambda *args, **kwargs: QMessageBox.StandardButton.No)
     monkeypatch.setattr(QMessageBox, "question", lambda *args, **kwargs: QMessageBox.StandardButton.No)
     widget.start_sync()

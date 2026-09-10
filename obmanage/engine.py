@@ -150,6 +150,11 @@ class SyncEngine:
             plan.source_empty = not source_entries
             store = BaselineStore(self.state_dir)
             baselines = store.records(plan.pair_id)
+            # Equality of two verified file versions is symmetric. Keep each
+            # direction's records separate, but reuse the opposite direction
+            # only when *both* exact snapshots still match after swapping. The
+            # reversed key includes the ordered canonical paths and volumes.
+            reverse_baselines = store.records(context["reverse_pair_id"]) if not deep else {}
             source_names = {_key(path) for path in source_entries}
             total = len(source_entries) + sum(_key(path) not in source_names for path in target_entries)
             for relative, src in sorted(source_entries.items()):
@@ -172,6 +177,10 @@ class SyncEngine:
                     item = PlanItem("add", relative, src["size"], "目标中不存在")
                 elif not deep and relative in baselines and baselines[relative][:2] == (src, dst):
                     item = PlanItem("skip", relative, src["size"], "两端与上次校验记录一致")
+                elif (not deep and target_name in reverse_baselines
+                      and reverse_baselines[target_name][:2] == (dst, src)):
+                    store.save(plan.pair_id, relative, src, dst, reverse_baselines[target_name][2])
+                    item = PlanItem("skip", relative, src["size"], "两端与反向同步的已校验记录一致")
                 elif src["size"] != dst["size"]:
                     item = PlanItem("update", relative, src["size"], "文件大小不同，以源端为准")
                 else:

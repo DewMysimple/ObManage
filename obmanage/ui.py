@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import ntpath
 import os
 import threading
 import time
@@ -40,6 +41,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QSpinBox,
     QStackedWidget,
@@ -78,6 +80,7 @@ ACTION_COLORS = {
     "error": "#AD5748",
 }
 FILTERS = (
+    ("待执行", {"add", "mkdir", "update", "rename", "delete", "rmdir", "error"}),
     ("全部", None),
     ("新增", {"add", "mkdir"}),
     ("更新", {"update", "rename"}),
@@ -85,6 +88,29 @@ FILTERS = (
     ("跳过", {"skip"}),
     ("异常", {"error"}),
 )
+
+
+def drive_label(path: str) -> str:
+    """Show the configured drive/share, including Windows paths in headless tests."""
+    if path.startswith("\\\\?\\UNC\\"):
+        path = "\\\\" + path[8:]
+    elif path.startswith("\\\\?\\"):
+        path = path[4:]
+    drive = ntpath.splitdrive(path)[0]
+    return drive.upper() if len(drive) == 2 and drive[1] == ":" else drive
+
+
+def endpoint_label(name: str, path: str) -> str:
+    drive = drive_label(path)
+    return f"{name}（{drive}）" if drive else name
+
+
+def absolute_item_path(root: str, relative: str) -> str:
+    if not root:
+        return relative
+    if ntpath.splitdrive(root)[0]:
+        return ntpath.normpath(ntpath.join(root, relative))
+    return os.path.abspath(os.path.join(root, relative))
 
 
 def format_bytes(value: int | float) -> str:
@@ -123,6 +149,33 @@ class PlanTableModel(QAbstractTableModel):
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self.items: list[PlanItem] = []
+        self.source_path = ""
+        self.target_path = ""
+        self.source_name = "来源仓库"
+        self.target_name = "目标仓库"
+
+    def set_context(self, source: str, target: str, source_name: str, target_name: str) -> None:
+        self.beginResetModel()
+        self.source_path, self.target_path = source, target
+        self.source_name, self.target_name = source_name, target_name
+        self.endResetModel()
+
+    def action_text(self, item: PlanItem) -> str:
+        if item.action in ("delete", "rmdir"):
+            return f"仅从{self.target_name}删除"
+        if item.action == "skip":
+            return "跳过 · 无需修改"
+        if item.action == "error":
+            return "无法处理"
+        verb = {"add": "新增", "mkdir": "新建文件夹", "update": "覆盖更新", "rename": "重命名"}.get(item.action, item.action)
+        return f"在{self.target_name}{verb}"
+
+    def reason_text(self, item: PlanItem) -> str:
+        if item.action in ("delete", "rmdir"):
+            return f"{self.source_name}来源里不存在；仅移除{self.target_name}中的这一项"
+        if item.action in ("add", "mkdir", "update"):
+            return f"使用{self.source_name}的内容：{absolute_item_path(self.source_path, item.relative_path)}"
+        return item.reason.replace("源端", f"{self.source_name}来源").replace("目标端", self.target_name).replace("源仓库", self.source_name)
 
     def set_items(self, items: list[PlanItem]) -> None:
         self.beginResetModel()
@@ -133,11 +186,11 @@ class PlanTableModel(QAbstractTableModel):
         return 0 if parent.isValid() else len(self.items)
 
     def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:
-        return 0 if parent.isValid() else 4
+        return 0 if parent.isValid() else 5
 
     def headerData(self, section: int, orientation: Qt.Orientation, role: int = Qt.ItemDataRole.DisplayRole) -> Any:
         if orientation == Qt.Orientation.Horizontal and role == Qt.ItemDataRole.DisplayRole:
-            return ("操作", "相对路径", "大小", "说明")[section]
+            return ("本次操作（仅目标）", "相对路径", "大小", "实际修改位置", "依据 / 来源")[section]
         return None
 
     def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole) -> Any:
@@ -147,15 +200,21 @@ class PlanTableModel(QAbstractTableModel):
         column = index.column()
         if role == Qt.ItemDataRole.DisplayRole:
             return (
-                ACTION_NAMES.get(item.action, item.action),
+                self.action_text(item),
                 item.relative_path,
                 "—" if item.action in ("mkdir", "rmdir") else format_bytes(item.size),
-                item.reason,
+                "—（不修改）" if item.action in ("skip", "error") else absolute_item_path(self.target_path, item.relative_path),
+                self.reason_text(item),
             )[column]
         if role == Qt.ItemDataRole.UserRole:
             return item.action
         if role == Qt.ItemDataRole.ToolTipRole:
-            return f"{item.relative_path}\n{item.reason}".strip()
+            return (
+                f"{self.action_text(item)}\n"
+                f"实际修改位置：{'无' if item.action in ('skip', 'error') else absolute_item_path(self.target_path, item.relative_path)}\n"
+                f"{self.reason_text(item)}\n"
+                f"{self.source_name}只读取，不覆盖或删除。"
+            )
         if role == Qt.ItemDataRole.ForegroundRole and column == 0:
             return QColor(ACTION_COLORS.get(item.action, "#273A46"))
         if role == Qt.ItemDataRole.TextAlignmentRole:
@@ -288,6 +347,9 @@ QLabel { background: transparent; }
 QLabel#Brand { font-size: 27px; font-weight: 700; letter-spacing: -0.5px; }
 QLabel#Subtitle, QLabel#Muted { color: #758189; font-size: 12px; }
 QLabel#SectionTitle { font-size: 14px; font-weight: 600; }
+QLabel#Direction { font-size: 16px; font-weight: 600; color: #315F7B; }
+QLabel#SourceSafety { color: #27735B; background: #F0F7F3; border-radius: 6px; padding: 8px 11px; }
+QLabel#TargetEffect { color: #845B35; background: #FBF5ED; border-radius: 6px; padding: 8px 11px; }
 QLabel#Badge { background: #E5EBED; color: #48626F; border-radius: 12px; padding: 7px 12px; font-size: 12px; }
 QFrame#Panel, QFrame#Stat { background: #FFFFFF; border: 1px solid #DFE5E5; border-radius: 12px; }
 QLabel#StatLabel { color: #6A7980; font-size: 12px; }
@@ -304,6 +366,9 @@ QPushButton { background: #FFFFFF; border: 1px solid #D9E1E3; border-radius: 7px
 QPushButton:hover { background: #F1F5F6; border-color: #ADC0C9; }
 QPushButton:pressed { background: #E6EDF0; }
 QPushButton:disabled { color: #A2AAAD; background: #F1F3F3; border-color: #E3E7E7; }
+QPushButton#DirectionChoice { min-height: 48px; font-size: 13px; }
+QPushButton#DirectionChoice:checked { background: #EAF2F6; color: #254E68; border: 2px solid #60859B; font-weight: 600; }
+QPushButton#DirectionChoice:disabled { color: #8296A0; border-color: #D4DEE3; }
 QPushButton#Primary { background: #315F7B; color: #FFFFFF; border: 1px solid #315F7B; font-weight: 600; padding: 1px 24px; }
 QPushButton#Primary:hover { background: #264F69; border-color: #264F69; }
 QPushButton#Primary:pressed { background: #203F55; }
@@ -373,12 +438,13 @@ class MainWindow(QMainWindow):
         self.setWindowTitle("ObManage · 仓库镜像")
         self.setObjectName("main_window")
         self.setWindowIcon(app_icon())
-        self.resize(1140, 890)
-        self.setMinimumSize(980, 800)
+        self.resize(1140, 920)
+        self.setMinimumSize(980, 620)
         self.setStyleSheet(STYLE)
         self._build_ui()
         self._build_tray()
         self._connect_signals()
+        self._refresh_direction_text()
         self.scheduler.configure(self.settings)
         self._refresh_schedule_controls()
         self._refresh_actions()
@@ -401,9 +467,19 @@ class MainWindow(QMainWindow):
     def _build_ui(self) -> None:
         central = QWidget(self)
         self.setCentralWidget(central)
-        layout = QVBoxLayout(central)
-        layout.setContentsMargins(28, 22, 28, 22)
-        layout.setSpacing(16)
+        outer = QVBoxLayout(central)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        self.content_scroll = QScrollArea()
+        self.content_scroll.setWidgetResizable(True)
+        self.content_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.content_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        content = QWidget()
+        self.content_scroll.setWidget(content)
+        outer.addWidget(self.content_scroll, 1)
+        layout = QVBoxLayout(content)
+        layout.setContentsMargins(24, 14, 24, 8)
+        layout.setSpacing(8)
 
         header = QHBoxLayout()
         mark = QLabel()
@@ -415,12 +491,12 @@ class MainWindow(QMainWindow):
         brand = QLabel("ObManage")
         brand.setObjectName("Brand")
         heading.addWidget(brand)
-        subtitle = QLabel("仓库镜像，让每一处改动都有一致的副本。")
+        subtitle = QLabel("在本机与移动硬盘之间，按选定方向同步完整仓库。")
         subtitle.setObjectName("Subtitle")
         heading.addWidget(subtitle)
         header.addLayout(heading)
         header.addStretch()
-        badge = QLabel("单向镜像  /  增量同步")
+        badge = QLabel("选定方向  /  增量镜像")
         badge.setObjectName("Badge")
         header.addWidget(badge, 0, Qt.AlignmentFlag.AlignVCenter)
         layout.addLayout(header)
@@ -428,26 +504,38 @@ class MainWindow(QMainWindow):
         paths = QFrame()
         paths.setObjectName("Panel")
         paths_layout = QVBoxLayout(paths)
-        paths_layout.setContentsMargins(18, 14, 18, 14)
-        paths_layout.setSpacing(10)
+        paths_layout.setContentsMargins(16, 12, 16, 12)
+        paths_layout.setSpacing(8)
         paths_header = QHBoxLayout()
-        paths_title = QLabel("同步位置")
+        paths_title = QLabel("1  选择本次同步方向")
         paths_title.setObjectName("SectionTitle")
         paths_header.addWidget(paths_title)
         paths_header.addStretch()
-        direction = QLabel("源仓库  →  目标镜像")
-        direction.setObjectName("Muted")
-        paths_header.addWidget(direction)
+        fixed_hint = QLabel("两个仓库的位置固定，切换方向即可带走或带回")
+        fixed_hint.setObjectName("Muted")
+        paths_header.addWidget(fixed_hint)
         paths_layout.addLayout(paths_header)
+
+        direction_row = QHBoxLayout()
+        self.direction_to_local_button = QPushButton("带回本机\n移动硬盘 → 本机")
+        self.direction_to_portable_button = QPushButton("带走到移动硬盘\n本机 → 移动硬盘")
+        for button in (self.direction_to_local_button, self.direction_to_portable_button):
+            button.setObjectName("DirectionChoice")
+            button.setCheckable(True)
+            direction_row.addWidget(button, 1)
+        self.direction_to_local_button.setToolTip("笔记本工作完成后，以移动硬盘仓库为准，更新当前电脑的仓库。")
+        self.direction_to_portable_button.setToolTip("当前电脑工作完成后，以本机仓库为准，更新移动硬盘，随后带到另一台电脑。")
+        paths_layout.addLayout(direction_row)
 
         source_row = QHBoxLayout()
         source_row.setSpacing(10)
-        source_label = QLabel("源仓库")
-        source_label.setFixedWidth(64)
+        source_label = QLabel("本机仓库")
+        source_label.setFixedWidth(90)
         source_row.addWidget(source_label)
-        self.source_edit = QLineEdit(self.settings.source)
-        self.source_edit.setObjectName("source_edit")
-        self.source_edit.setPlaceholderText("选择包含完整 Obsidian 仓库的文件夹")
+        self.local_edit = QLineEdit(self.settings.local_path)
+        self.source_edit = self.local_edit
+        self.source_edit.setObjectName("local_edit")
+        self.source_edit.setPlaceholderText("当前电脑（主机或笔记本）的 Obsidian 仓库")
         self.source_edit.setClearButtonEnabled(True)
         source_label.setBuddy(self.source_edit)
         source_row.addWidget(self.source_edit, 1)
@@ -458,25 +546,44 @@ class MainWindow(QMainWindow):
 
         target_row = QHBoxLayout()
         target_row.setSpacing(10)
-        target_label = QLabel("目标镜像")
-        target_label.setFixedWidth(64)
+        target_label = QLabel("移动硬盘仓库")
+        target_label.setFixedWidth(90)
         target_row.addWidget(target_label)
-        self.target_combo = DropDownCombo()
-        self.target_combo.setObjectName("target_combo")
+        self.portable_combo = DropDownCombo()
+        self.target_combo = self.portable_combo
+        self.target_combo.setObjectName("portable_combo")
         self.target_combo.setEditable(True)
         self.target_combo.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         self.target_combo.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
         self.target_combo.setMinimumContentsLength(10)
-        self.target_combo.addItems(list(dict.fromkeys([self.settings.target, *self.settings.recent_targets])))
-        self.target_combo.setCurrentText(self.settings.target)
-        self.target_combo.lineEdit().setPlaceholderText("所选文件夹就是镜像根目录，不会额外嵌套一层")
+        self.target_combo.addItems(list(dict.fromkeys([self.settings.portable_path, *self.settings.recent_targets])))
+        self.target_combo.setCurrentText(self.settings.portable_path)
+        self.target_combo.lineEdit().setPlaceholderText("移动硬盘上的仓库根目录，可选择任意盘符")
         target_label.setBuddy(self.target_combo)
         target_row.addWidget(self.target_combo, 1)
         self.target_browse = QPushButton("选择文件夹")
         self.target_browse.setObjectName("target_browse")
         target_row.addWidget(self.target_browse)
         paths_layout.addLayout(target_row)
-        self.path_hint = QLabel("包含隐藏文件和 .obsidian 配置；源端删除的内容，也会从目标移除。")
+        self.direction_label = QLabel()
+        self.direction_label.setObjectName("Direction")
+        self.direction_label.setWordWrap(True)
+        paths_layout.addWidget(self.direction_label)
+        self.source_safety_label = QLabel()
+        self.source_safety_label.setObjectName("SourceSafety")
+        self.target_effect_label = QLabel()
+        self.target_effect_label.setObjectName("TargetEffect")
+        safety_row = QHBoxLayout()
+        safety_row.setSpacing(8)
+        for label in (self.source_safety_label, self.target_effect_label):
+            label.setTextFormat(Qt.TextFormat.PlainText)
+            label.setWordWrap(True)
+            label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            label.setMinimumWidth(0)
+            label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+            safety_row.addWidget(label, 1)
+        paths_layout.addLayout(safety_row)
+        self.path_hint = QLabel("先选方向，再分析差异；所有删除与覆盖只发生在本次接收更新的仓库。")
         self.path_hint.setObjectName("Muted")
         self.path_hint.setWordWrap(True)
         paths_layout.addWidget(self.path_hint)
@@ -486,6 +593,7 @@ class MainWindow(QMainWindow):
         stats.setSpacing(12)
         self.stat_values: dict[str, QLabel] = {}
         self.stat_details: dict[str, QLabel] = {}
+        self.stat_titles: dict[str, QLabel] = {}
         for action, title, color in (
             ("add", "新增", "#27735B"),
             ("update", "更新", "#326B94"),
@@ -495,11 +603,12 @@ class MainWindow(QMainWindow):
             tile = QFrame()
             tile.setObjectName("Stat")
             tile_layout = QVBoxLayout(tile)
-            tile_layout.setContentsMargins(16, 10, 16, 10)
-            tile_layout.setSpacing(3)
+            tile_layout.setContentsMargins(14, 8, 14, 8)
+            tile_layout.setSpacing(2)
             top = QHBoxLayout()
             label = QLabel(title)
             label.setObjectName("StatLabel")
+            self.stat_titles[action] = label
             top.addWidget(label)
             top.addStretch()
             dot = QLabel("●")
@@ -524,9 +633,9 @@ class MainWindow(QMainWindow):
         preview_layout.setSpacing(0)
         preview_header = QHBoxLayout()
         preview_header.setContentsMargins(18, 13, 18, 4)
-        preview_title = QLabel("差异预览")
-        preview_title.setObjectName("SectionTitle")
-        preview_header.addWidget(preview_title)
+        self.preview_title = QLabel()
+        self.preview_title.setObjectName("SectionTitle")
+        preview_header.addWidget(self.preview_title)
         preview_header.addStretch()
         self.copy_summary = QLabel("待复制  —")
         self.copy_summary.setObjectName("Muted")
@@ -544,7 +653,8 @@ class MainWindow(QMainWindow):
         tabs_row.addStretch()
         preview_layout.addLayout(tabs_row)
         self.preview_stack = QStackedWidget()
-        self.preview_stack.setMinimumHeight(170)
+        self.preview_stack.setMinimumHeight(145)
+        self.preview_stack.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Ignored)
         empty_page = QWidget()
         empty_layout = QVBoxLayout(empty_page)
         empty_layout.setContentsMargins(20, 18, 20, 18)
@@ -578,9 +688,15 @@ class MainWindow(QMainWindow):
         self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
         self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
         self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
-        self.table.setColumnWidth(0, 108)
-        self.table.setColumnWidth(2, 100)
-        self.table.setColumnWidth(3, 250)
+        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive)
+        self.table.setColumnWidth(0, 210)
+        self.table.setColumnWidth(2, 80)
+        self.table.setColumnWidth(3, 300)
+        self.table.setColumnWidth(4, 300)
+        self.table.horizontalHeader().setMinimumSectionSize(140)
+        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+        self.table.setColumnWidth(1, 240)
+        self.table.horizontalHeader().setMinimumSectionSize(65)
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._table_context_menu)
         self.preview_stack.addWidget(self.table)
@@ -592,10 +708,10 @@ class MainWindow(QMainWindow):
         schedule_layout = QHBoxLayout(schedule_panel)
         schedule_layout.setContentsMargins(16, 10, 16, 10)
         schedule_layout.setSpacing(10)
-        self.schedule_toggle = QCheckBox("定时同步")
+        self.schedule_toggle = QCheckBox("定时按此方向同步（含删除）")
         self.schedule_toggle.setObjectName("schedule_toggle")
         self.schedule_toggle.setChecked(self.settings.schedule_enabled)
-        self.schedule_toggle.setToolTip("启用后自动分析并同步当前路径，关闭窗口后继续在托盘运行。")
+        self.schedule_toggle.setToolTip("勾选即按上方方向自动更新目标，包括删除。切换方向或仓库会暂停定时，需重新勾选。")
         schedule_layout.addWidget(self.schedule_toggle)
         self.schedule_mode = DropDownCombo()
         self.schedule_mode.setObjectName("schedule_mode")
@@ -648,8 +764,16 @@ class MainWindow(QMainWindow):
         self.current_file.setMinimumWidth(0)
         self.current_file.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         progress_layout.addWidget(self.current_file)
-        layout.addLayout(progress_layout)
 
+        footer = QWidget()
+        footer_layout = QVBoxLayout(footer)
+        footer_layout.setContentsMargins(24, 8, 24, 12)
+        footer_layout.setSpacing(8)
+        footer_layout.addLayout(progress_layout)
+        self.confirm_direction_checkbox = QCheckBox()
+        self.confirm_direction_checkbox.setObjectName("confirm_direction_checkbox")
+        self.confirm_direction_checkbox.setEnabled(False)
+        footer_layout.addWidget(self.confirm_direction_checkbox)
         actions = QHBoxLayout()
         actions.setSpacing(10)
         self.logs_button = QPushButton("查看日志")
@@ -670,7 +794,8 @@ class MainWindow(QMainWindow):
         self.sync_button = QPushButton("开始同步")
         self.sync_button.setObjectName("Primary")
         actions.addWidget(self.sync_button)
-        layout.addLayout(actions)
+        footer_layout.addLayout(actions)
+        outer.addWidget(footer)
 
     def _build_tray(self) -> None:
         self.tray = QSystemTrayIcon(self.windowIcon(), self)
@@ -696,6 +821,9 @@ class MainWindow(QMainWindow):
             self.tray.show()
 
     def _connect_signals(self) -> None:
+        self.direction_to_local_button.clicked.connect(lambda: self.set_direction("to_local"))
+        self.direction_to_portable_button.clicked.connect(lambda: self.set_direction("to_portable"))
+        self.confirm_direction_checkbox.toggled.connect(self._refresh_actions)
         self.source_browse.clicked.connect(lambda: self._browse(True))
         self.target_browse.clicked.connect(lambda: self._browse(False))
         self.source_edit.textChanged.connect(self._paths_changed)
@@ -712,7 +840,64 @@ class MainWindow(QMainWindow):
         self.daily_time.timeChanged.connect(self._schedule_changed)
 
     def _paths(self) -> tuple[str, str]:
-        return self.source_edit.text().strip(), self.target_combo.currentText().strip()
+        local, portable = self.local_edit.text().strip(), self.portable_combo.currentText().strip()
+        return (portable, local) if self.settings.direction == "to_local" else (local, portable)
+
+    def _endpoint_names(self) -> tuple[str, str]:
+        local = endpoint_label("本机", self.local_edit.text().strip())
+        portable = endpoint_label("移动硬盘", self.portable_combo.currentText().strip())
+        return (portable, local) if self.settings.direction == "to_local" else (local, portable)
+
+    def _refresh_direction_text(self) -> None:
+        source, target = self._paths()
+        source_name, target_name = self._endpoint_names()
+        to_local = self.settings.direction == "to_local"
+        self.direction_to_local_button.setChecked(to_local)
+        self.direction_to_portable_button.setChecked(not to_local)
+        self.direction_label.setText(f"本次方向：{source_name}  →  {target_name}")
+        self.source_safety_label.setText(
+            f"本次以此为准 · {source_name} · 只读取，不覆盖或删除\n{source or '请选择仓库位置'}"
+        )
+        self.target_effect_label.setText(
+            f"本次仅修改这里 · {target_name} · 新增、覆盖与删除均在此处\n{target or '请选择仓库位置'}"
+        )
+        self.preview_title.setText(f"2  将在 {target_name} 进行的操作")
+        for action, verb in (("add", "新增到"), ("update", "更新"), ("delete", "仅从此处删除：")):
+            self.stat_titles[action].setText(f"{verb}{target_name}")
+        self.stat_titles["skip"].setText("未变化 · 跳过复制")
+        self.confirm_direction_checkbox.setText(
+            f"我已确认：以{source_name}为准，仅更新{target_name}，包括预览中的删除"
+        )
+        self.confirm_direction_checkbox.setToolTip(
+            f"只读取：{source}\n仅修改：{target}\n每次重新分析或切换方向后，需要重新确认本次预览。"
+        )
+        self.sync_button.setText(f"更新{target_name}")
+        self.sync_button.setToolTip(f"仅修改 {target}；{source} 只读取，不覆盖或删除。")
+        self.table_model.set_context(source, target, source_name, target_name)
+        if hasattr(self, "tray_sync_action"):
+            self.tray_sync_action.setText(f"分析{source_name} → {target_name}…")
+
+    def set_direction(self, direction: str) -> None:
+        if direction not in ("to_local", "to_portable"):
+            raise ValueError("同步方向无效")
+        if self.busy or self._confirming_empty or self._exit_requested:
+            self._refresh_direction_text()
+            return
+        if direction == self.settings.direction:
+            self._refresh_direction_text()
+            return
+        self.settings.set_endpoints(self.local_edit.text().strip(), self.portable_combo.currentText().strip())
+        self.settings.set_direction(direction)
+        self._invalidate_plan()
+        self.pause_schedule()
+        self._refresh_direction_text()
+        source_name, target_name = self._endpoint_names()
+        self.path_hint.setText("方向已切换，旧预览与确认已清除，定时已暂停。请重新分析差异。")
+        self.current_file.setText(f"{source_name}只读取；新增、更新与删除仅发生在{target_name}。")
+        self._set_status(f"已切换为 {source_name} → {target_name}，请重新分析。")
+        self._log(f"已切换方向：{source_name} {self._paths()[0]} → {target_name} {self._paths()[1]}；定时已暂停。")
+        self._refresh_actions()
+        self._persist()
 
     @staticmethod
     def _normalized_path(path: str) -> str:
@@ -720,7 +905,7 @@ class MainWindow(QMainWindow):
             path = "\\\\" + path[8:]
         elif path.startswith("\\\\?\\"):
             path = path[4:]
-        return os.path.normcase(os.path.abspath(os.path.expanduser(path)))
+        return os.path.normcase(os.path.realpath(os.path.expanduser(path)))
 
     def _plan_matches_paths(self) -> bool:
         if self.plan is None:
@@ -732,12 +917,12 @@ class MainWindow(QMainWindow):
         )
 
     def _browse(self, source: bool) -> None:
-        if self.busy:
+        if self.busy or self._confirming_empty or self._exit_requested:
             return
         current = self.source_edit.text() if source else self.target_combo.currentText()
         chosen = QFileDialog.getExistingDirectory(
             self,
-            "选择源仓库" if source else "选择目标镜像根目录",
+            "选择本机仓库（主机或笔记本）" if source else "选择移动硬盘上的仓库根目录",
             current,
         )
         if chosen:
@@ -751,12 +936,13 @@ class MainWindow(QMainWindow):
         # Programmatic path changes are subject to the same invalidation as typing.
         self._invalidate_plan()
         was_enabled = self.schedule_toggle.isChecked()
-        if was_enabled:
-            self.pause_schedule()
+        self.settings.set_endpoints(self.local_edit.text().strip(), self.portable_combo.currentText().strip())
+        self.pause_schedule()
+        self._refresh_direction_text()
         self.path_hint.setText(
             "同步位置已变更，定时已暂停。请重新分析差异；重新开启定时后绑定当前位置。"
             if was_enabled
-            else "同步位置已变更，请重新分析差异。所选目标文件夹就是镜像根目录。"
+            else "仓库位置已变更，请重新分析差异。上方方向决定本次以哪一端为准。"
         )
         if not self.busy:
             self._set_status("路径已变更，旧预览已清除。")
@@ -765,31 +951,36 @@ class MainWindow(QMainWindow):
 
     def _invalidate_plan(self) -> None:
         self.plan = None
+        self.confirm_direction_checkbox.setChecked(False)
         self.table_model.set_items([])
         self.preview_stack.setCurrentIndex(0)
         self.empty_title.setText("先看清变化，再开始同步")
-        self.empty_detail.setText("选择同步位置后，点击「分析差异」查看文件变化。")
+        self.empty_detail.setText("确认上方方向后，点击「分析差异」。分析只读取两个仓库，不修改文件。")
         self.copy_summary.setText("待复制  —")
         for action in self.stat_values:
             self.stat_values[action].setText("—")
             self.stat_details[action].setText("等待分析")
         for index, (name, _) in enumerate(FILTERS):
             self.filter_tabs.setTabText(index, name)
+        self.filter_tabs.setCurrentIndex(0)
+        self._change_filter(0)
+
+        self._refresh_direction_text()
 
     def _persist(self, remember_target: bool = False) -> None:
         source, target = self._paths()
-        self.settings.source = source
-        self.settings.target = target
+        self.settings.set_endpoints(self.local_edit.text().strip(), self.portable_combo.currentText().strip())
         self.settings.schedule_enabled = self.schedule_toggle.isChecked()
         self.settings.schedule_mode = self.schedule_mode.currentData()
         self.settings.interval_minutes = self.interval_spin.value()
         self.settings.daily_time = self.daily_time.time().toString("HH:mm")
         if remember_target and target:
-            self.settings.recent_targets = list(dict.fromkeys([target, *self.settings.recent_targets]))[:10]
+            portable = self.portable_combo.currentText().strip()
+            self.settings.recent_targets = list(dict.fromkeys([portable, *self.settings.recent_targets]))[:10]
             blocker = QSignalBlocker(self.target_combo)
             self.target_combo.clear()
             self.target_combo.addItems(self.settings.recent_targets)
-            self.target_combo.setCurrentText(target)
+            self.target_combo.setCurrentText(portable)
             del blocker
         try:
             self.store.save(self.settings)
@@ -799,13 +990,14 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _schedule_changed(self, *_: Any) -> None:
+        self.settings.set_endpoints(self.local_edit.text().strip(), self.portable_combo.currentText().strip())
         if self.schedule_toggle.isChecked():
             source, target = self._paths()
             if not source or not target:
                 blocker = QSignalBlocker(self.schedule_toggle)
                 self.schedule_toggle.setChecked(False)
                 del blocker
-                self._set_status("请先填写源仓库和目标镜像路径。", "warning")
+                self._set_status("请先填写本机仓库和移动硬盘仓库的位置。", "warning")
             else:
                 self.settings.bound_source = source
                 self.settings.bound_target = target
@@ -814,8 +1006,9 @@ class MainWindow(QMainWindow):
         self._refresh_schedule_controls()
         self._refresh_actions()
         if self.settings.schedule_enabled:
-            self.path_hint.setText("定时已绑定当前源仓库和目标；到点自动同步，包括删除。关闭窗口后继续在托盘运行。")
-            self._log(f"已启用定时同步：{self.settings.source} → {self.settings.target}")
+            source_name, target_name = self._endpoint_names()
+            self.path_hint.setText(f"定时已绑定 {source_name} → {target_name}，仅自动更新{target_name}（含删除）；切换方向后自动暂停。")
+            self._log(f"已启用定时同步：只读取 {source_name} {self.settings.source} → 仅更新 {target_name} {self.settings.target}（含删除）")
 
     @Slot()
     def pause_schedule(self) -> None:
@@ -824,13 +1017,15 @@ class MainWindow(QMainWindow):
         self.schedule_toggle.setChecked(False)
         del blocker
         self.settings.schedule_enabled = False
+        self.settings.bound_source = ""
+        self.settings.bound_target = ""
         self.scheduler.pause()
         self._persist()
         self._refresh_schedule_controls()
         self._refresh_actions()
         if was_enabled:
             self._log("定时同步已暂停。")
-            self.path_hint.setText("定时已暂停。手动同步前请分析差异，源端删除会同步删除目标。")
+            self.path_hint.setText("定时已暂停。请按上方方向分析差异，所有修改与删除仅发生在接收更新的仓库。")
 
     def _refresh_schedule_controls(self) -> None:
         interval = self.schedule_mode.currentData() == "interval"
@@ -867,6 +1062,8 @@ class MainWindow(QMainWindow):
     def _refresh_actions(self) -> None:
         available = not self.busy and not self._confirming_empty and not self._exit_requested
         for control in (
+            self.direction_to_local_button,
+            self.direction_to_portable_button,
             self.source_edit,
             self.source_browse,
             self.target_combo,
@@ -885,6 +1082,10 @@ class MainWindow(QMainWindow):
             and self._plan_matches_paths()
             and self.plan.can_execute
             and self.plan.has_changes
+            and self.confirm_direction_checkbox.isChecked()
+        )
+        self.confirm_direction_checkbox.setEnabled(
+            available and self._plan_matches_paths() and self.plan.can_execute and self.plan.has_changes
         )
         self.cancel_button.setVisible(self.busy)
         self.cancel_button.setEnabled(self.busy and not self._cancel_event.is_set() and not self._exit_requested)
@@ -895,7 +1096,7 @@ class MainWindow(QMainWindow):
             return
         source, target = self._paths()
         if not source or not target:
-            self._set_status("请先填写源仓库和目标镜像路径。", "warning")
+            self._set_status("请先填写本机仓库和移动硬盘仓库的位置。", "warning")
             return
         self._invalidate_plan()
         self.last_result = None
@@ -906,8 +1107,9 @@ class MainWindow(QMainWindow):
             if deep
             else "已有副本首次需要比较内容；完成的校验记录会保留，可随时取消。"
         )
-        self._set_status("正在完整校验内容…" if deep else "正在分析差异…", "busy")
-        self._log(f"{'定时' if scheduled else '手动'}{'完整内容校验' if deep else '分析差异'}：{source} → {target}")
+        source_name, target_name = self._endpoint_names()
+        self._set_status(f"正在{'完整校验内容' if deep else '分析差异'}：{source_name} → {target_name}（分析不修改文件）", "busy")
+        self._log(f"{'定时' if scheduled else '手动'}{'完整内容校验' if deep else '分析差异'}：以 {source_name} {source} 为准 → 仅修改 {target_name} {target}；分析阶段不修改仓库。")
         self._start_worker("analyze", deep=deep, scheduled=scheduled)
 
     @Slot()
@@ -920,17 +1122,21 @@ class MainWindow(QMainWindow):
         if not self.plan.has_changes:
             self._set_status("两端已经一致，无需复制。", "success")
             return
+        if not self.confirm_direction_checkbox.isChecked():
+            self._set_status("请先核对上方方向与预览，再勾选本次方向确认。", "warning")
+            return
         allow_empty = False
         if self._would_empty_target(self.plan):
-            # This is the only destructive confirmation; ordinary mirror deletion is
-            # already explicitly represented by the preview and the Start action.
+            # An empty source is additional to the ordinary per-preview direction
+            # acknowledgement because this would empty the entire destination.
+            source_name, target_name = self._endpoint_names()
             self._confirming_empty = True
             self._refresh_actions()
             try:
                 answer = QMessageBox.warning(
                     self,
-                    "源仓库为空",
-                    f"源仓库目前为空。本次同步将清空下方目标文件夹中的内容：\n\n{self.plan.target}\n\n确认源仓库应当为空，并继续清空目标吗？",
+                    f"{source_name}来源仓库为空",
+                    f"本次以 {source_name} 为准，但它目前为空：\n{self.plan.source}\n\n继续将清空 {target_name} 中的内容：\n{self.plan.target}\n\n{source_name}只读取，不覆盖或删除。确认清空 {target_name} 吗？",
                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
                     QMessageBox.StandardButton.Cancel,
                 )
@@ -938,7 +1144,7 @@ class MainWindow(QMainWindow):
                 self._confirming_empty = False
                 self._refresh_actions()
             if answer != QMessageBox.StandardButton.Yes:
-                self._set_status("已保留目标内容；确认源仓库后可重新分析。")
+                self._set_status(f"已保留{target_name}内容；确认{source_name}来源仓库后可重新分析。")
                 return
             if self._exit_requested or not self.plan or not self._plan_matches_paths():
                 return
@@ -950,8 +1156,12 @@ class MainWindow(QMainWindow):
         return plan.source_empty and any(item.action in ("delete", "rmdir") for item in plan.items)
 
     def _execute_plan(self, allow_empty: bool = False, scheduled: bool = False) -> None:
-        self._set_status("正在同步，完成新增与更新后再清理多余内容…", "busy")
-        self._log(f"开始同步：预计复制 {format_bytes(self.plan.bytes_to_copy)}。")
+        source_name, target_name = self._endpoint_names()
+        self._set_status(f"正在更新{target_name}，完成新增与更新后再删除此处多余内容；{source_name}只读取。", "busy")
+        self._log(
+            f"开始同步：以 {source_name} {self.plan.source} 为准，仅更新 {target_name} {self.plan.target}，"
+            f"包括删除；{source_name}不覆盖或删除。预计复制 {format_bytes(self.plan.bytes_to_copy)}。"
+        )
         self._start_worker("execute", scheduled=scheduled, allow_empty=allow_empty)
 
     def _start_worker(
@@ -1036,15 +1246,19 @@ class MainWindow(QMainWindow):
 
     def _accept_plan(self, plan: SyncPlan, scheduled: bool) -> None:
         self.plan = plan
+        self.confirm_direction_checkbox.setChecked(False)
         if not self._plan_matches_paths():
             self._invalidate_plan()
             self._set_status("分析期间路径发生变化，请重新分析差异。", "warning")
             return
+        source_name, target_name = self._endpoint_names()
+        self.table_model.set_context(plan.source, plan.target, source_name, target_name)
         self.table_model.set_items(plan.items)
         self._update_counts(plan)
-        self._change_filter(self.filter_tabs.currentIndex())
+        self.filter_tabs.setCurrentIndex(0)
+        self._change_filter(0)
         self.progress_bar.setValue(1000)
-        self.current_file.setText(f"分析完成于 {datetime.now():%H:%M:%S} · 执行前会再次检查路径与文件状态。")
+        self.current_file.setText(f"分析完成于 {datetime.now():%H:%M:%S} · 尚未修改仓库；预览中的删除仅发生在{target_name}。")
         self.current_file.setToolTip("")
         if not plan.can_execute:
             errors = plan.errors or [item.reason for item in plan.items if item.action == "error"]
@@ -1059,29 +1273,31 @@ class MainWindow(QMainWindow):
             return
         counts = plan.counts
         self._log(
-            f"分析完成：新增 {counts['add']} 文件 / {counts['mkdir']} 文件夹，"
+            f"分析完成：以下操作仅发生在 {target_name} {plan.target}；新增 {counts['add']} 文件 / {counts['mkdir']} 文件夹，"
             f"更新 {counts['update']}，重命名 {counts.get('rename', 0)}，删除 {counts['delete']} 文件 / {counts['rmdir']} 文件夹，"
             f"跳过 {counts['skip']}，待复制 {format_bytes(plan.bytes_to_copy)}。"
         )
         if not plan.has_changes:
-            self._set_status("两端已经一致，本轮复制 0 字节。", "success")
+            self._set_status(f"{target_name}与{source_name}已经一致，本轮复制 0 字节。", "success")
             self.empty_title.setText("两端已经一致")
             self.empty_detail.setText("没有需要同步的变化。")
             return
         if scheduled and self._would_empty_target(plan):
             self.pause_schedule()
-            self._set_status("源仓库为空，定时已暂停。请打开窗口检查预览并手动确认。", "warning")
-            self._log("源仓库为空，本轮未清空目标。需要手动确认后同步。")
-            self._notify("需要确认：源仓库为空", "定时已暂停，目标内容已保留。请检查源仓库后手动同步。", warning=True)
+            self._set_status(f"{source_name}来源仓库为空，定时已暂停。请检查预览并手动确认。", "warning")
+            self._log(f"{source_name}来源仓库为空，本轮未清空{target_name}。需要手动确认后同步。")
+            self._notify(f"需要确认：{source_name}来源仓库为空", f"定时已暂停，{target_name}内容已保留。请检查来源仓库后手动同步。", warning=True)
             return
         if scheduled:
             # The user enabled automatic mirroring for this exact pair of paths.
             self._execute_plan(scheduled=True)
             return
-        self._set_status("预览已就绪。点击「开始同步」应用以上变化，包括删除。", "success")
+        self._set_status(f"预览已就绪。核对并勾选方向确认后，可更新{target_name}；{source_name}只读取。", "success")
+        self._refresh_actions()
 
     def _update_counts(self, plan: SyncPlan) -> None:
         counts = plan.counts
+        source_name, target_name = self._endpoint_names()
         self.stat_values["add"].setText(f"{counts['add'] + counts['mkdir']:,}")
         self.stat_values["update"].setText(f"{counts['update'] + counts.get('rename', 0):,}")
         self.stat_values["delete"].setText(f"{counts['delete'] + counts['rmdir']:,}")
@@ -1089,7 +1305,7 @@ class MainWindow(QMainWindow):
         self.stat_details["add"].setText(f"{counts['add']:,} 文件 · {counts['mkdir']:,} 文件夹")
         self.stat_details["update"].setText(
             f"{counts['update']:,} 内容更新 · {counts['rename']:,} 重命名"
-            if counts.get("rename") else "以源仓库的内容覆盖"
+            if counts.get("rename") else f"使用{source_name}的内容"
         )
         self.stat_details["delete"].setText(f"{counts['delete']:,} 文件 · {counts['rmdir']:,} 文件夹")
         self.stat_details["skip"].setText("内容未变化，无需复制")
@@ -1101,8 +1317,10 @@ class MainWindow(QMainWindow):
     def _accept_result(self, result: SyncResult) -> None:
         self.last_result = result
         self.plan = None  # A result never leaves an executable stale preview behind.
+        self.confirm_direction_checkbox.setChecked(False)
+        source_name, target_name = self._endpoint_names()
         summary = (
-            f"复制 {result.copied_files:,} 个文件（{format_bytes(result.copied_bytes)}），"
+            f"{target_name}：复制 {result.copied_files:,} 个文件（{format_bytes(result.copied_bytes)}），"
             f"删除 {result.deleted_files:,} 个文件、{result.deleted_dirs:,} 个文件夹，"
             f"跳过 {result.skipped_files:,} 个文件。"
         )
@@ -1113,21 +1331,22 @@ class MainWindow(QMainWindow):
         self.current_file.setToolTip(summary)
         self.speed_label.setText(f"用时 {result.duration_seconds:,.1f} 秒")
         if result.status == "success":
-            self._set_status("同步完成，目标镜像已更新。", "success")
+            self._set_status(f"同步完成，{target_name}已更新；本程序未覆盖或删除{source_name}的文件。", "success")
             self.progress_bar.setValue(1000)
-            self._log(f"同步成功：{summary} 用时 {result.duration_seconds:.1f} 秒。")
+            self._log(f"同步成功：{summary} {source_name}只读取，未覆盖或删除；用时 {result.duration_seconds:.1f} 秒。")
             if not self.isVisible():
-                self._notify("同步完成", summary)
+                self._notify(f"{target_name}更新完成", f"{summary} {source_name}只读取，未覆盖或删除。")
         elif result.status == "cancelled":
-            self._set_status("同步已取消，已完成部分保留。下次操作前请重新分析。", "warning")
+            self._set_status(f"已取消更新{target_name}，已完成部分保留；{source_name}只读取。请重新分析。", "warning")
             self._log(f"同步已取消：{summary}")
         else:
-            self._set_status("本轮部分完成，已停止后续操作。请查看日志并重新分析。", "error")
+            self._set_status(f"{target_name}本轮部分完成，已停止后续操作；{source_name}只读取。请查看日志并重新分析。", "error")
             self._log(f"同步未完成：{summary}")
-            self._notify("同步未完成", result.errors[0] if result.errors else "请查看日志。", warning=True)
+            self._notify(f"{target_name}更新未完成", result.errors[0] if result.errors else "请查看日志。", warning=True)
         for error in result.errors:
             self._log(error)
-        self.path_hint.setText("上方为本轮执行前的差异记录。再次同步前请重新分析。")
+        self.preview_title.setText(f"本轮执行前记录 · 操作位置：{target_name}")
+        self.path_hint.setText(f"上方为本轮执行前的记录，操作仅针对{target_name}。再次同步前请重新分析。")
 
     @Slot(object)
     def _on_progress(self, progress: Progress) -> None:
@@ -1135,23 +1354,31 @@ class MainWindow(QMainWindow):
             return
         if self._cancel_event.is_set():
             return
+        source_name, target_name = self._endpoint_names()
         names = {
             "scan": "正在扫描文件",
             "hash": "正在校验文件内容",
             "compare": "正在比较差异",
             "copy": "正在复制文件",
             "copied": "正在复制文件",
-            "delete": "正在清理目标多余内容",
+            "delete": f"正在清理{target_name}多余内容",
             "done": "正在完成本轮任务",
         }
         if progress.phase == "hash":
             message = "当前文件写入校验" if self._operation == "execute" else "当前文件内容校验"
+        elif progress.phase == "delete":
+            message = f"仅从{target_name}删除多余内容；{source_name}只读取"
+        elif progress.phase in ("copy", "copied", "rename"):
+            message = f"正在更新{target_name}；{source_name}只读取"
         else:
-            message = progress.message or names.get(progress.phase, "正在处理…")
+            message = (progress.message or names.get(progress.phase, "正在处理…")).replace("源端", source_name).replace("目标", target_name)
         self._set_status(message, "busy")
         path = progress.relative_path or "正在检查仓库…"
-        self.current_file.setText(path)
-        self.current_file.setToolTip(path)
+        actual = absolute_item_path(self._paths()[1], progress.relative_path)
+        self.current_file.setText(f"{target_name}：{actual}" if self._operation == "execute" and progress.relative_path else path)
+        self.current_file.setToolTip(
+            f"本次只读取：{self._paths()[0]}\n本次仅修改：{self._paths()[1]}\n{path}"
+        )
         if progress.total_bytes > 0:
             self.progress_bar.setRange(0, 1000)
             self.progress_bar.setValue(min(1000, int(progress.completed_bytes * 1000 / progress.total_bytes)))
@@ -1220,8 +1447,13 @@ class MainWindow(QMainWindow):
             return
         menu = QMenu(self)
         copy = menu.addAction("复制相对路径")
-        if menu.exec(self.table.viewport().mapToGlobal(position)) == copy:
+        copy_target = menu.addAction("复制实际修改位置")
+        chosen = menu.exec(self.table.viewport().mapToGlobal(position))
+        if chosen == copy:
             paths = [self.filter_model.index(index.row(), 1).data() for index in rows]
+            QApplication.clipboard().setText("\n".join(paths))
+        elif chosen == copy_target:
+            paths = [self.filter_model.index(index.row(), 3).data() for index in rows]
             QApplication.clipboard().setText("\n".join(paths))
 
     def _load_log(self) -> None:
