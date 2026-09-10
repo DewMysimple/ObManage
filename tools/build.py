@@ -32,7 +32,7 @@ def main() -> None:
         "--exclude-module", "tkinter", "--distpath", str(ROOT / "dist"), "--workpath", str(ROOT / "build"),
         str(ROOT / "run_obmanage.py"),
     ], cwd=ROOT, env=build_environment, check=True)
-    shutil.copy2(ROOT / "README.md", ROOT / "dist" / "ObManage" / "使用说明.md")
+    shutil.copy2(ROOT / "docs" / "使用指南.md", ROOT / "dist" / "ObManage" / "使用说明.md")
     shutil.copy2(ROOT / "THIRD_PARTY_NOTICES.md", ROOT / "dist" / "ObManage" / "THIRD_PARTY_NOTICES.md")
     shutil.copytree(ROOT / "licenses", ROOT / "dist" / "ObManage" / "licenses", dirs_exist_ok=True)
     print(ROOT / "dist" / "ObManage" / "ObManage.exe")

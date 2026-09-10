@@ -1,0 +1,29 @@
+---
+type: decision
+status: active
+kind: architecture
+importance: high
+updated: 2026-09-10
+topic: windows-qt-portable-runtime
+source_logs:
+  - "[[日志/2026-09-10-工程记忆与界面整理]]"
+supersedes: null
+---
+
+# ADR-003｜Windows 桌面运行与打包
+
+## 背景与决策
+
+用户需要无需安装 Python 的中文桌面程序，同时保持引擎可单独验证。采用 Python 3.14、PySide6 Widgets、SQLite 和 PyInstaller `onedir`，界面与引擎通过模型及信号连接。
+
+`SyncWorker` 继承 `QThread`，在 `run()` 中创建引擎及 SQLite 连接，主线程消费进度和结束信号。保持当前线程生命周期实现，不能在未验证的情况下替换为其他 Qt 工作对象模式。
+
+打包使用构建脚本限定子进程 PATH 为 Python/venv 和 Windows 系统目录，以防开发工具附带的同名 ICU DLL 混入 Qt 依赖。便携目录包含 EXE、动态库、使用说明和第三方许可证；使用说明来自[独立指南](../../docs/使用指南.md)，不依赖 GitHub README 的仓库链接和图片。manifest 使用 `asInvoker`、长路径与 PerMonitorV2。
+
+## 理由和影响
+
+避免 GUI 被大文件读取阻塞，依赖和状态边界可检查。`onedir` 要求分发整个目录，不能只拷 EXE。源码启动成功不能证明冻结包依赖正确，必须补独立 EXE 启动验证。
+
+## 验证与来源
+
+[SyncWorker](../../obmanage/ui.py)、[构建环境 PATH 注释与脚本](../../tools/build.py)、[Windows manifest](../../windows.manifest)、[GUI 启动及 smoke-test](../../obmanage/app.py)、[UI 取消与任务互斥测试](../../tests/test_ui.py)。具体操作见[Windows 打包与排障](../知识/运维/Windows打包与排障.md)。

@@ -1,0 +1,18 @@
+---
+type: knowledge
+status: active
+kind: module
+importance: medium
+updated: 2026-09-10
+topic: module-index
+source_logs:
+  - "[[日志/2026-09-10-工程记忆与界面整理]]"
+supersedes: null
+---
+
+# 模块知识
+
+- [同步引擎与路径保护](./同步引擎与路径保护.md)：扫描、缓存、临时文件和删除条件。
+- [方向、界面与调度](./方向界面与调度.md)：固定端点映射、计划失效、线程和定时。
+
+先读[系统架构](../../当前状态/系统架构.md)，按需进入具体模块；接口改变时同步更新这些页面与测试。

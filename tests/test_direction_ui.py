@@ -15,7 +15,7 @@ from PySide6.QtWidgets import QApplication
 
 from obmanage.models import SyncCancelled
 from obmanage.settings import SettingsStore
-from obmanage.ui import MainWindow
+from obmanage.ui import MainWindow, PlanTableModel
 
 
 @pytest.fixture(scope="module")
@@ -106,19 +106,19 @@ def test_direction_buttons_keep_endpoint_rows_and_name_target(directional_window
     assert "移动硬盘" in widget.direction_label.text()
     assert "本机" in widget.direction_label.text()
     assert widget.direction_label.text().index("移动硬盘") < widget.direction_label.text().index("本机")
-    assert str(portable) in widget.source_safety_label.text()
+    assert str(portable) in widget.source_safety_label.toolTip()
     assert "只读" in widget.source_safety_label.text()
-    assert str(local) in widget.target_effect_label.text()
+    assert str(local) in widget.target_effect_label.toolTip()
     assert "删除" in widget.target_effect_label.text()
     assert "本机" in widget.preview_title.text()
-    assert "本机" in widget.stat_titles["delete"].text()
+    assert "本机" in widget.stat_titles["delete"].toolTip()
     QTest.mouseClick(widget.direction_to_portable_button, Qt.MouseButton.LeftButton)
     assert widget.settings.direction == "to_portable"
     assert widget._paths() == (str(local), str(portable))
     assert widget.local_edit.text() == str(local)
     assert widget.portable_combo.currentText() == str(portable)
     assert "移动硬盘" in widget.preview_title.text()
-    assert "移动硬盘" in widget.stat_titles["delete"].text()
+    assert "移动硬盘" in widget.stat_titles["delete"].toolTip()
 
 
 def test_switch_discards_preview_confirmation_and_schedule(application, directional_window):
@@ -214,9 +214,9 @@ def test_pull_preview_names_delete_location_and_hides_skips(application, directi
     row = "\n".join(str(model.data(model.index(0, col)) or "") for col in range(model.columnCount()))
     assert "删除" in row
     assert "本机" in row
-    assert "移动硬盘" in row
+    assert "移动硬盘" in model.index(0, PlanTableModel.TARGET_COLUMN).data(Qt.ItemDataRole.ToolTipRole)
     assert "不存在" in row
-    assert widget._normalized_path(str(delete_path)) == widget._normalized_path(str(model.data(model.index(0, 3))))
+    assert widget._normalized_path(str(delete_path)) == widget._normalized_path(str(model.data(model.index(0, PlanTableModel.TARGET_COLUMN))))
     assert "本机" in str(model.data(model.index(0, 0)))
     assert "移动硬盘" not in str(model.data(model.index(0, 0)))
     assert snapshot(portable) == before

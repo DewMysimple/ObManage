@@ -11,6 +11,7 @@ from typing import Any
 
 from PySide6.QtCore import (
     QAbstractTableModel,
+    QEvent,
     QModelIndex,
     QObject,
     QRectF,
@@ -146,6 +147,9 @@ def app_icon() -> QIcon:
 class PlanTableModel(QAbstractTableModel):
     """Keep a large vault preview in a plain list, without per-cell widgets."""
 
+    ACTION_COLUMN, TARGET_COLUMN, SIZE_COLUMN, REASON_COLUMN = range(4)
+    HEADERS = ("操作", "实际修改位置", "大小", "说明")
+
     def __init__(self, parent: QObject | None = None) -> None:
         super().__init__(parent)
         self.items: list[PlanItem] = []
@@ -172,9 +176,13 @@ class PlanTableModel(QAbstractTableModel):
 
     def reason_text(self, item: PlanItem) -> str:
         if item.action in ("delete", "rmdir"):
-            return f"{self.source_name}来源里不存在；仅移除{self.target_name}中的这一项"
-        if item.action in ("add", "mkdir", "update"):
-            return f"使用{self.source_name}的内容：{absolute_item_path(self.source_path, item.relative_path)}"
+            return "来源中已不存在"
+        if item.action == "add":
+            return "目标缺少此文件，复制来源内容"
+        if item.action == "mkdir":
+            return "目标缺少此文件夹"
+        if item.action == "update":
+            return "内容不同，使用来源版本"
         return item.reason.replace("源端", f"{self.source_name}来源").replace("目标端", self.target_name).replace("源仓库", self.source_name)
 
     def set_items(self, items: list[PlanItem]) -> None:
@@ -186,11 +194,11 @@ class PlanTableModel(QAbstractTableModel):
         return 0 if parent.isValid() else len(self.items)
 
     def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:
-        return 0 if parent.isValid() else 5
+        return 0 if parent.isValid() else len(self.HEADERS)
 
     def headerData(self, section: int, orientation: Qt.Orientation, role: int = Qt.ItemDataRole.DisplayRole) -> Any:
         if orientation == Qt.Orientation.Horizontal and role == Qt.ItemDataRole.DisplayRole:
-            return ("本次操作（仅目标）", "相对路径", "大小", "实际修改位置", "依据 / 来源")[section]
+            return self.HEADERS[section] if 0 <= section < len(self.HEADERS) else None
         return None
 
     def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole) -> Any:
@@ -201,9 +209,8 @@ class PlanTableModel(QAbstractTableModel):
         if role == Qt.ItemDataRole.DisplayRole:
             return (
                 self.action_text(item),
-                item.relative_path,
+                absolute_item_path(self.target_path, item.relative_path),
                 "—" if item.action in ("mkdir", "rmdir") else format_bytes(item.size),
-                "—（不修改）" if item.action in ("skip", "error") else absolute_item_path(self.target_path, item.relative_path),
                 self.reason_text(item),
             )[column]
         if role == Qt.ItemDataRole.UserRole:
@@ -212,7 +219,10 @@ class PlanTableModel(QAbstractTableModel):
             return (
                 f"{self.action_text(item)}\n"
                 f"实际修改位置：{'无' if item.action in ('skip', 'error') else absolute_item_path(self.target_path, item.relative_path)}\n"
+                f"目标位置：{absolute_item_path(self.target_path, item.relative_path)}\n"
+                f"对应来源：{absolute_item_path(self.source_path, item.relative_path)}\n"
                 f"{self.reason_text(item)}\n"
+                f"{item.reason}\n"
                 f"{self.source_name}只读取，不覆盖或删除。"
             )
         if role == Qt.ItemDataRole.ForegroundRole and column == 0:
@@ -239,6 +249,43 @@ class PlanFilterModel(QSortFilterProxyModel):
             return True
         model = self.sourceModel()
         return model.data(model.index(row, 0, parent), Qt.ItemDataRole.UserRole) in self.actions
+
+
+class ResponsivePlanTableView(QTableView):
+    """Give every viewport pixel to a column, including after scrollbar changes."""
+
+    def __init__(self, parent: QWidget | None = None) -> None:
+        super().__init__(parent)
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.setTextElideMode(Qt.TextElideMode.ElideMiddle)
+        header = self.horizontalHeader()
+        header.setMinimumSectionSize(40)
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(QHeaderView.ResizeMode.Fixed)
+
+    def viewportEvent(self, event: Any) -> bool:
+        result = super().viewportEvent(event)
+        if event.type() == QEvent.Type.Resize:
+            # A filter can add/remove the vertical scrollbar without resizing
+            # the table itself. Fit to the viewport after Qt updates its layout.
+            QTimer.singleShot(0, self.fit_columns)
+        return result
+
+    def resizeEvent(self, event: Any) -> None:
+        super().resizeEvent(event)
+        self.fit_columns()
+
+    @Slot()
+    def fit_columns(self) -> None:
+        if self.model() is None or self.model().columnCount() != len(PlanTableModel.HEADERS):
+            return
+        width = self.viewport().width()
+        action_width, size_width = 210, 88
+        flexible = max(80, width - action_width - size_width)
+        path_width = round(flexible * 0.68)
+        widths = (action_width, path_width, size_width, flexible - path_width)
+        for column, column_width in enumerate(widths):
+            self.horizontalHeader().resizeSection(column, column_width)
 
 
 class DropDownCombo(QComboBox):
@@ -344,16 +391,16 @@ STYLE = """
 QMainWindow, QDialog { background: #F3F5F4; }
 QWidget { color: #23353F; font-family: "Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI"; font-size: 13px; }
 QLabel { background: transparent; }
-QLabel#Brand { font-size: 27px; font-weight: 700; letter-spacing: -0.5px; }
+QLabel#Brand { font-size: 24px; font-weight: 700; letter-spacing: -0.5px; }
 QLabel#Subtitle, QLabel#Muted { color: #758189; font-size: 12px; }
 QLabel#SectionTitle { font-size: 14px; font-weight: 600; }
-QLabel#Direction { font-size: 16px; font-weight: 600; color: #315F7B; }
-QLabel#SourceSafety { color: #27735B; background: #F0F7F3; border-radius: 6px; padding: 8px 11px; }
-QLabel#TargetEffect { color: #845B35; background: #FBF5ED; border-radius: 6px; padding: 8px 11px; }
+QLabel#Direction { font-size: 13px; font-weight: 600; color: #315F7B; }
+QLabel#SourceSafety { color: #27735B; font-size: 12px; }
+QLabel#TargetEffect { color: #845B35; font-size: 12px; }
 QLabel#Badge { background: #E5EBED; color: #48626F; border-radius: 12px; padding: 7px 12px; font-size: 12px; }
 QFrame#Panel, QFrame#Stat { background: #FFFFFF; border: 1px solid #DFE5E5; border-radius: 12px; }
 QLabel#StatLabel { color: #6A7980; font-size: 12px; }
-QLabel#StatValue { font-size: 27px; font-weight: 600; }
+QLabel#StatValue { font-size: 21px; font-weight: 600; }
 QLineEdit, QComboBox, QSpinBox, QTimeEdit { min-height: 32px; border: 1px solid #DAE1E3; border-radius: 6px; background: #FAFBFB; padding: 1px 10px; selection-background-color: #DCE9F0; selection-color: #23353F; }
 QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QTimeEdit:focus { border-color: #7195AA; background: #FFFFFF; }
 QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled, QTimeEdit:disabled { color: #929CA2; background: #F2F4F4; }
@@ -366,7 +413,7 @@ QPushButton { background: #FFFFFF; border: 1px solid #D9E1E3; border-radius: 7px
 QPushButton:hover { background: #F1F5F6; border-color: #ADC0C9; }
 QPushButton:pressed { background: #E6EDF0; }
 QPushButton:disabled { color: #A2AAAD; background: #F1F3F3; border-color: #E3E7E7; }
-QPushButton#DirectionChoice { min-height: 48px; font-size: 13px; }
+QPushButton#DirectionChoice { min-height: 30px; font-size: 13px; }
 QPushButton#DirectionChoice:checked { background: #EAF2F6; color: #254E68; border: 2px solid #60859B; font-weight: 600; }
 QPushButton#DirectionChoice:disabled { color: #8296A0; border-color: #D4DEE3; }
 QPushButton#Primary { background: #315F7B; color: #FFFFFF; border: 1px solid #315F7B; font-weight: 600; padding: 1px 24px; }
@@ -384,10 +431,10 @@ QTabBar { background: transparent; }
 QTabBar::tab { color: #78868D; background: transparent; padding: 9px 13px 8px; border-bottom: 2px solid transparent; font-size: 12px; }
 QTabBar::tab:selected { color: #315F7B; border-bottom: 2px solid #315F7B; }
 QTabBar::tab:hover { background: #F2F6F7; }
-QTableView { background: #FFFFFF; border: none; border-top: 1px solid #EBEFEF; selection-background-color: #EAF1F5; selection-color: #23353F; gridline-color: #F0F3F4; outline: none; }
-QTableView::item { padding: 0 12px; border-bottom: 1px solid #F0F3F4; }
+QTableView { background: #FFFFFF; border: none; border-top: 1px solid #EBEFEF; selection-background-color: #EAF1F5; selection-color: #23353F; gridline-color: #DEE5E8; outline: none; }
+QTableView::item { padding: 0 10px; border-bottom: 1px solid #F0F3F4; border-right: 1px solid #DEE5E8; }
 QTableView::item:selected { background: #EAF1F5; color: #23353F; }
-QHeaderView::section { background: #F8FAFA; color: #74818A; border: none; border-bottom: 1px solid #E8EDED; padding: 9px 12px; text-align: left; font-size: 12px; font-weight: 400; }
+QHeaderView::section { background: #F8FAFA; color: #74818A; border: none; border-bottom: 1px solid #DEE5E8; border-right: 1px solid #D3DDE1; padding: 8px 10px; text-align: left; font-size: 12px; font-weight: 400; }
 QProgressBar { min-height: 5px; max-height: 5px; border: none; border-radius: 2px; background: #E8EDEF; }
 QProgressBar::chunk { background: #5E8AA2; border-radius: 2px; }
 QScrollBar:vertical { border: none; background: #F7F9F9; width: 10px; margin: 2px; }
@@ -478,47 +525,37 @@ class MainWindow(QMainWindow):
         self.content_scroll.setWidget(content)
         outer.addWidget(self.content_scroll, 1)
         layout = QVBoxLayout(content)
-        layout.setContentsMargins(24, 14, 24, 8)
+        layout.setContentsMargins(20, 12, 20, 6)
         layout.setSpacing(8)
 
         header = QHBoxLayout()
         mark = QLabel()
-        mark.setPixmap(self.windowIcon().pixmap(44, 44))
-        mark.setFixedSize(44, 44)
+        mark.setPixmap(self.windowIcon().pixmap(32, 32))
+        mark.setFixedSize(32, 32)
         header.addWidget(mark)
-        heading = QVBoxLayout()
-        heading.setSpacing(2)
         brand = QLabel("ObManage")
         brand.setObjectName("Brand")
-        heading.addWidget(brand)
-        subtitle = QLabel("在本机与移动硬盘之间，按选定方向同步完整仓库。")
+        header.addWidget(brand)
+        subtitle = QLabel("本机与移动硬盘之间的增量镜像")
         subtitle.setObjectName("Subtitle")
-        heading.addWidget(subtitle)
-        header.addLayout(heading)
+        header.addSpacing(8)
+        header.addWidget(subtitle)
         header.addStretch()
-        badge = QLabel("选定方向  /  增量镜像")
-        badge.setObjectName("Badge")
-        header.addWidget(badge, 0, Qt.AlignmentFlag.AlignVCenter)
         layout.addLayout(header)
 
-        paths = QFrame()
+        self.paths_panel = paths = QFrame()
         paths.setObjectName("Panel")
         paths_layout = QVBoxLayout(paths)
-        paths_layout.setContentsMargins(16, 12, 16, 12)
-        paths_layout.setSpacing(8)
-        paths_header = QHBoxLayout()
-        paths_title = QLabel("1  选择本次同步方向")
-        paths_title.setObjectName("SectionTitle")
-        paths_header.addWidget(paths_title)
-        paths_header.addStretch()
-        fixed_hint = QLabel("两个仓库的位置固定，切换方向即可带走或带回")
-        fixed_hint.setObjectName("Muted")
-        paths_header.addWidget(fixed_hint)
-        paths_layout.addLayout(paths_header)
+        paths_layout.setContentsMargins(14, 10, 14, 10)
+        paths_layout.setSpacing(6)
 
         direction_row = QHBoxLayout()
-        self.direction_to_local_button = QPushButton("带回本机\n移动硬盘 → 本机")
-        self.direction_to_portable_button = QPushButton("带走到移动硬盘\n本机 → 移动硬盘")
+        direction_row.setSpacing(10)
+        paths_title = QLabel("同步方向")
+        paths_title.setFixedWidth(90)
+        direction_row.addWidget(paths_title)
+        self.direction_to_local_button = QPushButton("带回本机  ·  移动硬盘 → 本机")
+        self.direction_to_portable_button = QPushButton("带到移动硬盘  ·  本机 → 移动硬盘")
         for button in (self.direction_to_local_button, self.direction_to_portable_button):
             button.setObjectName("DirectionChoice")
             button.setCheckable(True)
@@ -567,30 +604,27 @@ class MainWindow(QMainWindow):
         paths_layout.addLayout(target_row)
         self.direction_label = QLabel()
         self.direction_label.setObjectName("Direction")
-        self.direction_label.setWordWrap(True)
-        paths_layout.addWidget(self.direction_label)
         self.source_safety_label = QLabel()
         self.source_safety_label.setObjectName("SourceSafety")
         self.target_effect_label = QLabel()
         self.target_effect_label.setObjectName("TargetEffect")
         safety_row = QHBoxLayout()
-        safety_row.setSpacing(8)
+        safety_row.setSpacing(16)
+        safety_row.addWidget(self.direction_label)
         for label in (self.source_safety_label, self.target_effect_label):
             label.setTextFormat(Qt.TextFormat.PlainText)
-            label.setWordWrap(True)
             label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-            label.setMinimumWidth(0)
-            label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
-            safety_row.addWidget(label, 1)
+            safety_row.addWidget(label)
+        safety_row.addStretch()
         paths_layout.addLayout(safety_row)
-        self.path_hint = QLabel("先选方向，再分析差异；所有删除与覆盖只发生在本次接收更新的仓库。")
-        self.path_hint.setObjectName("Muted")
-        self.path_hint.setWordWrap(True)
-        paths_layout.addWidget(self.path_hint)
+        self.paths_panel.setToolTip("先选方向，再分析差异；所有删除与覆盖只发生在本次接收更新的仓库。")
         layout.addWidget(paths)
 
-        stats = QHBoxLayout()
-        stats.setSpacing(12)
+        self.stats_panel = QFrame()
+        self.stats_panel.setObjectName("Panel")
+        stats = QHBoxLayout(self.stats_panel)
+        stats.setContentsMargins(0, 0, 0, 0)
+        stats.setSpacing(0)
         self.stat_values: dict[str, QLabel] = {}
         self.stat_details: dict[str, QLabel] = {}
         self.stat_titles: dict[str, QLabel] = {}
@@ -601,30 +635,33 @@ class MainWindow(QMainWindow):
             ("skip", "跳过", "#79848B"),
         ):
             tile = QFrame()
-            tile.setObjectName("Stat")
             tile_layout = QVBoxLayout(tile)
-            tile_layout.setContentsMargins(14, 8, 14, 8)
-            tile_layout.setSpacing(2)
+            tile_layout.setContentsMargins(14, 5, 14, 5)
+            tile_layout.setSpacing(0)
             top = QHBoxLayout()
             label = QLabel(title)
             label.setObjectName("StatLabel")
             self.stat_titles[action] = label
             top.addWidget(label)
             top.addStretch()
-            dot = QLabel("●")
-            dot.setStyleSheet(f"color: {color}; font-size: 9px;")
-            top.addWidget(dot)
-            tile_layout.addLayout(top)
             value = QLabel("—")
             value.setObjectName("StatValue")
-            tile_layout.addWidget(value)
+            value.setStyleSheet(f"color: {color};")
+            top.addWidget(value)
+            tile_layout.addLayout(top)
             detail = QLabel("等待分析")
             detail.setObjectName("Muted")
             tile_layout.addWidget(detail)
             self.stat_values[action] = value
             self.stat_details[action] = detail
             stats.addWidget(tile, 1)
-        layout.addLayout(stats)
+            if action != "skip":
+                divider = QFrame()
+                divider.setFrameShape(QFrame.Shape.VLine)
+                divider.setStyleSheet("color: #E1E7E9; background: #E1E7E9;")
+                divider.setFixedWidth(1)
+                stats.addWidget(divider)
+        layout.addWidget(self.stats_panel)
 
         preview = QFrame()
         preview.setObjectName("Panel")
@@ -632,7 +669,7 @@ class MainWindow(QMainWindow):
         preview_layout.setContentsMargins(0, 0, 0, 8)
         preview_layout.setSpacing(0)
         preview_header = QHBoxLayout()
-        preview_header.setContentsMargins(18, 13, 18, 4)
+        preview_header.setContentsMargins(14, 8, 14, 0)
         self.preview_title = QLabel()
         self.preview_title.setObjectName("SectionTitle")
         preview_header.addWidget(self.preview_title)
@@ -670,7 +707,7 @@ class MainWindow(QMainWindow):
         empty_layout.addWidget(self.empty_detail)
         empty_layout.addStretch()
         self.preview_stack.addWidget(empty_page)
-        self.table = QTableView()
+        self.table = ResponsivePlanTableView()
         self.table.setObjectName("preview_table")
         self.table_model = PlanTableModel(self)
         self.filter_model = PlanFilterModel(self)
@@ -684,19 +721,7 @@ class MainWindow(QMainWindow):
         self.table.verticalHeader().hide()
         self.table.verticalHeader().setDefaultSectionSize(35)
         self.table.horizontalHeader().setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
-        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Stretch)
-        self.table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
-        self.table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Interactive)
-        self.table.horizontalHeader().setSectionResizeMode(4, QHeaderView.ResizeMode.Interactive)
-        self.table.setColumnWidth(0, 210)
-        self.table.setColumnWidth(2, 80)
-        self.table.setColumnWidth(3, 300)
-        self.table.setColumnWidth(4, 300)
-        self.table.horizontalHeader().setMinimumSectionSize(140)
-        self.table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
-        self.table.setColumnWidth(1, 240)
-        self.table.horizontalHeader().setMinimumSectionSize(65)
+        self.table.fit_columns()
         self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.table.customContextMenuRequested.connect(self._table_context_menu)
         self.preview_stack.addWidget(self.table)
@@ -706,7 +731,7 @@ class MainWindow(QMainWindow):
         schedule_panel = QFrame()
         schedule_panel.setObjectName("Panel")
         schedule_layout = QHBoxLayout(schedule_panel)
-        schedule_layout.setContentsMargins(16, 10, 16, 10)
+        schedule_layout.setContentsMargins(14, 5, 14, 5)
         schedule_layout.setSpacing(10)
         self.schedule_toggle = QCheckBox("定时按此方向同步（含删除）")
         self.schedule_toggle.setObjectName("schedule_toggle")
@@ -739,7 +764,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(schedule_panel)
 
         progress_layout = QVBoxLayout()
-        progress_layout.setSpacing(6)
+        progress_layout.setSpacing(4)
         progress_row = QHBoxLayout()
         self.status_dot = QLabel("●")
         self.status_dot.setFixedWidth(12)
@@ -759,7 +784,7 @@ class MainWindow(QMainWindow):
         self.progress_bar.setRange(0, 1000)
         self.progress_bar.setValue(0)
         progress_layout.addWidget(self.progress_bar)
-        self.current_file = QLabel("未变化文件会跳过复制；完整内容校验可检查隐藏的内容变化。")
+        self.current_file = QLabel("")
         self.current_file.setObjectName("Muted")
         self.current_file.setMinimumWidth(0)
         self.current_file.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
@@ -767,8 +792,8 @@ class MainWindow(QMainWindow):
 
         footer = QWidget()
         footer_layout = QVBoxLayout(footer)
-        footer_layout.setContentsMargins(24, 8, 24, 12)
-        footer_layout.setSpacing(8)
+        footer_layout.setContentsMargins(20, 6, 20, 10)
+        footer_layout.setSpacing(6)
         footer_layout.addLayout(progress_layout)
         self.confirm_direction_checkbox = QCheckBox()
         self.confirm_direction_checkbox.setObjectName("confirm_direction_checkbox")
@@ -854,17 +879,17 @@ class MainWindow(QMainWindow):
         to_local = self.settings.direction == "to_local"
         self.direction_to_local_button.setChecked(to_local)
         self.direction_to_portable_button.setChecked(not to_local)
-        self.direction_label.setText(f"本次方向：{source_name}  →  {target_name}")
-        self.source_safety_label.setText(
-            f"本次以此为准 · {source_name} · 只读取，不覆盖或删除\n{source or '请选择仓库位置'}"
-        )
-        self.target_effect_label.setText(
-            f"本次仅修改这里 · {target_name} · 新增、覆盖与删除均在此处\n{target or '请选择仓库位置'}"
-        )
-        self.preview_title.setText(f"2  将在 {target_name} 进行的操作")
-        for action, verb in (("add", "新增到"), ("update", "更新"), ("delete", "仅从此处删除：")):
-            self.stat_titles[action].setText(f"{verb}{target_name}")
-        self.stat_titles["skip"].setText("未变化 · 跳过复制")
+        self.direction_label.setText(f"{source_name}  →  {target_name}")
+        self.direction_label.setToolTip(f"本次以来源为准：{source}\n仅修改目标：{target}")
+        self.source_safety_label.setText("来源只读取")
+        self.source_safety_label.setToolTip(f"{source_name}只读取，不覆盖或删除。\n{source}")
+        self.target_effect_label.setText("仅目标新增、覆盖与删除")
+        self.target_effect_label.setToolTip(f"新增、覆盖与删除仅发生在{target_name}。\n{target}")
+        self.preview_title.setText(f"差异预览 · 仅修改{target_name}")
+        self.preview_title.setToolTip(f"本次所有操作的目标根目录：{target}\n来源只读取：{source}")
+        for action, verb in (("add", "新增"), ("update", "更新"), ("delete", "删除"), ("skip", "跳过")):
+            self.stat_titles[action].setText(verb)
+            self.stat_titles[action].setToolTip(f"本次目标：{target_name}\n{target}")
         self.confirm_direction_checkbox.setText(
             f"我已确认：以{source_name}为准，仅更新{target_name}，包括预览中的删除"
         )
@@ -892,7 +917,7 @@ class MainWindow(QMainWindow):
         self.pause_schedule()
         self._refresh_direction_text()
         source_name, target_name = self._endpoint_names()
-        self.path_hint.setText("方向已切换，旧预览与确认已清除，定时已暂停。请重新分析差异。")
+        self.paths_panel.setToolTip("方向已切换，旧预览与确认已清除，定时已暂停。请重新分析差异。")
         self.current_file.setText(f"{source_name}只读取；新增、更新与删除仅发生在{target_name}。")
         self._set_status(f"已切换为 {source_name} → {target_name}，请重新分析。")
         self._log(f"已切换方向：{source_name} {self._paths()[0]} → {target_name} {self._paths()[1]}；定时已暂停。")
@@ -939,7 +964,7 @@ class MainWindow(QMainWindow):
         self.settings.set_endpoints(self.local_edit.text().strip(), self.portable_combo.currentText().strip())
         self.pause_schedule()
         self._refresh_direction_text()
-        self.path_hint.setText(
+        self.paths_panel.setToolTip(
             "同步位置已变更，定时已暂停。请重新分析差异；重新开启定时后绑定当前位置。"
             if was_enabled
             else "仓库位置已变更，请重新分析差异。上方方向决定本次以哪一端为准。"
@@ -1007,7 +1032,7 @@ class MainWindow(QMainWindow):
         self._refresh_actions()
         if self.settings.schedule_enabled:
             source_name, target_name = self._endpoint_names()
-            self.path_hint.setText(f"定时已绑定 {source_name} → {target_name}，仅自动更新{target_name}（含删除）；切换方向后自动暂停。")
+            self.paths_panel.setToolTip(f"定时已绑定 {source_name} → {target_name}，仅自动更新{target_name}（含删除）；切换方向后自动暂停。")
             self._log(f"已启用定时同步：只读取 {source_name} {self.settings.source} → 仅更新 {target_name} {self.settings.target}（含删除）")
 
     @Slot()
@@ -1025,7 +1050,7 @@ class MainWindow(QMainWindow):
         self._refresh_actions()
         if was_enabled:
             self._log("定时同步已暂停。")
-            self.path_hint.setText("定时已暂停。请按上方方向分析差异，所有修改与删除仅发生在接收更新的仓库。")
+            self.paths_panel.setToolTip("定时已暂停。请按上方方向分析差异，所有修改与删除仅发生在接收更新的仓库。")
 
     def _refresh_schedule_controls(self) -> None:
         interval = self.schedule_mode.currentData() == "interval"
@@ -1346,7 +1371,7 @@ class MainWindow(QMainWindow):
         for error in result.errors:
             self._log(error)
         self.preview_title.setText(f"本轮执行前记录 · 操作位置：{target_name}")
-        self.path_hint.setText(f"上方为本轮执行前的记录，操作仅针对{target_name}。再次同步前请重新分析。")
+        self.paths_panel.setToolTip(f"上方为本轮执行前的记录，操作仅针对{target_name}。再次同步前请重新分析。")
 
     @Slot(object)
     def _on_progress(self, progress: Progress) -> None:
@@ -1446,15 +1471,19 @@ class MainWindow(QMainWindow):
         if not rows:
             return
         menu = QMenu(self)
-        copy = menu.addAction("复制相对路径")
         copy_target = menu.addAction("复制实际修改位置")
+        copy = menu.addAction("复制相对路径")
         chosen = menu.exec(self.table.viewport().mapToGlobal(position))
         if chosen == copy:
-            paths = [self.filter_model.index(index.row(), 1).data() for index in rows]
+            paths = [self.table_model.items[self.filter_model.mapToSource(index).row()].relative_path for index in rows]
             QApplication.clipboard().setText("\n".join(paths))
         elif chosen == copy_target:
-            paths = [self.filter_model.index(index.row(), 3).data() for index in rows]
-            QApplication.clipboard().setText("\n".join(paths))
+            self.copy_selected_target_paths()
+
+    def copy_selected_target_paths(self) -> None:
+        rows = self.table.selectionModel().selectedRows()
+        paths = [self.filter_model.index(index.row(), PlanTableModel.TARGET_COLUMN).data() for index in rows]
+        QApplication.clipboard().setText("\n".join(paths))
 
     def _load_log(self) -> None:
         path = self.state_dir / "ui.log"
