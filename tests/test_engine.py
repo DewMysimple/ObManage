@@ -1,0 +1,829 @@
+from __future__ import annotations
+
+import os
+import errno
+from pathlib import Path
+from threading import Event
+from types import SimpleNamespace
+
+import pytest
+
+from obmanage.engine import SyncEngine
+from obmanage.models import SyncCancelled, SyncError
+from obmanage.store import BaselineStore
+import obmanage.engine as engine_module
+import obmanage.paths as paths_module
+
+
+@pytest.fixture
+def mirror(tmp_path):
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    source.mkdir()
+    target.mkdir()
+    return SyncEngine(tmp_path / "state"), source, target
+
+
+def put(root: Path, relative: str, content: bytes = b"content") -> Path:
+    file = root / relative
+    file.parent.mkdir(parents=True, exist_ok=True)
+    file.write_bytes(content)
+    return file
+
+
+def analyze(engine, source, target, **kwargs):
+    return engine.analyze(str(source), str(target), **kwargs)
+
+
+def synchronize(engine, source, target, **kwargs):
+    plan = analyze(engine, source, target)
+    assert plan.can_execute, plan.errors
+    result = engine.execute(plan, **kwargs)
+    assert not result.errors, result.errors
+    return plan, result
+
+
+def require_rejected(operation):
+    """Safety failures may surface as an exception or structured error result."""
+    try:
+        outcome = operation()
+    except (SyncError, SyncCancelled):
+        return
+    assert outcome.errors or getattr(outcome, "status", "") in {
+        "cancelled", "canceled", "error", "failed", "blocked", "partial"
+    }, outcome
+
+
+def test_first_mirror_preserves_hidden_files_and_empty_directories(mirror):
+    engine, source, target = mirror
+    put(source, "笔记/中文.md", "第一篇笔记".encode())
+    put(source, ".obsidian/app.json", b'{"theme":"dark"}')
+    (source / "空目录" / "仍然为空").mkdir(parents=True)
+
+    plan, result = synchronize(engine, source, target)
+
+    assert plan.counts["add"] == 2
+    assert result.copied_files == 2
+    assert (target / "笔记/中文.md").read_bytes() == (source / "笔记/中文.md").read_bytes()
+    assert (target / ".obsidian/app.json").read_bytes() == b'{"theme":"dark"}'
+    assert (target / "空目录/仍然为空").is_dir()
+
+
+def test_incremental_updates_deletes_and_target_only_files(mirror):
+    engine, source, target = mirror
+    put(source, "unchanged/video.bin", b"unchanged video" * 100)
+    put(source, "updated.md", b"original")
+    put(source, "removed/deep/note.md", b"delete me")
+    synchronize(engine, source, target)
+    unchanged = target / "unchanged/video.bin"
+    unchanged_metadata = unchanged.stat()
+    put(source, "updated.md", b"updated source")
+    put(source, "new.md", b"new")
+    (source / "removed/deep/note.md").unlink()
+    (source / "removed/deep").rmdir()
+    (source / "removed").rmdir()
+    put(target, "target-only/note.md", b"local target addition")
+
+    plan, result = synchronize(engine, source, target)
+
+    assert plan.counts["add"] == 1
+    assert plan.counts["update"] == 1
+    assert result.copied_files == 2
+    assert result.copied_bytes == len(b"updated source") + len(b"new")
+    assert result.deleted_files == 2
+    assert (target / "updated.md").read_bytes() == b"updated source"
+    assert not (target / "removed").exists()
+    assert not (target / "target-only").exists()
+    assert unchanged.stat().st_mtime_ns == unchanged_metadata.st_mtime_ns
+    assert unchanged.stat().st_ino == unchanged_metadata.st_ino
+
+
+def test_source_wins_even_when_target_has_newer_timestamp(mirror):
+    engine, source, target = mirror
+    source_file = put(source, "note.md", b"source version")
+    target_file = put(target, "note.md", b"target version")
+    os.utime(source_file, ns=(1_600_000_000_000_000_000,) * 2)
+    os.utime(target_file, ns=(1_700_000_000_000_000_000,) * 2)
+
+    plan, result = synchronize(engine, source, target)
+
+    assert plan.counts["update"] == 1
+    assert result.copied_files == 1
+    assert target_file.read_bytes() == b"source version"
+
+
+def test_unchanged_second_sync_writes_zero_bytes(mirror):
+    engine, source, target = mirror
+    put(source, "note.md", b"unchanged note")
+    put(source, "video.bin", bytes(range(256)) * 8192)
+    synchronize(engine, source, target)
+
+    plan, result = synchronize(engine, source, target)
+
+    assert plan.counts["skip"] == 2
+    assert plan.bytes_to_copy == 0
+    assert result.copied_files == 0
+    assert result.copied_bytes == 0
+    assert result.deleted_files == 0
+
+
+def test_adopts_existing_identical_copy_without_rewriting_or_changing_timestamps(mirror):
+    engine, source, target = mirror
+    payload = b"Existing immutable video data" * 4096
+    source_file = put(source, "电影.mp4", payload)
+    target_file = put(target, "电影.mp4", payload)
+    os.utime(source_file, ns=(1_700_000_000_123_456_700,) * 2)
+    os.utime(target_file, ns=(1_700_000_002_000_000_000,) * 2)
+    initial_stat = target_file.stat()
+
+    plan, result = synchronize(engine, source, target)
+    second_plan, second_result = synchronize(engine, source, target)
+
+    assert plan.counts["skip"] == 1
+    assert result.copied_bytes == 0
+    assert second_plan.counts["skip"] == 1
+    assert second_result.copied_bytes == 0
+    assert target_file.stat().st_mtime_ns == initial_stat.st_mtime_ns
+    assert target_file.stat().st_ino == initial_stat.st_ino
+
+
+def test_renaming_becomes_add_and_delete(mirror):
+    engine, source, target = mirror
+    put(source, "old.md", b"same content")
+    synchronize(engine, source, target)
+    (source / "old.md").rename(source / "new.md")
+
+    plan, _ = synchronize(engine, source, target)
+
+    assert plan.counts["add"] == 1
+    assert plan.counts["delete"] == 1
+    assert not (target / "old.md").exists()
+    assert (target / "new.md").read_bytes() == b"same content"
+
+
+@pytest.mark.parametrize("changed_side", ["source", "target"])
+def test_deep_scan_detects_changes_with_same_size_and_mtime(mirror, changed_side):
+    engine, source, target = mirror
+    put(source, "note.md", b"original")
+    synchronize(engine, source, target)
+    changed = (source if changed_side == "source" else target) / "note.md"
+    old_stat = changed.stat()
+    changed.write_bytes(b"modified")
+    os.utime(changed, ns=(old_stat.st_atime_ns, old_stat.st_mtime_ns))
+
+    deep_plan = analyze(engine, source, target, deep=True)
+
+    assert deep_plan.can_execute, deep_plan.errors
+    assert deep_plan.counts["update"] == 1
+    result = engine.execute(deep_plan)
+    assert not result.errors
+    assert (target / "note.md").read_bytes() == (source / "note.md").read_bytes()
+
+
+def test_analysis_does_not_write_or_delete_vault_files(mirror):
+    engine, source, target = mirror
+    put(source, "new.md", b"new source")
+    put(source, "update.md", b"correct source")
+    put(target, "update.md", b"old target")
+    put(target, "remove.md", b"target only")
+    (source / "empty").mkdir()
+
+    plan = analyze(engine, source, target)
+
+    assert plan.can_execute, plan.errors
+    assert not (target / "new.md").exists()
+    assert not (target / "empty").exists()
+    assert (target / "update.md").read_bytes() == b"old target"
+    assert (target / "remove.md").read_bytes() == b"target only"
+
+
+@pytest.mark.parametrize("changed_side", ["source", "target"])
+def test_preview_becomes_invalid_after_file_change_and_never_deletes(mirror, changed_side):
+    engine, source, target = mirror
+    put(source, "note.md", b"source")
+    put(target, "note.md", b"target")
+    put(target, "target-only.md", b"must survive stale plan")
+    plan = analyze(engine, source, target)
+    changed_root = source if changed_side == "source" else target
+    put(changed_root, "note.md", b"modified after preview")
+
+    require_rejected(lambda: engine.execute(plan))
+
+    assert (target / "target-only.md").read_bytes() == b"must survive stale plan"
+    if changed_side == "source":
+        assert (target / "note.md").read_bytes() == b"target"
+    else:
+        assert (target / "note.md").read_bytes() == b"modified after preview"
+
+
+def test_new_source_file_after_preview_prevents_target_deletion(mirror):
+    engine, source, target = mirror
+    put(source, "present.md", b"present")
+    put(target, "returned.md", b"old target")
+    plan = analyze(engine, source, target)
+    put(source, "returned.md", b"restored since preview")
+
+    require_rejected(lambda: engine.execute(plan))
+
+    assert (target / "returned.md").read_bytes() == b"old target"
+
+
+def test_missing_source_is_never_treated_as_empty(mirror):
+    engine, source, target = mirror
+    put(target, "keep.md", b"do not delete")
+    source.rmdir()
+
+    require_rejected(lambda: analyze(engine, source, target))
+
+    assert (target / "keep.md").read_bytes() == b"do not delete"
+
+
+def test_empty_source_requires_explicit_allow_empty(mirror):
+    engine, source, target = mirror
+    put(target, "old/note.md", b"remove after confirmation")
+    plan = analyze(engine, source, target)
+    assert plan.source_empty
+
+    require_rejected(lambda: engine.execute(plan))
+    assert (target / "old/note.md").exists()
+
+    confirmed_plan = analyze(engine, source, target)
+    result = engine.execute(confirmed_plan, allow_empty=True)
+    assert not result.errors, result.errors
+    assert list(target.iterdir()) == []
+
+
+@pytest.mark.parametrize("source_is_directory", [True, False])
+def test_file_directory_conflict_blocks_execution_and_all_deletion(mirror, source_is_directory):
+    engine, source, target = mirror
+    directory_root, file_root = (source, target) if source_is_directory else (target, source)
+    put(directory_root, "conflict/child.md", b"child")
+    put(file_root, "conflict", b"file")
+    put(target, "target-only.md", b"keep on conflict")
+
+    plan = analyze(engine, source, target)
+
+    assert not plan.can_execute
+    assert plan.errors or plan.counts["error"]
+    require_rejected(lambda: engine.execute(plan))
+    assert (target / "target-only.md").read_bytes() == b"keep on conflict"
+    assert (directory_root / "conflict/child.md").read_bytes() == b"child"
+    assert (file_root / "conflict").read_bytes() == b"file"
+
+
+def test_pre_cancelled_execution_keeps_existing_target(mirror):
+    engine, source, target = mirror
+    put(source, "note.md", b"new source")
+    put(target, "note.md", b"old target")
+    put(target, "keep.md", b"keep on cancellation")
+    plan = analyze(engine, source, target)
+    cancelled = Event()
+    cancelled.set()
+
+    require_rejected(lambda: engine.execute(plan, cancel=cancelled))
+
+    assert (target / "note.md").read_bytes() == b"old target"
+    assert (target / "keep.md").read_bytes() == b"keep on cancellation"
+
+
+def test_each_target_has_independent_comparison_records(tmp_path):
+    engine = SyncEngine(tmp_path / "state")
+    source, first, second = [tmp_path / name for name in ("source", "first", "second")]
+    for folder in (source, first, second):
+        folder.mkdir()
+    put(source, "note.md", b"source content")
+    synchronize(engine, source, first)
+    put(second, "note.md", b"wrong contents")
+
+    plan, result = synchronize(engine, source, second)
+
+    assert plan.counts["update"] == 1
+    assert result.copied_files == 1
+    assert (first / "note.md").read_bytes() == b"source content"
+    assert (second / "note.md").read_bytes() == b"source content"
+
+
+def test_hash_baseline_persists_across_engine_instances(tmp_path):
+    source, target, state = [tmp_path / name for name in ("source", "target", "state")]
+    source.mkdir()
+    target.mkdir()
+    put(source, "video.mp4", b"constant video payload")
+    synchronize(SyncEngine(state), source, target)
+
+    plan, result = synchronize(SyncEngine(state), source, target)
+
+    assert plan.counts["skip"] == 1
+    assert result.copied_bytes == 0
+
+
+def test_unchanged_baseline_avoids_reading_large_file_contents(mirror, monkeypatch):
+    engine, source, target = mirror
+    put(source, "video.mp4", b"video payload" * 1024)
+    synchronize(engine, source, target)
+
+    def unnecessary_hash(*args, **kwargs):
+        pytest.fail("An unchanged cached file must not be read for SHA-256 again")
+
+    monkeypatch.setattr(engine_module, "_hash_file", unnecessary_hash)
+
+    plan, result = synchronize(engine, source, target)
+
+    assert plan.counts["skip"] == 1
+    assert result.copied_bytes == 0
+
+
+def test_cancelled_first_adoption_reuses_already_hashed_record(mirror, monkeypatch):
+    engine, source, target = mirror
+    for name in ("first.mp4", "second.mp4", "third.mp4"):
+        put(source, name, b"video" * 4096)
+        put(target, name, b"video" * 4096)
+    cancelled = Event()
+    completed = []
+
+    def stop_after_first(event):
+        if event.phase == "compare" and event.completed_files == 1:
+            completed.append(event.relative_path)
+            cancelled.set()
+
+    require_rejected(lambda: analyze(engine, source, target, cancel=cancelled, progress=stop_after_first))
+    assert len(completed) == 1
+    original_hash = engine_module._hash_file
+    hashed_paths = []
+
+    def count_hash(path, *args, **kwargs):
+        hashed_paths.append(str(path))
+        return original_hash(path, *args, **kwargs)
+
+    monkeypatch.setattr(engine_module, "_hash_file", count_hash)
+    resumed = analyze(engine, source, target)
+
+    assert resumed.can_execute, resumed.errors
+    assert resumed.counts["skip"] == 3
+    assert len(hashed_paths) == 4, "Only the two not-yet-adopted files should be read on both sides"
+    assert not any(Path(path).name == Path(completed[0]).name for path in hashed_paths)
+
+
+def test_target_metadata_change_rehashes_and_repairs_content(mirror):
+    engine, source, target = mirror
+    put(source, "note.md", b"source content")
+    synchronize(engine, source, target)
+    put(target, "note.md", b"changed externally on target")
+
+    plan, result = synchronize(engine, source, target)
+
+    assert plan.counts["update"] == 1
+    assert result.copied_files == 1
+    assert (target / "note.md").read_bytes() == b"source content"
+
+
+def test_cancel_after_copied_file_prevents_all_deletions_and_can_resume(mirror):
+    engine, source, target = mirror
+    put(source, "a.md", b"first copied file")
+    put(source, "b.md", b"second copied file")
+    put(target, "obsolete.md", b"keep until copies complete")
+    plan = analyze(engine, source, target)
+    cancelled = Event()
+
+    def stop_after_copy(event):
+        if event.phase == "copied":
+            cancelled.set()
+
+    require_rejected(lambda: engine.execute(plan, cancel=cancelled, progress=stop_after_copy))
+
+    assert (target / "obsolete.md").read_bytes() == b"keep until copies complete"
+    copied = [path for path in target.iterdir() if path.name in {"a.md", "b.md"}]
+    assert len(copied) == 1
+    _, resumed = synchronize(engine, source, target)
+    assert resumed.copied_files == 1
+    assert not (target / "obsolete.md").exists()
+
+
+def test_insufficient_space_keeps_existing_target_and_obsolete_files(mirror, monkeypatch):
+    engine, source, target = mirror
+    put(source, "note.md", b"new source with more bytes")
+    put(target, "note.md", b"old target")
+    put(target, "obsolete.md", b"do not delete")
+    plan = analyze(engine, source, target)
+    monkeypatch.setattr(engine_module.shutil, "disk_usage", lambda path: SimpleNamespace(total=1000, used=1000, free=0))
+
+    require_rejected(lambda: engine.execute(plan))
+
+    assert (target / "note.md").read_bytes() == b"old target"
+    assert (target / "obsolete.md").read_bytes() == b"do not delete"
+
+
+def test_replace_failure_preserves_previous_file_and_stops_deletion(mirror, monkeypatch):
+    engine, source, target = mirror
+    put(source, "note.md", b"new source")
+    put(target, "note.md", b"old target")
+    put(target, "obsolete.md", b"do not delete")
+    plan = analyze(engine, source, target)
+
+    def locked_replace(*args, **kwargs):
+        raise PermissionError("simulated target file in use")
+
+    monkeypatch.setattr(engine_module.os, "replace", locked_replace)
+
+    require_rejected(lambda: engine.execute(plan))
+
+    assert (target / "note.md").read_bytes() == b"old target"
+    assert (target / "obsolete.md").read_bytes() == b"do not delete"
+    assert sorted(path.name for path in target.iterdir()) == ["note.md", "obsolete.md"]
+
+
+def test_source_modified_while_copying_never_replaces_target(mirror):
+    engine, source, target = mirror
+    source_file = put(source, "video.bin", b"new source" * 1_000_000)
+    put(target, "video.bin", b"old target")
+    put(target, "obsolete.md", b"do not delete")
+    plan = analyze(engine, source, target)
+    modified = []
+
+    def mutate_during_copy(event):
+        if event.phase == "copy" and not modified:
+            modified.append(True)
+            with source_file.open("ab") as handle:
+                handle.write(b"source changed while being copied")
+
+    require_rejected(lambda: engine.execute(plan, progress=mutate_during_copy))
+
+    assert modified, "Test must modify the source during a real copy"
+    assert (target / "video.bin").read_bytes() == b"old target"
+    assert (target / "obsolete.md").read_bytes() == b"do not delete"
+
+
+def test_replaced_volume_invalidates_preview_without_touching_target(mirror, monkeypatch):
+    engine, source, target = mirror
+    put(source, "note.md", b"new source")
+    put(target, "note.md", b"old target")
+    put(target, "obsolete.md", b"do not delete")
+    plan = analyze(engine, source, target)
+    original_identity = paths_module.volume_identity
+    monkeypatch.setattr(paths_module, "volume_identity", lambda path: original_identity(path) + ":replacement-volume")
+
+    require_rejected(lambda: engine.execute(plan))
+
+    assert (target / "note.md").read_bytes() == b"old target"
+    assert (target / "obsolete.md").read_bytes() == b"do not delete"
+
+
+def test_disconnection_after_copy_prevents_deletion(mirror, monkeypatch):
+    engine, source, target = mirror
+    put(source, "note.md", b"new source")
+    put(target, "obsolete.md", b"do not delete")
+    plan = analyze(engine, source, target)
+
+    def disconnected(*args, **kwargs):
+        raise SyncError("simulated disk disconnected")
+
+    def disconnect_after_copy(event):
+        if event.phase == "copied":
+            monkeypatch.setattr(paths_module, "volume_identity", disconnected)
+
+    require_rejected(lambda: engine.execute(plan, progress=disconnect_after_copy))
+
+    assert (target / "obsolete.md").read_bytes() == b"do not delete"
+
+
+def test_unreadable_source_during_analysis_blocks_execution(mirror, monkeypatch):
+    engine, source, target = mirror
+    put(source, "note.md", b"new source")
+    put(target, "note.md", b"old target")
+    put(target, "obsolete.md", b"do not delete")
+
+    def unreadable_source(*args, **kwargs):
+        raise PermissionError("simulated source file is exclusively locked")
+
+    monkeypatch.setattr(engine_module, "_hash_file", unreadable_source)
+
+    plan = analyze(engine, source, target)
+
+    assert not plan.can_execute
+    assert any("locked" in message for message in plan.errors)
+    require_rejected(lambda: engine.execute(plan))
+    assert (target / "note.md").read_bytes() == b"old target"
+    assert (target / "obsolete.md").read_bytes() == b"do not delete"
+
+
+def test_mid_write_disk_full_cleans_staging_file_without_losing_previous_version(mirror, monkeypatch):
+    engine, source, target = mirror
+    put(source, "note.md", b"new source data" * 1024)
+    put(target, "note.md", b"old target")
+    put(target, "obsolete.md", b"do not delete")
+    plan = analyze(engine, source, target)
+    real_fdopen = engine_module.os.fdopen
+    partial_writes = []
+
+    class FailsAfterPartialWrite:
+        def __init__(self, wrapped):
+            self.wrapped = wrapped
+
+        def __enter__(self):
+            self.wrapped.__enter__()
+            return self
+
+        def __exit__(self, *args):
+            return self.wrapped.__exit__(*args)
+
+        def __getattr__(self, name):
+            return getattr(self.wrapped, name)
+
+        def write(self, data):
+            self.wrapped.write(data[:32])
+            partial_writes.append(True)
+            raise OSError(errno.ENOSPC, "simulated disk full during write")
+
+    def failing_fdopen(*args, **kwargs):
+        return FailsAfterPartialWrite(real_fdopen(*args, **kwargs))
+
+    monkeypatch.setattr(engine_module.os, "fdopen", failing_fdopen)
+
+    require_rejected(lambda: engine.execute(plan))
+
+    assert partial_writes, "Test must fail after a staging file has actually received bytes"
+    assert (target / "note.md").read_bytes() == b"old target"
+    assert (target / "obsolete.md").read_bytes() == b"do not delete"
+    assert sorted(path.name for path in target.iterdir()) == ["note.md", "obsolete.md"]
+
+
+def test_source_change_after_copy_stops_cleanup_phase(mirror):
+    engine, source, target = mirror
+    put(source, "note.md", b"new source")
+    put(target, "obsolete.md", b"do not delete")
+    plan = analyze(engine, source, target)
+
+    def change_source_after_copy(event):
+        if event.phase == "copied":
+            put(source, "arrived.md", b"added while synchronization was running")
+
+    require_rejected(lambda: engine.execute(plan, progress=change_source_after_copy))
+
+    assert (target / "note.md").read_bytes() == b"new source"
+    assert (target / "obsolete.md").read_bytes() == b"do not delete"
+    assert not (target / "arrived.md").exists()
+
+
+def test_overlapping_engine_operation_is_rejected(mirror):
+    engine, source, target = mirror
+    put(source, "note.md", b"source")
+    simultaneous = []
+
+    def attempt_reentry(event):
+        if event.phase == "compare" and not simultaneous:
+            with pytest.raises(SyncError):
+                engine.analyze(str(source), str(target))
+            simultaneous.append(True)
+
+    plan = analyze(engine, source, target, progress=attempt_reentry)
+
+    assert simultaneous
+    assert plan.can_execute, plan.errors
+    assert not engine.execute(plan).errors
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows path comparison is case-insensitive")
+def test_case_only_filename_differences_are_not_deleted_or_copied(mirror):
+    engine, source, target = mirror
+    put(source, "Notes/Example.md", b"same note")
+    put(target, "notes/example.md", b"same note")
+
+    plan, result = synchronize(engine, source, target)
+
+    assert plan.counts["skip"] == 1
+    assert plan.counts["add"] == 0
+    assert plan.counts["delete"] == 0
+    assert result.copied_bytes == 0
+    assert (target / "Notes/Example.md").read_bytes() == b"same note"
+
+
+@pytest.mark.parametrize("target_change", ["skipped", "copied", "new_file"])
+def test_target_change_after_copy_blocks_cleanup_and_never_reports_success(mirror, target_change):
+    engine, source, target = mirror
+    put(source, "stable.md", b"unchanged content")
+    synchronize(engine, source, target)
+    put(source, "new.md", b"new source content")
+    put(target, "obsolete.md", b"keep until all preconditions hold")
+    plan = analyze(engine, source, target)
+
+    def change_target_after_copy(event):
+        if event.phase == "copied":
+            relative = {"skipped": "stable.md", "copied": "new.md", "new_file": "unexpected.md"}[target_change]
+            put(target, relative, b"modified outside the application during synchronization")
+
+    result = engine.execute(plan, progress=change_target_after_copy)
+
+    assert result.status != "success"
+    assert result.errors
+    assert (target / "obsolete.md").read_bytes() == b"keep until all preconditions hold"
+
+
+@pytest.mark.parametrize("changed_side", ["source", "target"])
+def test_unrelated_external_change_during_cleanup_is_reported_as_incomplete(mirror, changed_side):
+    engine, source, target = mirror
+    put(source, "stable.md", b"unchanged content")
+    synchronize(engine, source, target)
+    put(target, "obsolete-a.md", b"obsolete A")
+    put(target, "obsolete-b.md", b"obsolete B")
+    plan = analyze(engine, source, target)
+    changed = []
+
+    def change_after_first_deletion(event):
+        if event.phase == "delete" and not changed:
+            changed.append(True)
+            put(source if changed_side == "source" else target, "stable.md", b"external modification while cleanup is running")
+
+    result = engine.execute(plan, progress=change_after_first_deletion)
+
+    assert changed
+    assert result.status != "success"
+    assert result.errors
+    changed_file = (source if changed_side == "source" else target) / "stable.md"
+    assert changed_file.read_bytes() == b"external modification while cleanup is running"
+    # Each unchanged target-only candidate remains independently safe to delete.
+    # A final whole-manifest check must report the unrelated retained-file change.
+
+
+@pytest.mark.parametrize("changed_side", ["source", "target"])
+def test_candidate_change_during_cleanup_stops_that_and_remaining_deletions(mirror, changed_side):
+    engine, source, target = mirror
+    put(source, "stable.md", b"unchanged content")
+    synchronize(engine, source, target)
+    for name in ("obsolete-a.md", "obsolete-b.md", "obsolete-c.md"):
+        put(target, name, b"obsolete original")
+    plan = analyze(engine, source, target)
+    candidates = [item.relative_path for item in plan.items if item.action == "delete"]
+    changed = []
+
+    def change_next_candidate_after_first_deletion(event):
+        if event.phase == "delete" and not changed:
+            changed.append(True)
+            assert event.relative_path == candidates[0]
+            put(source if changed_side == "source" else target, candidates[1], b"candidate changed during cleanup")
+
+    result = engine.execute(plan, progress=change_next_candidate_after_first_deletion)
+
+    assert changed
+    assert result.status != "success"
+    assert result.errors
+    assert not (target / candidates[0]).exists()
+    assert (target / candidates[1]).exists()
+    assert (target / candidates[2]).read_bytes() == b"obsolete original"
+    expected = b"obsolete original" if changed_side == "source" else b"candidate changed during cleanup"
+    assert (target / candidates[1]).read_bytes() == expected
+
+
+@pytest.mark.parametrize("changed_side", ["source", "target"])
+def test_change_after_last_deletion_is_not_reported_as_success(mirror, changed_side):
+    engine, source, target = mirror
+    put(source, "stable.md", b"unchanged content")
+    synchronize(engine, source, target)
+    put(target, "obsolete.md", b"obsolete")
+    plan = analyze(engine, source, target)
+
+    def change_after_deletion(event):
+        if event.phase == "delete":
+            put(source if changed_side == "source" else target, "stable.md", b"external modification after the last deletion")
+
+    result = engine.execute(plan, progress=change_after_deletion)
+
+    assert not (target / "obsolete.md").exists()
+    assert result.status != "success"
+    assert result.errors
+
+
+def register_crash_temp(engine, source, target, temp, *, mismatched_identity=False):
+    """Simulate the exact durable registration left behind by a killed process."""
+    plan = analyze(engine, source, target)
+    assert plan.can_execute, plan.errors
+    recorded_identity = paths_module.identity(paths_module.snapshot(temp))
+    if mismatched_identity:
+        recorded_identity = (*recorded_identity[:-1], -1)
+    store = BaselineStore(engine.state_dir)
+    try:
+        store.register_temp(plan.pair_id, paths_module.native(temp), recorded_identity)
+    finally:
+        store.close()
+
+
+def test_registered_crash_temp_is_reclaimed_before_checking_available_capacity(mirror, monkeypatch):
+    engine, source, target = mirror
+    put(source, "new.md", b"new source content")
+    crash_temp = put(target, ".obmanage-crash.tmp", b"partial staging content")
+    ordinary_extra = put(target, "ordinary-target-only.md", b"do not reclaim early")
+    register_crash_temp(engine, source, target, crash_temp)
+    plan = analyze(engine, source, target)
+    capacity_checks = []
+
+    def disk_usage_after_reclamation(path):
+        capacity_checks.append(True)
+        assert not crash_temp.exists(), "Owned crash residue must be reclaimed before the free-space check"
+        assert ordinary_extra.exists(), "Ordinary mirror deletions must wait until all copies succeed"
+        return SimpleNamespace(total=1_000_000, used=0, free=1_000_000)
+
+    monkeypatch.setattr(engine_module.shutil, "disk_usage", disk_usage_after_reclamation)
+    result = engine.execute(plan)
+
+    assert capacity_checks
+    assert result.status == "success", result.errors
+    assert result.deleted_files == 2
+    assert (target / "new.md").read_bytes() == b"new source content"
+    assert not crash_temp.exists()
+    assert not ordinary_extra.exists()
+    store = BaselineStore(engine.state_dir)
+    try:
+        assert store.temps(plan.pair_id) == []
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("registration", ["unregistered", "wrong_identity", "present_in_source"])
+def test_early_crash_cleanup_never_deletes_an_unowned_or_source_named_file(mirror, monkeypatch, registration):
+    engine, source, target = mirror
+    put(source, "new.md", b"new source content")
+    possible_temp = put(target, ".obmanage-crash.tmp", b"target file to protect")
+    if registration == "present_in_source":
+        put(source, ".obmanage-crash.tmp", b"target file to protect")
+    if registration != "unregistered":
+        register_crash_temp(engine, source, target, possible_temp, mismatched_identity=registration == "wrong_identity")
+    plan = analyze(engine, source, target)
+    monkeypatch.setattr(engine_module.shutil, "disk_usage", lambda path: SimpleNamespace(total=1, used=1, free=0))
+
+    result = engine.execute(plan)
+
+    assert result.status != "success"
+    assert possible_temp.read_bytes() == b"target file to protect"
+    assert not (target / "new.md").exists()
+
+
+def test_stale_preview_prevents_even_registered_temp_reclamation(mirror):
+    engine, source, target = mirror
+    put(source, "new.md", b"source at preview")
+    crash_temp = put(target, ".obmanage-crash.tmp", b"partial staging content")
+    register_crash_temp(engine, source, target, crash_temp)
+    plan = analyze(engine, source, target)
+    put(source, "new.md", b"changed after preview")
+
+    result = engine.execute(plan)
+
+    assert result.status != "success"
+    assert crash_temp.read_bytes() == b"partial staging content"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows path comparison is case-insensitive")
+def test_case_only_rename_changes_actual_names_and_refreshes_baseline(mirror, monkeypatch):
+    engine, source, target = mirror
+    put(source, "Notes/Topics/Example.md", b"same note")
+    put(target, "notes/topics/example.md", b"same note")
+
+    plan, result = synchronize(engine, source, target)
+
+    assert plan.counts["rename"] == 3
+    assert result.renamed_items == 3
+    assert result.copied_bytes == 0
+    assert [path.name for path in target.iterdir()] == ["Notes"]
+    assert [path.name for path in (target / "Notes").iterdir()] == ["Topics"]
+    assert [path.name for path in (target / "Notes/Topics").iterdir()] == ["Example.md"]
+
+    def unnecessary_hash(*args, **kwargs):
+        pytest.fail("Successful case-only rename must preserve a reusable verified baseline")
+
+    monkeypatch.setattr(engine_module, "_hash_file", unnecessary_hash)
+    second_plan, second_result = synchronize(engine, source, target)
+    assert second_plan.counts["rename"] == 0
+    assert second_plan.counts["skip"] == 1
+    assert second_result.copied_bytes == 0
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows path comparison is case-insensitive")
+def test_case_only_rename_and_content_update_both_apply(mirror):
+    engine, source, target = mirror
+    put(source, "Note.md", b"new source content")
+    put(target, "note.md", b"old target")
+
+    plan, result = synchronize(engine, source, target)
+
+    assert plan.counts["rename"] == 1
+    assert plan.counts["update"] == 1
+    assert result.renamed_items == 1
+    assert result.copied_files == 1
+    assert [path.name for path in target.iterdir()] == ["Note.md"]
+    assert (target / "Note.md").read_bytes() == b"new source content"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows path comparison is case-insensitive")
+def test_case_only_rename_after_previous_sync_keeps_video_bytes_unchanged(mirror):
+    engine, source, target = mirror
+    put(source, "notes/video.mp4", b"immutable video" * 1024)
+    put(source, "note.md", b"note")
+    synchronize(engine, source, target)
+    video_identity = (target / "notes/video.mp4").stat().st_ino
+    (source / "notes").rename(source / "Notes")
+    (source / "note.md").rename(source / "Note.md")
+
+    plan, result = synchronize(engine, source, target)
+
+    assert plan.counts["rename"] == 2
+    assert result.renamed_items == 2
+    assert result.copied_bytes == 0
+    assert sorted(path.name for path in target.iterdir()) == ["Note.md", "Notes"]
+    assert (target / "Notes/video.mp4").stat().st_ino == video_identity
