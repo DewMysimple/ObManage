@@ -27,6 +27,7 @@ from PySide6.QtCore import (
 from PySide6.QtGui import QAction, QColor, QFont, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QDialog,
@@ -55,9 +56,16 @@ from PySide6.QtWidgets import (
 )
 
 from .engine import SyncEngine
-from .models import PlanItem, Progress, SyncCancelled, SyncPlan, SyncResult
+from .models import PlanItem, Progress, SyncCancelled, SyncError, SyncPlan, SyncResult
+from .paths import validate_state_separation
 from .scheduler import Scheduler
 from .settings import SettingsStore
+from .tasking import FeatureWorker
+from .pages.common import FeaturePage
+from .pages.distribution import ObsidianConfigPage, TemplateSuitePage, TemplaterPage
+from .pages.registry import FEATURES
+from .pages.statistics import StatisticsPage
+from .pages.trash_cleanup import TrashCleanupPage
 
 
 ACTION_NAMES = {
@@ -392,6 +400,15 @@ QMainWindow, QDialog { background: #F3F5F4; }
 QWidget { color: #23353F; font-family: "Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI"; font-size: 13px; }
 QLabel { background: transparent; }
 QLabel#Brand { font-size: 24px; font-weight: 700; letter-spacing: -0.5px; }
+QLabel#PageTitle { font-size: 24px; font-weight: 700; letter-spacing: -0.5px; }
+QFrame#Navigation { background: #E9EEEF; border-right: 1px solid #D9E1E3; }
+QLabel#NavBrand { color: #294F66; font-size: 17px; font-weight: 700; }
+QLabel#NavCaption { color: #7A898F; font-size: 11px; padding: 1px 5px; }
+QPushButton#NavButton { min-height: 38px; text-align: left; padding: 1px 12px; background: transparent; border: 1px solid transparent; color: #50646F; }
+QPushButton#NavButton:hover { background: #F4F7F7; border-color: #DCE4E6; }
+QPushButton#NavButton:checked { background: #FFFFFF; border-color: #D5E0E4; color: #28536C; font-weight: 600; }
+QPushButton#NavUtility { min-height: 32px; text-align: left; padding: 1px 12px; background: transparent; border: 1px solid transparent; color: #60747E; }
+QPushButton#NavUtility:hover { background: #F4F7F7; border-color: #DCE4E6; color: #274E69; }
 QLabel#Subtitle, QLabel#Muted { color: #758189; font-size: 12px; }
 QLabel#SectionTitle { font-size: 14px; font-weight: 600; }
 QLabel#Direction { font-size: 13px; font-weight: 600; color: #315F7B; }
@@ -423,6 +440,8 @@ QPushButton#Primary:disabled { background: #C6D2D9; border-color: #C6D2D9; color
 QPushButton#TextButton { background: transparent; border-color: transparent; color: #5B7180; padding-left: 3px; }
 QPushButton#TextButton:hover { color: #274E69; background: #E9EEEF; }
 QPushButton#Cancel { color: #A04F44; }
+QPushButton#Recovery { color: #8B642D; border-color: #DEC9A7; background: #FFF9EE; }
+QPushButton#Recovery:hover { background: #F8EDD9; border-color: #CFB27E; }
 QCheckBox { spacing: 8px; }
 QCheckBox::indicator { width: 17px; height: 17px; border: 1px solid #B9C7CD; border-radius: 5px; background: #FFFFFF; }
 QCheckBox::indicator:checked { background: #315F7B; border: 4px solid #315F7B; image: none; }
@@ -452,18 +471,22 @@ QToolTip { color: #23353F; background: #FFFFFF; border: 1px solid #CCD7DC; paddi
 
 
 class MainWindow(QMainWindow):
-    """Chinese desktop shell; the mirror engine never runs on the GUI thread."""
+    """Application shell hosting one isolated page per repository-management feature."""
 
     def __init__(self, state_dir: Path) -> None:
         super().__init__()
         self.state_dir = Path(state_dir)
         self.store = SettingsStore(self.state_dir)
-        self.settings = self.store.load()
+        self.settings_document = self.store.load_document()
+        self.settings = self.settings_document.mirror
         self.scheduler = Scheduler()
         self.plan: SyncPlan | None = None
         self.last_result: SyncResult | None = None
         self._thread: QThread | None = None
         self._worker: SyncWorker | None = None
+        self._feature_worker: FeatureWorker | None = None
+        self._feature_page: FeaturePage | None = None
+        self._feature_outcome: tuple[str, Any] | None = None
         self._cancel_event = threading.Event()
         self._pending_outcome: tuple[str, Any] | None = None
         self._operation = ""
@@ -482,7 +505,7 @@ class MainWindow(QMainWindow):
         self._log_lines: list[str] = []
         self._load_log()
 
-        self.setWindowTitle("ObManage · 仓库镜像")
+        self.setWindowTitle("ObManage · Obsidian 仓库管理")
         self.setObjectName("main_window")
         self.setWindowIcon(app_icon())
         self.resize(1140, 920)
@@ -509,12 +532,79 @@ class MainWindow(QMainWindow):
 
     @property
     def busy(self) -> bool:
-        return self._thread is not None
+        return self._thread is not None or self._feature_worker is not None
 
     def _build_ui(self) -> None:
         central = QWidget(self)
         self.setCentralWidget(central)
-        outer = QVBoxLayout(central)
+        shell = QHBoxLayout(central)
+        shell.setContentsMargins(0, 0, 0, 0)
+        shell.setSpacing(0)
+
+        navigation = QFrame()
+        navigation.setObjectName("Navigation")
+        navigation.setFixedWidth(164)
+        nav_layout = QVBoxLayout(navigation)
+        nav_layout.setContentsMargins(10, 13, 10, 12)
+        nav_layout.setSpacing(5)
+        nav_brand = QHBoxLayout()
+        nav_mark = QLabel()
+        nav_mark.setPixmap(self.windowIcon().pixmap(27, 27))
+        nav_mark.setFixedSize(29, 29)
+        nav_brand.addWidget(nav_mark)
+        nav_name = QLabel("ObManage")
+        nav_name.setObjectName("NavBrand")
+        nav_brand.addWidget(nav_name)
+        nav_brand.addStretch()
+        nav_layout.addLayout(nav_brand)
+        nav_caption = QLabel("仓库管理中心")
+        nav_caption.setObjectName("NavCaption")
+        nav_layout.addWidget(nav_caption)
+        nav_layout.addSpacing(8)
+        self.navigation_group = QButtonGroup(self)
+        self.navigation_group.setExclusive(True)
+        self.navigation_buttons: dict[str, QPushButton] = {}
+        for index, feature in enumerate(FEATURES):
+            button = QPushButton(feature.short_title)
+            button.setObjectName("NavButton")
+            button.setCheckable(True)
+            button.setProperty("pageKey", feature.key)
+            button.setToolTip(feature.description)
+            self.navigation_group.addButton(button, index)
+            self.navigation_buttons[feature.key] = button
+            nav_layout.addWidget(button)
+            button.clicked.connect(lambda checked=False, key=feature.key: self._show_page(key))
+        nav_layout.addStretch()
+        self.nav_recovery_button = QPushButton("待恢复事务")
+        self.nav_recovery_button.setObjectName("Recovery")
+        self.nav_recovery_button.setToolTip(
+            "有写操作尚未确认、撤销或安全清理；点击进入处理页面。"
+        )
+        self.nav_recovery_button.hide()
+        nav_layout.addWidget(self.nav_recovery_button)
+        self.nav_cancel_button = QPushButton("取消当前任务")
+        self.nav_cancel_button.setObjectName("Cancel")
+        self.nav_cancel_button.hide()
+        nav_layout.addWidget(self.nav_cancel_button)
+        self.logs_button = QPushButton("查看操作日志")
+        self.logs_button.setObjectName("NavUtility")
+        nav_layout.addWidget(self.logs_button)
+        nav_hint = QLabel("所有写操作都先预览并确认")
+        nav_hint.setObjectName("NavCaption")
+        nav_hint.setWordWrap(True)
+        nav_layout.addWidget(nav_hint)
+        shell.addWidget(navigation)
+
+        self.page_stack = QStackedWidget()
+        shell.addWidget(self.page_stack, 1)
+        self.pages: dict[str, QWidget] = {}
+        self.page_containers: dict[str, QWidget] = {}
+        self._current_page_key = "mirror"
+        self.mirror_page = QWidget()
+        self.pages["mirror"] = self.mirror_page
+        self.page_containers["mirror"] = self.mirror_page
+        self.page_stack.addWidget(self.mirror_page)
+        outer = QVBoxLayout(self.mirror_page)
         outer.setContentsMargins(0, 0, 0, 0)
         outer.setSpacing(0)
         self.content_scroll = QScrollArea()
@@ -533,7 +623,7 @@ class MainWindow(QMainWindow):
         mark.setPixmap(self.windowIcon().pixmap(32, 32))
         mark.setFixedSize(32, 32)
         header.addWidget(mark)
-        brand = QLabel("ObManage")
+        brand = QLabel("仓库镜像")
         brand.setObjectName("Brand")
         header.addWidget(brand)
         subtitle = QLabel("本机与移动硬盘之间的增量镜像")
@@ -801,9 +891,6 @@ class MainWindow(QMainWindow):
         footer_layout.addWidget(self.confirm_direction_checkbox)
         actions = QHBoxLayout()
         actions.setSpacing(10)
-        self.logs_button = QPushButton("查看日志")
-        self.logs_button.setObjectName("TextButton")
-        actions.addWidget(self.logs_button)
         actions.addStretch()
         self.cancel_button = QPushButton("取消")
         self.cancel_button.setObjectName("Cancel")
@@ -822,14 +909,166 @@ class MainWindow(QMainWindow):
         footer_layout.addLayout(actions)
         outer.addWidget(footer)
 
+        distribution_pages = {
+            "template_suite": TemplateSuitePage,
+            "obsidian_config": ObsidianConfigPage,
+            "templater": TemplaterPage,
+        }
+        for feature in FEATURES[1:]:
+            if feature.key == "statistics":
+                page = StatisticsPage(
+                    self.settings_document.features.get(feature.key, {}),
+                    self.settings.local_path,
+                )
+            elif feature.key in distribution_pages:
+                page = distribution_pages[feature.key](
+                    self.state_dir,
+                    self.settings_document.features.get(feature.key, {}),
+                    self.settings.local_path,
+                )
+            elif feature.key == "trash_cleanup":
+                page = TrashCleanupPage(
+                    self.state_dir,
+                    self.settings_document.features.get(feature.key, {}),
+                    self.settings.local_path,
+                )
+            else:
+                raise RuntimeError(f"未注册功能页面：{feature.key}")
+            page.task_requested.connect(
+                lambda operation, current=page: self._start_feature_task(current, operation)
+            )
+            page.cancel_requested.connect(self.cancel_operation)
+            page.settings_changed.connect(self._queue_settings_save)
+            page.message_logged.connect(self._log)
+            self.pages[feature.key] = page
+            page_scroll = QScrollArea()
+            page_scroll.setObjectName(f"{feature.key}_scroll")
+            page_scroll.setWidgetResizable(True)
+            page_scroll.setFrameShape(QFrame.Shape.NoFrame)
+            page_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            page_scroll.setWidget(page)
+            self.page_containers[feature.key] = page_scroll
+            self.page_stack.addWidget(page_scroll)
+
+        selected = self.settings_document.selected_page
+        self._show_page(selected if selected in self.pages else "mirror", persist=False)
+
+    def _show_page(self, key: str, *, persist: bool = True) -> None:
+        page = self.pages.get(key)
+        if page is None:
+            return
+        current = self.pages.get(self._current_page_key)
+        if current is self.mirror_page and page is not current:
+            # A destructive acknowledgment never survives leaving its context.
+            self.confirm_direction_checkbox.setChecked(False)
+        elif isinstance(current, FeaturePage) and page is not current:
+            current.invalidate_confirmation()
+        self.page_stack.setCurrentWidget(self.page_containers[key])
+        self._current_page_key = key
+        self.navigation_buttons[key].setChecked(True)
+        self.settings_document.selected_page = key
+        feature = next(item for item in FEATURES if item.key == key)
+        self.setWindowTitle(f"ObManage · {feature.title}")
+        if persist:
+            self._queue_settings_save()
+
+    def _queue_settings_save(self) -> None:
+        if hasattr(self, "_save_timer"):
+            self._save_timer.start()
+
+    def _configured_repository_paths(self) -> tuple[str, ...]:
+        roots = [*self._paths()]
+        for page in self.pages.values():
+            if isinstance(page, FeaturePage):
+                roots.extend(page.repository_paths())
+        return tuple(path for path in roots if path and path.strip())
+
+    def _state_location_error(self) -> str:
+        try:
+            validate_state_separation(
+                self.state_dir, self._configured_repository_paths()
+            )
+        except (OSError, ValueError, SyncError) as exc:
+            return str(exc)
+        return ""
+
+    def _reject_unsafe_state_location(self, page: FeaturePage | None = None) -> bool:
+        error = self._state_location_error()
+        if not error:
+            return False
+        message = f"程序数据目录与当前仓库路径冲突，已阻止操作：{error}"
+        if page is not None:
+            page.set_status(message, "error")
+            page._task_active = False
+            page.refresh_actions()
+        else:
+            self._set_status(message, "error")
+        return True
+
+    def _start_feature_task(self, page: FeaturePage, operation: Any) -> None:
+        if self._reject_unsafe_state_location(page):
+            self._refresh_actions()
+            return
+        if self.busy or self._confirming_empty or self._exit_requested:
+            page._task_active = False
+            page.set_status("已有任务正在运行，请等待完成或先取消。", "warning")
+            page.refresh_actions()
+            return
+        worker = FeatureWorker(operation)
+        worker.progress.connect(page.task_progress)
+        worker.completed.connect(self._on_feature_completed)
+        worker.finished.connect(self._feature_thread_finished)
+        worker.finished.connect(worker.deleteLater)
+        self._feature_worker = worker
+        self._feature_page = page
+        self._feature_outcome = None
+        self._refresh_actions()
+        worker.start()
+
+    def _recovery_page_keys(self) -> tuple[str, ...]:
+        return tuple(
+            key for key, page in self.pages.items()
+            if key != "mirror" and isinstance(page, FeaturePage)
+            and page.has_pending_recovery()
+        )
+
+    @Slot()
+    def _show_first_recovery_page(self) -> None:
+        keys = self._recovery_page_keys()
+        if keys:
+            self._show_page(keys[0])
+
+    @Slot(object)
+    def _on_feature_completed(self, outcome: tuple[str, Any]) -> None:
+        self._feature_outcome = outcome
+
+    @Slot()
+    def _feature_thread_finished(self) -> None:
+        worker = self._feature_worker
+        page = self._feature_page
+        outcome = self._feature_outcome or ("error", "后台任务结束，但未返回结果。")
+        self._feature_worker = None
+        self._feature_page = None
+        self._feature_outcome = None
+        if page is not None:
+            status, payload = outcome
+            page.task_finished(status, payload)
+            if status == "error":
+                self._log(str(payload))
+            elif status == "cancelled":
+                self._log("管理任务已取消。")
+        self._refresh_actions()
+        if self._exit_requested:
+            self._finish_exit()
+
     def _build_tray(self) -> None:
         self.tray = QSystemTrayIcon(self.windowIcon(), self)
-        self.tray.setToolTip("ObManage · 仓库镜像")
+        self.tray.setToolTip("ObManage · Obsidian 仓库管理")
         menu = QMenu(self)
         self.tray_open_action = QAction("打开 ObManage", self)
         self.tray_open_action.triggered.connect(self._show_window)
         menu.addAction(self.tray_open_action)
-        self.tray_sync_action = QAction("立即同步…", self)
+        self.tray_sync_action = QAction("分析镜像差异…", self)
         self.tray_sync_action.triggered.connect(self._tray_sync)
         menu.addAction(self.tray_sync_action)
         self.tray_pause_action = QAction("暂停定时", self)
@@ -857,6 +1096,8 @@ class MainWindow(QMainWindow):
         self.deep_button.clicked.connect(lambda: self.analyze(deep=True))
         self.sync_button.clicked.connect(self.start_sync)
         self.cancel_button.clicked.connect(self.cancel_operation)
+        self.nav_cancel_button.clicked.connect(self.cancel_operation)
+        self.nav_recovery_button.clicked.connect(self._show_first_recovery_page)
         self.logs_button.clicked.connect(self.show_logs)
         self.filter_tabs.currentChanged.connect(self._change_filter)
         self.schedule_toggle.toggled.connect(self._schedule_changed)
@@ -992,8 +1233,10 @@ class MainWindow(QMainWindow):
 
         self._refresh_direction_text()
 
-    def _persist(self, remember_target: bool = False) -> None:
+    def _persist(self, remember_target: bool = False) -> bool:
         source, target = self._paths()
+        if self._reject_unsafe_state_location():
+            return False
         self.settings.set_endpoints(self.local_edit.text().strip(), self.portable_combo.currentText().strip())
         self.settings.schedule_enabled = self.schedule_toggle.isChecked()
         self.settings.schedule_mode = self.schedule_mode.currentData()
@@ -1007,15 +1250,33 @@ class MainWindow(QMainWindow):
             self.target_combo.addItems(self.settings.recent_targets)
             self.target_combo.setCurrentText(portable)
             del blocker
+        self.settings_document.mirror = self.settings
+        for key, page in self.pages.items():
+            if key != "mirror" and isinstance(page, FeaturePage):
+                self.settings_document.features[key] = page.settings_payload()
         try:
-            self.store.save(self.settings)
+            self.store.save_document(self.settings_document)
         except (OSError, ValueError) as exc:
             self._log(f"无法保存设置：{exc}")
             self._set_status("无法保存设置，详情见日志。", "warning")
+            return False
+        return True
 
     @Slot()
     def _schedule_changed(self, *_: Any) -> None:
         self.settings.set_endpoints(self.local_edit.text().strip(), self.portable_combo.currentText().strip())
+        if self._state_location_error():
+            blocker = QSignalBlocker(self.schedule_toggle)
+            self.schedule_toggle.setChecked(False)
+            del blocker
+            self.settings.schedule_enabled = False
+            self.settings.bound_source = ""
+            self.settings.bound_target = ""
+            self.scheduler.pause()
+            self._reject_unsafe_state_location()
+            self._refresh_schedule_controls()
+            self._refresh_actions()
+            return
         if self.schedule_toggle.isChecked():
             source, target = self._paths()
             if not source or not target:
@@ -1072,9 +1333,12 @@ class MainWindow(QMainWindow):
         if self._exit_requested:
             return
         was_due = self.scheduler.next_run is not None and datetime.now() >= self.scheduler.next_run
-        occupied = self.busy or self._confirming_empty
+        recovery_pending = bool(self._recovery_page_keys())
+        occupied = self.busy or self._confirming_empty or recovery_pending
         due = self.scheduler.tick(occupied)
-        if was_due and occupied:
+        if was_due and recovery_pending:
+            self._log("到达定时时间，但存在待恢复事务；本轮镜像已跳过，不累计任务。")
+        elif was_due and occupied:
             self._log("到达定时时间，本轮已有任务运行；已跳过，不累计任务。")
         if due:
             if self._paths() != (self.settings.bound_source, self.settings.bound_target):
@@ -1086,6 +1350,9 @@ class MainWindow(QMainWindow):
 
     def _refresh_actions(self) -> None:
         available = not self.busy and not self._confirming_empty and not self._exit_requested
+        state_location_safe = not self._state_location_error()
+        recovery_keys = self._recovery_page_keys()
+        recovery_pending = bool(recovery_keys)
         for control in (
             self.direction_to_local_button,
             self.direction_to_portable_button,
@@ -1100,24 +1367,50 @@ class MainWindow(QMainWindow):
         ):
             control.setEnabled(available)
         source, target = self._paths()
-        self.analyze_button.setEnabled(available and bool(source and target))
-        self.deep_button.setEnabled(available and bool(source and target))
+        self.analyze_button.setEnabled(available and state_location_safe and bool(source and target))
+        self.deep_button.setEnabled(available and state_location_safe and bool(source and target))
         self.sync_button.setEnabled(
             available
+            and state_location_safe
+            and not recovery_pending
             and self._plan_matches_paths()
             and self.plan.can_execute
             and self.plan.has_changes
             and self.confirm_direction_checkbox.isChecked()
         )
         self.confirm_direction_checkbox.setEnabled(
-            available and self._plan_matches_paths() and self.plan.can_execute and self.plan.has_changes
+            available and state_location_safe and not recovery_pending and self._plan_matches_paths()
+            and self.plan.can_execute and self.plan.has_changes
         )
-        self.cancel_button.setVisible(self.busy)
-        self.cancel_button.setEnabled(self.busy and not self._cancel_event.is_set() and not self._exit_requested)
-        self.tray_sync_action.setEnabled(available)
+        cancel_sent = (
+            self._feature_worker.cancel_event.is_set()
+            if self._feature_worker is not None else self._cancel_event.is_set()
+        )
+        feature_cancellable = (
+            self._feature_page.task_cancellable()
+            if self._feature_page is not None else False
+        )
+        cancellable = self._thread is not None or feature_cancellable
+        self.cancel_button.setVisible(self._thread is not None)
+        self.cancel_button.setEnabled(
+            self._thread is not None and not cancel_sent and not self._exit_requested
+        )
+        self.nav_cancel_button.setVisible(cancellable)
+        self.nav_cancel_button.setEnabled(cancellable and not cancel_sent and not self._exit_requested)
+        self.nav_recovery_button.setVisible(recovery_pending)
+        self.nav_recovery_button.setText(f"待恢复事务 · {len(recovery_keys)} 页")
+        self.tray_sync_action.setEnabled(available and state_location_safe)
+        for key, page in self.pages.items():
+            if key != "mirror" and isinstance(page, FeaturePage):
+                page.set_global_busy(self.busy or self._confirming_empty or self._exit_requested)
+                page.set_external_recovery_pending(any(
+                    recovery_key != key for recovery_key in recovery_keys
+                ))
 
     def analyze(self, deep: bool = False, scheduled: bool = False) -> None:
         if self.busy or self._confirming_empty or self._exit_requested:
+            return
+        if self._reject_unsafe_state_location():
             return
         source, target = self._paths()
         if not source or not target:
@@ -1140,6 +1433,14 @@ class MainWindow(QMainWindow):
     @Slot()
     def start_sync(self) -> None:
         if self.busy or self._confirming_empty or self._exit_requested:
+            return
+        if self._reject_unsafe_state_location():
+            return
+        if self._recovery_page_keys():
+            self._set_status(
+                "存在待恢复事务，请先通过左侧入口完成撤销、恢复或确认清理。",
+                "warning",
+            )
             return
         if not self.plan or not self._plan_matches_paths() or not self.plan.can_execute:
             self._set_status("请先重新分析差异，得到可执行的预览。", "warning")
@@ -1181,6 +1482,13 @@ class MainWindow(QMainWindow):
         return plan.source_empty and any(item.action in ("delete", "rmdir") for item in plan.items)
 
     def _execute_plan(self, allow_empty: bool = False, scheduled: bool = False) -> None:
+        if self._reject_unsafe_state_location():
+            return
+        if self._recovery_page_keys():
+            message = "存在待恢复事务，本轮镜像已阻止；请先完成撤销、恢复或确认清理。"
+            self._set_status(message, "warning")
+            self._log(message)
+            return
         source_name, target_name = self._endpoint_names()
         self._set_status(f"正在更新{target_name}，完成新增与更新后再删除此处多余内容；{source_name}只读取。", "busy")
         self._log(
@@ -1444,9 +1752,15 @@ class MainWindow(QMainWindow):
     def cancel_operation(self) -> None:
         if not self.busy:
             return
-        self._cancel_event.set()
+        if self._feature_worker is not None:
+            self._feature_worker.request_cancel()
+            if self._feature_page is not None:
+                self._feature_page.set_status("正在取消，请等待当前步骤安全停止…", "warning")
+        else:
+            self._cancel_event.set()
         self._set_status("正在取消，请等待当前操作安全停止…", "warning")
         self.cancel_button.setEnabled(False)
+        self.nav_cancel_button.setEnabled(False)
         self._log("已请求取消，等待后台任务停止。")
 
     def _set_status(self, text: str, kind: str = "neutral") -> None:
@@ -1496,12 +1810,14 @@ class MainWindow(QMainWindow):
             self._log_lines = []
 
     def _log(self, message: str) -> None:
-        logging.getLogger(__name__).info(message)
         line = f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {message}"
         self._log_lines.append(line)
         self._log_lines = self._log_lines[-3000:]
         if self._log_dialog is not None:
             self.log_view.appendPlainText(line)
+        if self._state_location_error():
+            return
+        logging.getLogger(__name__).info(message)
         try:
             self.state_dir.mkdir(parents=True, exist_ok=True)
             path = self.state_dir / "ui.log"
@@ -1561,6 +1877,7 @@ class MainWindow(QMainWindow):
     def _tray_sync(self) -> None:
         self._show_window()
         if not self.busy:
+            self._show_page("mirror")
             self.analyze()
 
     def _tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
@@ -1576,7 +1893,10 @@ class MainWindow(QMainWindow):
         self._save_timer.stop()
         self._persist()
         if self.busy:
-            self._cancel_event.set()
+            if self._feature_worker is not None:
+                self._feature_worker.request_cancel()
+            else:
+                self._cancel_event.set()
             self._set_status("正在安全停止后台任务，完成后退出…", "warning")
             self._refresh_actions()
             return

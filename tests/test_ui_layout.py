@@ -7,7 +7,7 @@ import time
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
-from PySide6.QtCore import QCoreApplication, QEvent, QPoint, Qt
+from PySide6.QtCore import QCoreApplication, QEvent, QPoint, QRect, Qt
 from PySide6.QtWidgets import QApplication, QMenu
 
 from obmanage.models import PlanItem, SyncPlan
@@ -195,3 +195,60 @@ def test_rendered_cells_have_visible_column_separators(application, preview_wind
             assert any(value != interior_left and value != interior_right for value in boundary_colors), (
                 f"No visible divider between columns {section} and {section + 1} in row {row}"
             )
+
+
+@pytest.mark.parametrize("size", [(980, 620), (1140, 920), (2560, 1440)])
+def test_every_management_page_fits_width_and_bottom_actions_are_reachable(
+    application, tmp_path, size
+):
+    window = MainWindow(tmp_path / f"state-{size[0]}-{size[1]}")
+    window.resize(*size)
+    window.show()
+    try:
+        bottom_controls = {
+            "statistics": (window.pages["statistics"].scan_button,),
+            "template_suite": (
+                window.pages["template_suite"].rollback_button,
+                window.pages["template_suite"].execute_button,
+            ),
+            "obsidian_config": (
+                window.pages["obsidian_config"].rollback_button,
+                window.pages["obsidian_config"].execute_button,
+            ),
+            "templater": (
+                window.pages["templater"].rollback_button,
+                window.pages["templater"].execute_button,
+            ),
+            "trash_cleanup": (
+                window.pages["trash_cleanup"].restore_button,
+                window.pages["trash_cleanup"].clear_button,
+            ),
+        }
+        for key, controls in bottom_controls.items():
+            window._show_page(key, persist=False)
+            scroll = window.page_containers[key]
+            settle(application)
+            assert scroll.horizontalScrollBar().maximum() == 0, (
+                f"{key} must not require horizontal scrolling at {size}"
+            )
+            scroll.verticalScrollBar().setValue(scroll.verticalScrollBar().maximum())
+            settle(application)
+            viewport = scroll.viewport()
+            for control in controls:
+                origin = control.mapTo(viewport, QPoint(0, 0))
+                mapped = QRect(origin, control.size())
+                assert viewport.rect().intersects(mapped), (
+                    f"{key} bottom action {control.objectName() or control.text()} "
+                    f"is unreachable at {size}"
+                )
+        if size == (980, 620):
+            for key in ("template_suite", "obsidian_config", "templater", "trash_cleanup"):
+                assert window.page_containers[key].verticalScrollBar().maximum() > 0
+    finally:
+        assert not window.busy
+        window._timer.stop()
+        window._save_timer.stop()
+        window.tray.hide()
+        window.hide()
+        window.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)

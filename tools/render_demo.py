@@ -1,4 +1,4 @@
-"""Render the real Qt window with synthetic data, without scanning any vault."""
+"""Render a real ObManage page with synthetic inputs, without scanning a vault."""
 from __future__ import annotations
 
 import argparse
@@ -15,6 +15,7 @@ from PySide6.QtGui import QFont
 from PySide6.QtWidgets import QApplication
 
 from obmanage.models import PlanItem, SyncPlan
+from obmanage.pages.registry import FEATURES
 from obmanage.settings import AppSettings, SettingsStore
 from obmanage.ui import MainWindow
 
@@ -25,6 +26,10 @@ def main() -> None:
     parser.add_argument("--width", type=int, default=1320)
     parser.add_argument("--height", type=int, default=880)
     parser.add_argument("--maximized", action="store_true")
+    parser.add_argument(
+        "--page", choices=[feature.key for feature in FEATURES], default="mirror",
+        help="page to render (default: mirror)",
+    )
     args = parser.parse_args()
     app = QApplication([])
     app.setQuitOnLastWindowClosed(False)
@@ -52,7 +57,10 @@ def main() -> None:
               for index in range(1250)],
             PlanItem("skip", "视频/旅行记录.mp4", 2_800_000_000, "两端与上次校验记录一致"),
         ]
-        window._accept_plan(SyncPlan(settings.source, settings.target, items), scheduled=False)
+        if args.page == "mirror":
+            window._accept_plan(SyncPlan(settings.source, settings.target, items), scheduled=False)
+        else:
+            window._show_page(args.page, persist=False)
         # Only presentation is exercised: no analyze/execute worker is started.
         if args.maximized:
             # The first Windows show may honor the launcher's STARTUPINFO;
@@ -68,9 +76,13 @@ def main() -> None:
         assert not window.busy and not window.confirm_direction_checkbox.isChecked()
         args.output.parent.mkdir(parents=True, exist_ok=True)
         assert window.grab().save(str(args.output)), "Could not save demo screenshot"
-        table = window.table
-        print(f"window={window.width()}x{window.height()} viewport={table.viewport().width()} "
-              f"columns={table.horizontalHeader().length()} horizontal_scroll={table.horizontalScrollBar().maximum()}")
+        table = window.table if args.page == "mirror" else None
+        details = (
+            f" viewport={table.viewport().width()} columns={table.horizontalHeader().length()} "
+            f"horizontal_scroll={table.horizontalScrollBar().maximum()}"
+            if table is not None else ""
+        )
+        print(f"page={args.page} window={window.width()}x{window.height()}{details}")
         window._timer.stop()
         window._save_timer.stop()
         window.tray.hide()

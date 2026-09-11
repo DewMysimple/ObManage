@@ -72,6 +72,32 @@ def assert_plain_chain(path: str | Path) -> None:
             raise SyncError(f"路径包含链接或非目录，无法安全同步：{part}")
 
 
+def validate_state_separation(state_dir: str | Path, roots: tuple[str, ...] | list[str]) -> str:
+    """Validate, without writing, that durable app state is outside repository roots."""
+    requested_state = canonical(state_dir)
+    assert_plain_chain(requested_state)
+    resolved_state = canonical(os.path.realpath(native(requested_state)))
+    assert_plain_chain(resolved_state)
+    state_key = os.path.normcase(resolved_state)
+    for raw_root in roots:
+        if not str(raw_root).strip():
+            continue
+        requested_root = canonical(raw_root)
+        assert_plain_chain(requested_root)
+        resolved_root = canonical(os.path.realpath(native(requested_root)))
+        assert_plain_chain(resolved_root)
+        root_key = os.path.normcase(resolved_root)
+        try:
+            common = os.path.commonpath((state_key, root_key))
+        except ValueError:
+            continue
+        if common in (state_key, root_key):
+            raise SyncError(
+                "程序数据目录必须与仓库路径分离，不能相同或互相包含。"
+            )
+    return resolved_state
+
+
 def checked_child(root: str, relative: str) -> str:
     parts = relative.replace("\\", "/").split("/")
     if not relative or any(part in ("", ".", "..") for part in parts):

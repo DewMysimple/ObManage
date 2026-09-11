@@ -119,6 +119,23 @@ def test_first_mirror_preserves_hidden_files_and_empty_directories(mirror):
     assert (target / "空目录/仍然为空").is_dir()
 
 
+def test_mirror_never_copies_or_deletes_deployment_recovery_directories(mirror):
+    engine, source, target = mirror
+    put(source, "note.md", b"active source")
+    source_recovery = source / ".obmanage-deploy-source.backup"
+    target_recovery = target / ".obmanage-deploy-target.rollback"
+    put(source_recovery, "private.md", b"must not be mirrored")
+    put(target_recovery, "original.md", b"only recoverable original")
+
+    plan, result = synchronize(engine, source, target)
+
+    assert result.status == "success"
+    assert (target / "note.md").read_bytes() == b"active source"
+    assert not (target / source_recovery.name).exists()
+    assert (target_recovery / "original.md").read_bytes() == b"only recoverable original"
+    assert all(".obmanage-deploy-" not in item.relative_path for item in plan.items)
+
+
 def test_incremental_updates_deletes_and_target_only_files(mirror):
     engine, source, target = mirror
     put(source, "unchanged/video.bin", b"unchanged video" * 100)

@@ -57,6 +57,21 @@ def test_state_database_cannot_be_created_inside_either_vault(tmp_path, state_si
     assert not state.exists()
 
 
+@pytest.mark.parametrize("repo_side", ["source", "target"])
+def test_vault_cannot_be_nested_inside_state_directory(tmp_path, repo_side):
+    state = tmp_path / "state"
+    state.mkdir()
+    nested = state / "vault"
+    nested.mkdir()
+    other = tmp_path / "other"
+    other.mkdir()
+    source, target = (nested, other) if repo_side == "source" else (other, nested)
+
+    rejected(SyncEngine(state), source, target)
+
+    assert not (state / "baselines.sqlite3").exists()
+
+
 def test_missing_target_can_be_previewed_without_creating_it(tmp_path):
     source = tmp_path / "source"
     source.mkdir()

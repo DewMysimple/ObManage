@@ -20,7 +20,8 @@ from typing import Callable
 
 from .models import PlanItem, Progress, SyncCancelled, SyncError, SyncPlan, SyncResult
 from .paths import (assert_plain_chain, canonical, checked_child, identity, native,
-                    revalidate_roots, snapshot, validate_roots)
+                    revalidate_roots, snapshot, validate_roots,
+                    validate_state_separation)
 from .store import BaselineStore
 
 CHUNK_SIZE = 4 * 1024 * 1024
@@ -34,6 +35,7 @@ _WINDOWS_DELETE_READONLY_ERRORS = frozenset((_WINDOWS_ACCESS_DENIED,))
 _WINDOWS_REPLACE_READONLY_ERRORS = frozenset(
     (_WINDOWS_ACCESS_DENIED, _WINDOWS_ALREADY_EXISTS)
 )
+_RESERVED_DIRECTORY_PREFIXES = (".obmanage-deploy-",)
 _ENGINE_TASK_LOCK = threading.Lock()
 
 
@@ -74,6 +76,15 @@ def _scan(root: str, cancel: threading.Event | None, progress: ProgressCallback)
                         raise SyncError(f"扫描时文件消失，请重新分析：{relative}")
                     if state["kind"] not in ("file", "dir"):
                         raise SyncError(f"不支持链接、重解析点或特殊文件：{relative}")
+                    if state["kind"] == "dir" and any(
+                        entry.name.casefold().startswith(prefix.casefold())
+                        for prefix in _RESERVED_DIRECTORY_PREFIXES
+                    ):
+                        # Deployment staging/backup/rollback trees are recovery
+                        # data owned by ObManage.  They are deliberately outside
+                        # the mirror namespace so a later mirror cannot copy or
+                        # delete the only recoverable original.
+                        continue
                     if _key(relative) in seen:
                         raise SyncError(f"存在 Windows 无法区分的大小写重名路径：{relative}")
                     seen.add(_key(relative))
@@ -321,16 +332,9 @@ class SyncEngine:
         self._lock = _ENGINE_TASK_LOCK
 
     def _check_state_location(self, source: str, target: str) -> None:
-        assert_plain_chain(self.state_dir)
-        self.state_dir = Path(canonical(os.path.realpath(native(self.state_dir))))
-        state = os.path.normcase(str(self.state_dir))
-        for root in (source, target):
-            root = os.path.normcase(root)
-            try:
-                if os.path.commonpath((state, root)) == root:
-                    raise SyncError("程序数据目录不能位于源目录或目标目录内。")
-            except ValueError:
-                pass
+        self.state_dir = Path(
+            validate_state_separation(self.state_dir, (source, target))
+        )
 
     def analyze(self, source: str, target: str, *, deep: bool = False,
                 cancel: threading.Event | None = None, progress: ProgressCallback = None) -> SyncPlan:
