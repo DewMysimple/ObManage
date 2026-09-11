@@ -10,6 +10,7 @@ import hashlib
 import os
 import shutil
 import sqlite3
+import stat
 import tempfile
 import threading
 import time
@@ -23,6 +24,14 @@ from .store import BaselineStore
 
 CHUNK_SIZE = 4 * 1024 * 1024
 ProgressCallback = Callable[[Progress], None] | None
+_WINDOWS_ACCESS_DENIED = 5
+_WINDOWS_ALREADY_EXISTS = 183
+_WINDOWS_READONLY = getattr(stat, "FILE_ATTRIBUTE_READONLY", 0x1)
+_WINDOWS_REPARSE_POINT = getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400)
+_WINDOWS_DELETE_READONLY_ERRORS = frozenset((_WINDOWS_ACCESS_DENIED,))
+_WINDOWS_REPLACE_READONLY_ERRORS = frozenset(
+    (_WINDOWS_ACCESS_DENIED, _WINDOWS_ALREADY_EXISTS)
+)
 
 
 def _cancelled(cancel: threading.Event | None) -> None:
@@ -110,6 +119,87 @@ def _hash_file(path: str, expected: dict, cancel: threading.Event | None,
     if read_bytes != expected["size"]:
         raise SyncError(f"校验时读取的大小不符：{relative_path}")
     return digest.hexdigest()
+
+
+def _stat_matches_file_snapshot(value: os.stat_result, expected: dict) -> bool:
+    return (stat.S_ISREG(value.st_mode)
+            and not getattr(value, "st_file_attributes", 0) & _WINDOWS_REPARSE_POINT
+            and value.st_nlink == 1
+            and (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns, value.st_ctime_ns) == (
+                expected["device"], expected["inode"], expected["size"],
+                expected["mtime_ns"], expected["ctime_ns"]
+            ))
+
+
+def _restore_windows_readonly(path: str, writable: dict | None) -> None:
+    """Best-effort rollback only while the path still has the cleared snapshot."""
+    if writable is None:
+        return
+    try:
+        if _stat_matches_file_snapshot(os.lstat(native(path)), writable):
+            os.chmod(native(path), stat.S_IREAD)
+    except OSError:
+        pass
+
+
+def _clear_windows_readonly(path: str, expected: dict | None, message: str) -> dict | None:
+    """Clear only a verified target file's DOS read-only bit for one retry."""
+    if os.name != "nt" or expected is None or expected.get("kind") != "file":
+        return None
+    current_stat = os.lstat(native(path))
+    if not getattr(current_stat, "st_file_attributes", 0) & _WINDOWS_READONLY:
+        return None
+    _require_state(path, expected, message)
+    verified_stat = os.lstat(native(path))
+    if (not _stat_matches_file_snapshot(verified_stat, expected)
+            or not getattr(verified_stat, "st_file_attributes", 0) & _WINDOWS_READONLY):
+        raise SyncError(f"{message}，已停止处理：{path}")
+    os.chmod(native(path), stat.S_IWRITE)
+    try:
+        writable = snapshot(path)
+    except OSError:
+        _restore_windows_readonly(path, expected)
+        raise
+    if (writable is None
+            or identity(writable) != identity(expected)
+            or writable["kind"] != "file"
+            or (writable["size"], writable["mtime_ns"]) != (expected["size"], expected["mtime_ns"])):
+        if writable is not None and identity(writable) == identity(expected):
+            _restore_windows_readonly(path, writable)
+        raise SyncError(f"{message}，已停止处理：{path}")
+    try:
+        writable_stat = os.lstat(native(path))
+    except OSError:
+        _restore_windows_readonly(path, writable)
+        raise
+    if not _stat_matches_file_snapshot(writable_stat, writable):
+        current = snapshot(path)
+        if current is not None and identity(current) == identity(expected):
+            _restore_windows_readonly(path, current)
+        raise SyncError(f"{message}，已停止处理：{path}")
+    if getattr(writable_stat, "st_file_attributes", 0) & _WINDOWS_READONLY:
+        _restore_windows_readonly(path, writable)
+        raise SyncError(f"无法解除目标文件的只读属性：{path}")
+    return writable
+
+
+def _mutate_target_file(path: str, expected: dict | None, message: str,
+                        operation: Callable[[], None], retry_winerrors: frozenset[int]) -> None:
+    """Retry a Windows target mutation only when a verified file is read-only."""
+    try:
+        operation()
+        return
+    except OSError as exc:
+        if os.name != "nt" or getattr(exc, "winerror", None) not in retry_winerrors:
+            raise
+        writable = _clear_windows_readonly(path, expected, message)
+        if writable is None:
+            raise
+    try:
+        operation()
+    except BaseException:
+        _restore_windows_readonly(path, writable)
+        raise
 
 
 class SyncEngine:
@@ -289,8 +379,15 @@ class SyncEngine:
             revalidate_roots(plan.context, target_root=target_root)
             checked_child(plan.target, relative)
             _require_state(src_path, expected, "提交前源文件已改变")
-            _require_state(dst_path, self._target_expected(plan, relative), "提交前目标文件已改变")
-            os.replace(temp_path, native(dst_path))
+            target_expected = self._target_expected(plan, relative)
+            _require_state(dst_path, target_expected, "提交前目标文件已改变")
+            _mutate_target_file(
+                dst_path,
+                target_expected,
+                "提交前目标文件已改变",
+                lambda: os.replace(temp_path, native(dst_path)),
+                _WINDOWS_REPLACE_READONLY_ERRORS,
+            )
             store.unregister_temp(temp_path)
             temp_path = None
             result.copied_files += 1
@@ -495,7 +592,13 @@ class SyncEngine:
                 if item.action == "delete":
                     if actual != expected:
                         raise SyncError(f"待删除文件在预览后发生变化，已停止删除：{relative}")
-                    os.unlink(native(target_path))
+                    _mutate_target_file(
+                        target_path,
+                        expected,
+                        "待删除文件在预览后发生变化",
+                        lambda: os.unlink(native(target_path)),
+                        _WINDOWS_DELETE_READONLY_ERRORS,
+                    )
                     result.deleted_files += 1
                     store.remove(plan.pair_id, relative)
                 else:

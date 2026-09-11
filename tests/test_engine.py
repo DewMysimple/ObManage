@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import errno
+import stat
 from pathlib import Path
 from threading import Event
 from types import SimpleNamespace
@@ -120,6 +121,427 @@ def test_incremental_updates_deletes_and_target_only_files(mirror):
     assert not (target / "target-only").exists()
     assert unchanged.stat().st_mtime_ns == unchanged_metadata.st_mtime_ns
     assert unchanged.stat().st_ino == unchanged_metadata.st_ino
+
+
+@pytest.mark.skipif(os.name != "nt", reason="DOS read-only attributes are Windows-specific")
+def test_readonly_target_only_files_are_deleted_and_cleanup_continues(mirror):
+    engine, source, target = mirror
+    put(source, "keep.md", b"stable content")
+    put(target, "keep.md", b"stable content")
+    first = put(target, "old/deep/first.jpg", b"first target-only file")
+    second = put(target, "old/deep/second.jpg", b"second target-only file")
+    first.chmod(stat.S_IREAD)
+    second.chmod(stat.S_IREAD)
+    try:
+        plan, result = synchronize(engine, source, target)
+
+        assert plan.counts["delete"] == 2
+        assert plan.counts["rmdir"] == 2
+        assert result.deleted_files == 2
+        assert result.deleted_dirs == 2
+        assert not (target / "old").exists()
+    finally:
+        for path in (first, second):
+            if path.exists():
+                path.chmod(stat.S_IWRITE)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="DOS read-only attributes are Windows-specific")
+def test_readonly_existing_target_is_replaced_before_deletions(mirror):
+    engine, source, target = mirror
+    put(source, "note.md", b"authoritative source content")
+    destination = put(target, "note.md", b"old target")
+    obsolete = put(target, "obsolete.md", b"delete only after replacement")
+    destination.chmod(stat.S_IREAD)
+    try:
+        plan, result = synchronize(engine, source, target)
+
+        assert plan.counts["update"] == 1
+        assert result.copied_files == 1
+        assert destination.read_bytes() == b"authoritative source content"
+        assert destination.stat().st_mode & stat.S_IWRITE
+        assert not obsolete.exists()
+    finally:
+        if destination.exists():
+            destination.chmod(stat.S_IWRITE)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="DOS read-only attributes are Windows-specific")
+def test_non_readonly_access_denied_is_not_retried_with_chmod(mirror, monkeypatch):
+    engine, source, target = mirror
+    put(source, "keep.md", b"stable content")
+    put(target, "keep.md", b"stable content")
+    blocked = put(target, "a-blocked.md", b"ordinary writable target")
+    untouched = put(target, "z-untouched.md", b"later deletion must not run")
+    plan = analyze(engine, source, target)
+    real_unlink = engine_module.os.unlink
+    chmod_calls = []
+
+    def denied_unlink(path):
+        if paths_module.canonical(path) == paths_module.canonical(blocked):
+            raise PermissionError(errno.EACCES, "simulated access denied", path, 5)
+        return real_unlink(path)
+
+    def record_chmod(*args, **kwargs):
+        chmod_calls.append((args, kwargs))
+
+    monkeypatch.setattr(engine_module.os, "unlink", denied_unlink)
+    monkeypatch.setattr(engine_module.os, "chmod", record_chmod)
+
+    result = engine.execute(plan)
+
+    assert result.status == "failed"
+    assert blocked.exists()
+    assert untouched.exists()
+    assert chmod_calls == []
+
+
+@pytest.mark.skipif(os.name != "nt", reason="DOS read-only attributes are Windows-specific")
+def test_failed_readonly_delete_restores_attribute_and_stops_cleanup(mirror, monkeypatch):
+    engine, source, target = mirror
+    put(source, "keep.md", b"stable content")
+    put(target, "keep.md", b"stable content")
+    blocked = put(target, "a-blocked.md", b"read-only target")
+    untouched = put(target, "z-untouched.md", b"later deletion must not run")
+    blocked.chmod(stat.S_IREAD)
+    plan = analyze(engine, source, target)
+    real_unlink = engine_module.os.unlink
+
+    def denied_unlink(path):
+        if paths_module.canonical(path) == paths_module.canonical(blocked):
+            raise PermissionError(errno.EACCES, "simulated persistent denial", path, 5)
+        return real_unlink(path)
+
+    monkeypatch.setattr(engine_module.os, "unlink", denied_unlink)
+    try:
+        result = engine.execute(plan)
+
+        assert result.status == "failed"
+        assert blocked.exists()
+        assert not blocked.stat().st_mode & stat.S_IWRITE
+        assert untouched.exists()
+    finally:
+        if blocked.exists():
+            blocked.chmod(stat.S_IWRITE)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows hard-link attributes are shared")
+def test_retry_failure_does_not_restore_readonly_after_new_hardlink(mirror, monkeypatch):
+    engine, source, target = mirror
+    put(source, "keep.md", b"stable content")
+    put(target, "keep.md", b"stable content")
+    blocked = put(target, "a-blocked.md", b"read-only target")
+    untouched = put(target, "z-untouched.md", b"later deletion must not run")
+    outside_alias = target.parent / "outside-alias.md"
+    blocked.chmod(stat.S_IREAD)
+    plan = analyze(engine, source, target)
+    real_chmod = engine_module.os.chmod
+    real_unlink = engine_module.os.unlink
+    attempts = []
+    chmod_calls = []
+
+    def deny_and_add_alias(path):
+        if paths_module.canonical(path) == paths_module.canonical(blocked):
+            attempts.append(path)
+            if len(attempts) == 2:
+                os.link(path, outside_alias)
+            raise PermissionError(errno.EACCES, "simulated persistent denial", path, 5)
+        return real_unlink(path)
+
+    def record_chmod(path, mode):
+        chmod_calls.append((paths_module.canonical(path), mode))
+        return real_chmod(path, mode)
+
+    monkeypatch.setattr(engine_module.os, "unlink", deny_and_add_alias)
+    monkeypatch.setattr(engine_module.os, "chmod", record_chmod)
+
+    result = engine.execute(plan)
+
+    assert result.status == "failed"
+    assert len(attempts) == 2
+    assert len(chmod_calls) == 1
+    assert chmod_calls[0][1] & stat.S_IWRITE
+    assert blocked.stat().st_mode & stat.S_IWRITE
+    assert outside_alias.stat().st_mode & stat.S_IWRITE
+    assert untouched.exists()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="DOS read-only attributes are Windows-specific")
+@pytest.mark.parametrize("winerror", [5, 183])
+def test_failed_readonly_replace_restores_old_target_and_prevents_deletion(
+        mirror, monkeypatch, winerror):
+    engine, source, target = mirror
+    put(source, "note.md", b"authoritative source content")
+    destination = put(target, "note.md", b"old target")
+    obsolete = put(target, "obsolete.md", b"must survive failed replacement")
+    destination.chmod(stat.S_IREAD)
+    plan = analyze(engine, source, target)
+
+    def denied_replace(staged, target_path):
+        error = errno.EEXIST if winerror == 183 else errno.EACCES
+        raise OSError(error, "simulated persistent denial", target_path, winerror)
+
+    monkeypatch.setattr(engine_module.os, "replace", denied_replace)
+    try:
+        result = engine.execute(plan)
+
+        assert result.status == "failed"
+        assert destination.read_bytes() == b"old target"
+        assert not destination.stat().st_mode & stat.S_IWRITE
+        assert obsolete.exists()
+    finally:
+        if destination.exists():
+            destination.chmod(stat.S_IWRITE)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="DOS read-only attributes are Windows-specific")
+def test_post_chmod_target_change_stops_before_retry_and_restores_readonly(mirror, monkeypatch):
+    engine, source, target = mirror
+    put(source, "keep.md", b"stable content")
+    put(target, "keep.md", b"stable content")
+    blocked = put(target, "a-blocked.md", b"previewed target")
+    untouched = put(target, "z-untouched.md", b"later deletion must not run")
+    blocked.chmod(stat.S_IREAD)
+    plan = analyze(engine, source, target)
+    real_chmod = engine_module.os.chmod
+    real_unlink = engine_module.os.unlink
+    unlink_attempts = []
+
+    def denied_unlink(path):
+        if paths_module.canonical(path) == paths_module.canonical(blocked):
+            unlink_attempts.append(path)
+            raise PermissionError(errno.EACCES, "simulated access denied", path, 5)
+        return real_unlink(path)
+
+    def chmod_then_change(path, mode):
+        result = real_chmod(path, mode)
+        if (paths_module.canonical(path) == paths_module.canonical(blocked)
+                and mode & stat.S_IWRITE):
+            with open(path, "ab") as stream:
+                stream.write(b" externally changed")
+        return result
+
+    monkeypatch.setattr(engine_module.os, "unlink", denied_unlink)
+    monkeypatch.setattr(engine_module.os, "chmod", chmod_then_change)
+    try:
+        result = engine.execute(plan)
+
+        assert result.status == "failed"
+        assert len(unlink_attempts) == 1
+        assert blocked.read_bytes().endswith(b" externally changed")
+        assert not blocked.stat().st_mode & stat.S_IWRITE
+        assert untouched.exists()
+    finally:
+        if blocked.exists():
+            real_chmod(blocked, stat.S_IWRITE)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="DOS read-only attributes are Windows-specific")
+def test_readonly_source_is_never_chmodded_when_readonly_target_is_replaced(mirror, monkeypatch):
+    engine, source, target = mirror
+    origin = put(source, "note.md", b"authoritative source content")
+    destination = put(target, "note.md", b"old target")
+    origin.chmod(stat.S_IREAD)
+    destination.chmod(stat.S_IREAD)
+    origin_before = paths_module.snapshot(origin)
+    origin_attributes = origin.stat().st_file_attributes
+    real_chmod = engine_module.os.chmod
+
+    def forbid_source_chmod(path, mode):
+        assert paths_module.canonical(path) != paths_module.canonical(origin)
+        return real_chmod(path, mode)
+
+    monkeypatch.setattr(engine_module.os, "chmod", forbid_source_chmod)
+    try:
+        _, result = synchronize(engine, source, target)
+
+        assert result.copied_files == 1
+        assert origin.read_bytes() == b"authoritative source content"
+        assert paths_module.snapshot(origin) == origin_before
+        assert origin.stat().st_file_attributes == origin_attributes
+    finally:
+        real_chmod(origin, stat.S_IWRITE)
+        if destination.exists():
+            real_chmod(destination, stat.S_IWRITE)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows hard-link attributes are shared")
+def test_readonly_target_hardlink_to_source_is_rejected_before_chmod(mirror, monkeypatch):
+    engine, source, target = mirror
+    origin = put(source, "source-note.md", b"source hard-link content")
+    target_link = target / "target-only.md"
+    os.link(origin, target_link)
+    target_link.chmod(stat.S_IREAD)
+    origin_before = paths_module.snapshot(origin)
+    origin_attributes = origin.stat().st_file_attributes
+    plan = analyze(engine, source, target)
+    real_chmod = engine_module.os.chmod
+    chmod_calls = []
+
+    def record_chmod(*args, **kwargs):
+        chmod_calls.append((args, kwargs))
+        return real_chmod(*args, **kwargs)
+
+    monkeypatch.setattr(engine_module.os, "chmod", record_chmod)
+    try:
+        result = engine.execute(plan)
+
+        assert result.status == "failed"
+        assert target_link.exists()
+        assert origin.read_bytes() == b"source hard-link content"
+        assert paths_module.snapshot(origin) == origin_before
+        assert origin.stat().st_file_attributes == origin_attributes
+        assert chmod_calls == []
+    finally:
+        real_chmod(origin, stat.S_IWRITE)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="DOS read-only attributes are Windows-specific")
+def test_replaced_target_after_denial_is_not_chmodded_or_deleted(mirror, monkeypatch):
+    engine, source, target = mirror
+    put(source, "keep.md", b"stable content")
+    put(target, "keep.md", b"stable content")
+    blocked = put(target, "a-blocked.md", b"previewed target")
+    untouched = put(target, "z-untouched.md", b"later deletion must not run")
+    blocked.chmod(stat.S_IREAD)
+    plan = analyze(engine, source, target)
+    real_chmod = engine_module.os.chmod
+    real_unlink = engine_module.os.unlink
+    chmod_calls = []
+
+    def replace_then_deny(path):
+        if paths_module.canonical(path) == paths_module.canonical(blocked):
+            real_chmod(path, stat.S_IWRITE)
+            real_unlink(path)
+            Path(paths_module.canonical(path)).write_bytes(b"external replacement")
+            real_chmod(path, stat.S_IREAD)
+            raise PermissionError(errno.EACCES, "simulated access denied", path, 5)
+        return real_unlink(path)
+
+    def record_chmod(*args, **kwargs):
+        chmod_calls.append((args, kwargs))
+        return real_chmod(*args, **kwargs)
+
+    monkeypatch.setattr(engine_module.os, "unlink", replace_then_deny)
+    monkeypatch.setattr(engine_module.os, "chmod", record_chmod)
+    try:
+        result = engine.execute(plan)
+
+        assert result.status == "failed"
+        assert blocked.read_bytes() == b"external replacement"
+        assert not blocked.stat().st_mode & stat.S_IWRITE
+        assert untouched.exists()
+        assert chmod_calls == []
+    finally:
+        if blocked.exists():
+            real_chmod(blocked, stat.S_IWRITE)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="DOS read-only attributes are Windows-specific")
+def test_target_replaced_after_state_read_is_caught_before_chmod(mirror, monkeypatch):
+    engine, source, target = mirror
+    put(source, "keep.md", b"stable content")
+    put(target, "keep.md", b"stable content")
+    blocked = put(target, "a-blocked.md", b"previewed target")
+    untouched = put(target, "z-untouched.md", b"later deletion must not run")
+    blocked.chmod(stat.S_IREAD)
+    plan = analyze(engine, source, target)
+    real_chmod = engine_module.os.chmod
+    real_snapshot = engine_module.snapshot
+    real_unlink = engine_module.os.unlink
+    state = {"denied": False, "replaced": False}
+    chmod_calls = []
+
+    def denied_unlink(path):
+        if paths_module.canonical(path) == paths_module.canonical(blocked):
+            state["denied"] = True
+            raise PermissionError(errno.EACCES, "simulated access denied", path, 5)
+        return real_unlink(path)
+
+    def snapshot_then_replace(path):
+        observed = real_snapshot(path)
+        if (state["denied"] and not state["replaced"]
+                and paths_module.canonical(path) == paths_module.canonical(blocked)):
+            state["replaced"] = True
+            real_chmod(path, stat.S_IWRITE)
+            real_unlink(path)
+            Path(paths_module.canonical(path)).write_bytes(b"external replacement")
+            real_chmod(path, stat.S_IREAD)
+        return observed
+
+    def record_chmod(*args, **kwargs):
+        chmod_calls.append((args, kwargs))
+        return real_chmod(*args, **kwargs)
+
+    monkeypatch.setattr(engine_module.os, "unlink", denied_unlink)
+    monkeypatch.setattr(engine_module, "snapshot", snapshot_then_replace)
+    monkeypatch.setattr(engine_module.os, "chmod", record_chmod)
+    try:
+        result = engine.execute(plan)
+
+        assert result.status == "failed"
+        assert state["replaced"]
+        assert blocked.read_bytes() == b"external replacement"
+        assert not blocked.stat().st_mode & stat.S_IWRITE
+        assert untouched.exists()
+        assert chmod_calls == []
+    finally:
+        if blocked.exists():
+            real_chmod(blocked, stat.S_IWRITE)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="DOS read-only attributes are Windows-specific")
+def test_target_replaced_at_final_attribute_check_is_not_retried(mirror, monkeypatch):
+    engine, source, target = mirror
+    put(source, "keep.md", b"stable content")
+    put(target, "keep.md", b"stable content")
+    blocked = put(target, "a-blocked.md", b"previewed target")
+    untouched = put(target, "z-untouched.md", b"later deletion must not run")
+    blocked.chmod(stat.S_IREAD)
+    plan = analyze(engine, source, target)
+    real_chmod = engine_module.os.chmod
+    real_lstat = engine_module.os.lstat
+    real_unlink = engine_module.os.unlink
+    state = {"cleared": False, "post_clear_lstats": 0}
+    operation_payloads = []
+    chmod_payloads = []
+
+    def denied_unlink(path):
+        if paths_module.canonical(path) == paths_module.canonical(blocked):
+            operation_payloads.append(Path(paths_module.canonical(path)).read_bytes())
+            raise PermissionError(errno.EACCES, "simulated access denied", path, 5)
+        return real_unlink(path)
+
+    def record_chmod(path, mode):
+        if (paths_module.canonical(path) == paths_module.canonical(blocked)
+                and mode & stat.S_IWRITE):
+            chmod_payloads.append(Path(paths_module.canonical(path)).read_bytes())
+            state["cleared"] = True
+        return real_chmod(path, mode)
+
+    def replace_during_final_lstat(path, *args, **kwargs):
+        if paths_module.canonical(path) == paths_module.canonical(blocked) and state["cleared"]:
+            state["post_clear_lstats"] += 1
+            if state["post_clear_lstats"] == 2:
+                real_unlink(path)
+                Path(paths_module.canonical(path)).write_bytes(b"external replacement")
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(engine_module.os, "unlink", denied_unlink)
+    monkeypatch.setattr(engine_module.os, "chmod", record_chmod)
+    monkeypatch.setattr(engine_module.os, "lstat", replace_during_final_lstat)
+    try:
+        result = engine.execute(plan)
+
+        assert result.status == "failed"
+        assert operation_payloads == [b"previewed target"]
+        assert chmod_payloads == [b"previewed target"]
+        assert blocked.read_bytes() == b"external replacement"
+        assert blocked.stat().st_mode & stat.S_IWRITE
+        assert untouched.exists()
+    finally:
+        if blocked.exists():
+            real_chmod(blocked, stat.S_IWRITE)
 
 
 def test_source_wins_even_when_target_has_newer_timestamp(mirror):
