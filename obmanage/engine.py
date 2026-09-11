@@ -14,6 +14,7 @@ import stat
 import tempfile
 import threading
 import time
+from concurrent.futures import FIRST_EXCEPTION, Future, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Callable
 
@@ -23,6 +24,7 @@ from .paths import (assert_plain_chain, canonical, checked_child, identity, nati
 from .store import BaselineStore
 
 CHUNK_SIZE = 4 * 1024 * 1024
+HASH_PROGRESS_INTERVAL = 0.08
 ProgressCallback = Callable[[Progress], None] | None
 _WINDOWS_ACCESS_DENIED = 5
 _WINDOWS_ALREADY_EXISTS = 183
@@ -32,6 +34,7 @@ _WINDOWS_DELETE_READONLY_ERRORS = frozenset((_WINDOWS_ACCESS_DENIED,))
 _WINDOWS_REPLACE_READONLY_ERRORS = frozenset(
     (_WINDOWS_ACCESS_DENIED, _WINDOWS_ALREADY_EXISTS)
 )
+_ENGINE_TASK_LOCK = threading.Lock()
 
 
 def _cancelled(cancel: threading.Event | None) -> None:
@@ -121,6 +124,114 @@ def _hash_file(path: str, expected: dict, cancel: threading.Event | None,
     return digest.hexdigest()
 
 
+class _CombinedCancel:
+    """Expose one cancellation flag to hash workers without mutating the caller's event."""
+
+    def __init__(self, external: threading.Event | None, internal: threading.Event):
+        self.external = external
+        self.internal = internal
+
+    def is_set(self) -> bool:
+        return self.internal.is_set() or (self.external is not None and self.external.is_set())
+
+
+def _hash_pair(source_path: str, source_expected: dict,
+               target_path: str, target_expected: dict,
+               cancel: threading.Event | None, progress: ProgressCallback,
+               relative_path: str, executor: ThreadPoolExecutor | None) -> tuple[str, str]:
+    """Hash both stable versions, overlapping reads only when their volumes differ."""
+    completed = [0, 0]
+    total_bytes = source_expected["size"] + target_expected["size"]
+
+    def emit_progress() -> None:
+        if total_bytes:
+            _emit(progress, "hash", relative_path=relative_path,
+                  message="正在校验两端内容", completed_bytes=sum(completed),
+                  total_bytes=total_bytes)
+
+    if executor is None:
+        def sequential_progress(index: int) -> Callable[[Progress], None]:
+            def update(event: Progress) -> None:
+                completed[index] = event.completed_bytes
+                emit_progress()
+            return update
+
+        source_digest = _hash_file(
+            source_path, source_expected, cancel, sequential_progress(0), relative_path
+        )
+        target_digest = _hash_file(
+            target_path, target_expected, cancel, sequential_progress(1), relative_path
+        )
+    else:
+        progress_lock = threading.Lock()
+        abort = threading.Event()
+        worker_cancel = _CombinedCancel(cancel, abort)
+
+        def remember_progress(index: int) -> Callable[[Progress], None]:
+            def update(event: Progress) -> None:
+                with progress_lock:
+                    completed[index] = event.completed_bytes
+            return update
+
+        futures: list[Future[str]] = []
+        try:
+            futures.append(executor.submit(
+                _hash_file, source_path, source_expected, worker_cancel,
+                remember_progress(0), relative_path
+            ))
+            futures.append(executor.submit(
+                _hash_file, target_path, target_expected, worker_cancel,
+                remember_progress(1), relative_path
+            ))
+        except BaseException:
+            abort.set()
+            wait(futures)
+            raise
+
+        reported = -1
+        try:
+            while True:
+                done, _ = wait(futures, timeout=HASH_PROGRESS_INTERVAL,
+                               return_when=FIRST_EXCEPTION)
+                with progress_lock:
+                    checked = sum(completed)
+                if checked != reported:
+                    reported = checked
+                    if total_bytes:
+                        _emit(progress, "hash", relative_path=relative_path,
+                              message="正在并行校验两端内容", completed_bytes=checked,
+                              total_bytes=total_bytes)
+                errors = [future.exception() for future in done if future.exception() is not None]
+                if errors:
+                    abort.set()
+                    wait(futures)
+                    errors = [future.exception() for future in futures
+                              if future.exception() is not None]
+                    # Preserve the real read/state error when the peer stopped
+                    # only because the pair was aborted.
+                    error = next((value for value in errors
+                                  if not isinstance(value, SyncCancelled)), errors[0])
+                    raise error
+                if len(done) == len(futures):
+                    break
+                if cancel is not None and cancel.is_set():
+                    abort.set()
+                    wait(futures)
+                    raise SyncCancelled("已取消。已经完成的文件和校验记录会保留。")
+            source_digest, target_digest = (future.result() for future in futures)
+        except BaseException:
+            abort.set()
+            wait(futures)
+            raise
+
+    # One side can finish before the other. Recheck both paths only after the
+    # pair has joined so a later change to the early side cannot be accepted.
+    _cancelled(cancel)
+    _require_state(source_path, source_expected, "比较期间源文件已改变")
+    _require_state(target_path, target_expected, "比较期间目标文件已改变")
+    return source_digest, target_digest
+
+
 def _stat_matches_file_snapshot(value: os.stat_result, expected: dict) -> bool:
     return (stat.S_ISREG(value.st_mode)
             and not getattr(value, "st_file_attributes", 0) & _WINDOWS_REPARSE_POINT
@@ -205,7 +316,9 @@ def _mutate_target_file(path: str, expected: dict | None, message: str,
 class SyncEngine:
     def __init__(self, state_dir: Path | str):
         self.state_dir = Path(canonical(state_dir))
-        self._lock = threading.Lock()
+        # The desktop product promises one active analysis/sync task. Keep that
+        # invariant even when callers accidentally construct multiple engines.
+        self._lock = _ENGINE_TASK_LOCK
 
     def _check_state_location(self, source: str, target: str) -> None:
         assert_plain_chain(self.state_dir)
@@ -225,6 +338,7 @@ class SyncEngine:
             raise SyncError("已有同步任务运行中。")
         plan = SyncPlan(source=str(source), target=str(target))
         store: BaselineStore | None = None
+        hash_pool: ThreadPoolExecutor | None = None
         try:
             _cancelled(cancel)
             context = validate_roots(str(source), str(target))
@@ -244,7 +358,50 @@ class SyncEngine:
             # direction's records separate, but reuse the opposite direction
             # only when *both* exact snapshots still match after swapping. The
             # reversed key includes the ordered canonical paths and volumes.
-            reverse_baselines = store.records(context["reverse_pair_id"]) if not deep else {}
+            reverse_baselines = store.records(context["reverse_pair_id"])
+            source_by_key = {_key(path): state for path, state in source_entries.items()}
+            target_by_key = {_key(path): state for path, state in target_entries.items()}
+            stale_records = []
+            for path, record in baselines.items():
+                key = _key(path)
+                if (key not in source_by_key or key not in target_by_key
+                        or record[:2] != (source_by_key[key], target_by_key[key])):
+                    stale_records.append((plan.pair_id, path))
+            for path, record in reverse_baselines.items():
+                key = _key(path)
+                if (key not in source_by_key or key not in target_by_key
+                        or record[:2] != (target_by_key[key], source_by_key[key])):
+                    stale_records.append((context["reverse_pair_id"], path))
+            invalidated_records = list(stale_records)
+            if deep:
+                # Retire old equality claims before reading content. A crash,
+                # cancellation, or later database error therefore cannot make
+                # a completed deep mismatch disappear into the old cache.
+                invalidated_records.extend(
+                    (plan.pair_id, path) for path in baselines
+                )
+                invalidated_records.extend(
+                    (context["reverse_pair_id"], path) for path in reverse_baselines
+                )
+            if invalidated_records:
+                # Once an observed file version no longer matches its equality
+                # claim, never let that claim become valid again by coincidence.
+                store.invalidate(invalidated_records)
+            stale_keys = {
+                (pair_id, _key(path)) for pair_id, path in invalidated_records
+            }
+            baseline_keys = {
+                _key(path): (path, record) for path, record in baselines.items()
+                if (plan.pair_id, _key(path)) not in stale_keys
+            }
+            reverse_keys = {
+                _key(path): (path, record) for path, record in reverse_baselines.items()
+                if (context["reverse_pair_id"], _key(path)) not in stale_keys
+            }
+            if context["source_volume"] != context["target_volume"]:
+                # At most one sequential reader per volume: overlap C: and the
+                # portable disk without making either disk seek across files.
+                hash_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="obmanage-hash")
             source_names = {_key(path) for path in source_entries}
             total = len(source_entries) + sum(_key(path) not in source_names for path in target_entries)
             for relative, src in sorted(source_entries.items()):
@@ -265,26 +422,40 @@ class SyncEngine:
                     item = PlanItem("mkdir", relative, reason="创建空目录或父目录")
                 elif dst is None:
                     item = PlanItem("add", relative, src["size"], "目标中不存在")
-                elif not deep and relative in baselines and baselines[relative][:2] == (src, dst):
+                elif (not deep and _key(relative) in baseline_keys
+                      and baseline_keys[_key(relative)][1][:2] == (src, dst)):
                     item = PlanItem("skip", relative, src["size"], "两端与上次校验记录一致")
-                elif (not deep and target_name in reverse_baselines
-                      and reverse_baselines[target_name][:2] == (dst, src)):
-                    store.save(plan.pair_id, relative, src, dst, reverse_baselines[target_name][2])
+                elif (not deep and _key(target_name) in reverse_keys
+                      and reverse_keys[_key(target_name)][1][:2] == (dst, src)):
+                    reverse_record = reverse_keys[_key(target_name)][1]
+                    store.save(plan.pair_id, relative, src, dst, reverse_record[2])
+                    baseline_keys[_key(relative)] = (
+                        relative, (src, dst, reverse_record[2])
+                    )
                     item = PlanItem("skip", relative, src["size"], "两端与反向同步的已校验记录一致")
                 elif src["size"] != dst["size"]:
                     item = PlanItem("update", relative, src["size"], "文件大小不同，以源端为准")
                 else:
                     src_path = checked_child(plan.source, relative)
                     dst_path = checked_child(plan.target, target_name)
-                    src_digest = _hash_file(src_path, src, cancel, progress, relative)
-                    dst_digest = _hash_file(dst_path, dst, cancel, progress, relative)
+                    src_digest, dst_digest = _hash_pair(
+                        src_path, src, dst_path, dst, cancel, progress, relative, hash_pool
+                    )
                     if src_digest == dst_digest:
-                        # Checking source again also covers changes while the
-                        # target was being hashed.
-                        _require_state(src_path, src, "比较期间源文件已改变")
+                        verified = (src, dst, src_digest)
                         store.save(plan.pair_id, relative, src, dst, src_digest)
+                        baseline_keys[_key(relative)] = (relative, verified)
                         item = PlanItem("skip", relative, src["size"], "SHA-256 内容相同")
                     else:
+                        # A confirmed mismatch supersedes every prior equality
+                        # claim in both directions. Invalidate atomically so a
+                        # later quick scan cannot resurrect a known bad copy.
+                        store.invalidate([
+                            (plan.pair_id, relative),
+                            (context["reverse_pair_id"], target_name),
+                        ])
+                        baseline_keys.pop(_key(relative), None)
+                        reverse_keys.pop(_key(target_name), None)
                         item = PlanItem("update", relative, src["size"], "内容不同，以源端为准")
                 plan.items.append(item)
                 _emit(progress, "compare", relative_path=relative,
@@ -310,6 +481,8 @@ class SyncEngine:
             plan.errors.append(str(exc))
             plan.items.append(PlanItem("error", "", reason=str(exc)))
         finally:
+            if hash_pool is not None:
+                hash_pool.shutdown(wait=True, cancel_futures=True)
             if store is not None:
                 store.close()
             self._lock.release()

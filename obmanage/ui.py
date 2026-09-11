@@ -811,7 +811,7 @@ class MainWindow(QMainWindow):
         actions.addWidget(self.cancel_button)
         self.deep_button = QPushButton("完整内容校验")
         self.deep_button.setObjectName("deep_button")
-        self.deep_button.setToolTip("重新读取并比较全部文件内容，发现大小和修改时间均未变化的内容差异。")
+        self.deep_button.setToolTip("重新读取并比较全部文件内容；两端位于不同磁盘时会并行校验。")
         actions.addWidget(self.deep_button)
         self.analyze_button = QPushButton("分析差异")
         self.analyze_button.setObjectName("analyze_button")
@@ -1128,7 +1128,7 @@ class MainWindow(QMainWindow):
         self._persist(remember_target=True)
         self.empty_title.setText("正在读取仓库变化…")
         self.empty_detail.setText(
-            "完整校验会读取两端所有文件内容，大型视频需要一些时间。"
+            "完整校验仍会读取两端全部内容；不同磁盘会并行进行，速度取决于较慢一端。"
             if deep
             else "已有副本首次需要比较内容；完成的校验记录会保留，可随时取消。"
         )

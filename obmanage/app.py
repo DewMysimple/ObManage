@@ -21,6 +21,15 @@ def setup_logging(state_dir: Path) -> None:
     logging.basicConfig(level=logging.INFO, handlers=[handler], force=True)
 
 
+def acquire_instance_lock(state_dir: Path):
+    """Serialize GUI and CLI analysis against the shared baseline database."""
+    from PySide6.QtCore import QLockFile
+
+    lock = QLockFile(str(state_dir / "instance.lock"))
+    lock.setStaleLockTime(0)
+    return lock if lock.tryLock(0) else None
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="ObManage — Obsidian 单向增量镜像")
     parser.add_argument("--state-dir", type=Path, help="设置和同步记录目录")
@@ -48,6 +57,10 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps({"phase": event.phase, "files": event.completed_files, "total_files": event.total_files, "bytes": event.completed_bytes}, ensure_ascii=False), flush=True)
                 last_message = time.monotonic()
 
+        lock = acquire_instance_lock(state_dir)
+        if lock is None:
+            print("ObManage 已有任务运行中，请稍后重试。", file=sys.stderr)
+            return 2
         try:
             plan = SyncEngine(state_dir).analyze(args.source, args.target, deep=args.deep, progress=progress)
             print(json.dumps({"source": plan.source, "target": plan.target, "counts": plan.counts,
@@ -58,9 +71,11 @@ def main(argv: list[str] | None = None) -> int:
             logging.exception("差异预览失败")
             print(str(exc), file=sys.stderr)
             return 2
+        finally:
+            lock.unlock()
 
     logging.info("Loading Qt modules")
-    from PySide6.QtCore import QLockFile, QTimer, qInstallMessageHandler
+    from PySide6.QtCore import QTimer, qInstallMessageHandler
     from PySide6.QtGui import QFont
     from PySide6.QtWidgets import QApplication, QMessageBox
 
@@ -75,9 +90,8 @@ def main(argv: list[str] | None = None) -> int:
     app.setOrganizationName("ObManage")
     app.setQuitOnLastWindowClosed(False)
     app.setFont(QFont("Microsoft YaHei UI", 10))
-    lock = QLockFile(str(state_dir / "instance.lock"))
-    lock.setStaleLockTime(0)
-    if not lock.tryLock(0):
+    lock = acquire_instance_lock(state_dir)
+    if lock is None:
         QMessageBox.information(None, "ObManage 已在运行", "请从右下角系统托盘打开已有的 ObManage 窗口。")
         return 0
 

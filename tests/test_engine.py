@@ -4,7 +4,7 @@ import os
 import errno
 import stat
 from pathlib import Path
-from threading import Event
+from threading import Barrier, Event, Lock, enumerate as enumerate_threads, get_ident
 from types import SimpleNamespace
 
 import pytest
@@ -53,6 +53,31 @@ def require_rejected(operation):
     assert outcome.errors or getattr(outcome, "status", "") in {
         "cancelled", "canceled", "error", "failed", "blocked", "partial"
     }, outcome
+
+
+def pretend_separate_volumes(monkeypatch, source: Path, target: Path) -> None:
+    real_volume_identity = paths_module.volume_identity
+
+    def separate_test_volumes(path):
+        value = paths_module.canonical(path)
+        if os.path.commonpath((value, str(source))) == str(source):
+            return "test-source-volume"
+        if os.path.commonpath((value, str(target))) == str(target):
+            return "test-target-volume"
+        return real_volume_identity(path)
+
+    monkeypatch.setattr(paths_module, "volume_identity", separate_test_volumes)
+
+
+def test_engine_instances_share_one_process_task_mutex(tmp_path):
+    first = SyncEngine(tmp_path / "first-state")
+    second = SyncEngine(tmp_path / "second-state")
+    assert first._lock.acquire(blocking=False)
+    try:
+        with pytest.raises(SyncError, match="已有同步任务"):
+            second.analyze(str(tmp_path / "source"), str(tmp_path / "target"))
+    finally:
+        first._lock.release()
 
 
 def simulate_reissued_staging_identity(monkeypatch):
@@ -624,6 +649,244 @@ def test_deep_scan_detects_changes_with_same_size_and_mtime(mirror, changed_side
     result = engine.execute(deep_plan)
     assert not result.errors
     assert (target / "note.md").read_bytes() == (source / "note.md").read_bytes()
+
+
+def test_different_volumes_hash_both_sides_concurrently_on_analysis(mirror, monkeypatch):
+    engine, source, target = mirror
+    put(source, "video.mp4", b"same content")
+    put(target, "video.mp4", b"same content")
+    pretend_separate_volumes(monkeypatch, source, target)
+    barrier = Barrier(2)
+    worker_threads = set()
+    worker_lock = Lock()
+
+    def overlapping_hash(path, expected, cancel, progress, relative):
+        with worker_lock:
+            worker_threads.add(get_ident())
+        barrier.wait(timeout=3)
+        progress(engine_module.Progress(
+            "hash", relative_path=relative,
+            completed_bytes=expected["size"], total_bytes=expected["size"],
+        ))
+        return "same-digest"
+
+    monkeypatch.setattr(engine_module, "_hash_file", overlapping_hash)
+    callback_threads = []
+    hash_progress = []
+    save_threads = []
+    caller_thread = get_ident()
+    real_save = BaselineStore.save
+
+    def record_save(self, *args, **kwargs):
+        save_threads.append(get_ident())
+        return real_save(self, *args, **kwargs)
+
+    monkeypatch.setattr(BaselineStore, "save", record_save)
+
+    def record_progress(event):
+        callback_threads.append(get_ident())
+        if event.phase == "hash":
+            hash_progress.append((event.completed_bytes, event.total_bytes))
+
+    plan = analyze(
+        engine, source, target, deep=True,
+        progress=record_progress,
+    )
+
+    assert plan.can_execute, plan.errors
+    assert plan.counts["skip"] == 1
+    assert len(worker_threads) == 2
+    assert callback_threads
+    assert set(callback_threads) == {caller_thread}, "Public progress must stay on the analysis thread"
+    assert save_threads == [caller_thread], "SQLite writes must stay on the analysis thread"
+    assert [value for value, _ in hash_progress] == sorted(value for value, _ in hash_progress)
+    assert hash_progress[-1] == (2 * len(b"same content"), 2 * len(b"same content"))
+    assert not any(thread.name.startswith("obmanage-hash") for thread in enumerate_threads())
+
+
+def test_parallel_hash_failure_stops_peer_before_analysis_returns(mirror, monkeypatch):
+    engine, source, target = mirror
+    put(source, "video.mp4", b"same content")
+    put(target, "video.mp4", b"same content")
+    pretend_separate_volumes(monkeypatch, source, target)
+    barrier = Barrier(2)
+    peer_finished = Event()
+
+    def failing_hash(path, expected, cancel, progress, relative):
+        barrier.wait(timeout=3)
+        if os.path.commonpath((paths_module.canonical(path), str(source))) == str(source):
+            raise PermissionError("simulated source read failure")
+        while not cancel.is_set():
+            Event().wait(0.001)
+        peer_finished.set()
+        raise SyncCancelled("peer stopped")
+
+    monkeypatch.setattr(engine_module, "_hash_file", failing_hash)
+
+    plan = analyze(engine, source, target, deep=True)
+
+    assert not plan.can_execute
+    assert any("simulated source read failure" in error for error in plan.errors)
+    assert peer_finished.is_set(), "No hash worker may outlive analyze()"
+    store = BaselineStore(engine.state_dir)
+    try:
+        assert store.records(plan.pair_id) == {}
+    finally:
+        store.close()
+    assert not any(thread.name.startswith("obmanage-hash") for thread in enumerate_threads())
+
+
+def test_external_cancel_joins_both_parallel_hash_workers(mirror, monkeypatch):
+    engine, source, target = mirror
+    put(source, "video.mp4", b"same content")
+    put(target, "video.mp4", b"same content")
+    pretend_separate_volumes(monkeypatch, source, target)
+    barrier = Barrier(2)
+    cancelled = Event()
+    pause = Event()
+    finished = 0
+    finished_lock = Lock()
+    all_finished = Event()
+
+    def cancellable_hash(path, expected, cancel, progress, relative):
+        nonlocal finished
+        barrier.wait(timeout=3)
+        if os.path.commonpath((paths_module.canonical(path), str(source))) == str(source):
+            cancelled.set()
+        while not cancel.is_set():
+            pause.wait(0.001)
+        with finished_lock:
+            finished += 1
+            if finished == 2:
+                all_finished.set()
+        raise SyncCancelled("parallel hash cancelled")
+
+    monkeypatch.setattr(engine_module, "_hash_file", cancellable_hash)
+
+    with pytest.raises(SyncCancelled):
+        analyze(engine, source, target, deep=True, cancel=cancelled)
+
+    assert all_finished.is_set()
+    assert not any(thread.name.startswith("obmanage-hash") for thread in enumerate_threads())
+
+
+def test_unchanged_deep_verification_reestablishes_retired_baseline(mirror, monkeypatch):
+    engine, source, target = mirror
+    put(source, "video.mp4", b"same content" * 1024)
+    synchronize(engine, source, target)
+    real_save = BaselineStore.save
+    saves = []
+
+    def record_save(self, *args, **kwargs):
+        saves.append(args)
+        return real_save(self, *args, **kwargs)
+
+    monkeypatch.setattr(BaselineStore, "save", record_save)
+
+    plan = analyze(engine, source, target, deep=True)
+
+    assert plan.can_execute, plan.errors
+    assert plan.counts["skip"] == 1
+    assert len(saves) == 1
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows metadata permits this deep-check scenario")
+def test_deep_mismatch_invalidates_forward_and_reverse_baselines(mirror):
+    engine, source, target = mirror
+    source_file = put(source, "note.md", b"AAAA")
+    target_file = put(target, "note.md", b"AAAA")
+    forward = analyze(engine, source, target)
+    assert forward.counts["skip"] == 1
+    reverse = analyze(engine, target, source)
+    assert reverse.counts["skip"] == 1
+    old_target = paths_module.snapshot(target_file)
+    target_file.write_bytes(b"BBBB")
+    os.utime(target_file, ns=(old_target["mtime_ns"], old_target["mtime_ns"]))
+    assert paths_module.snapshot(target_file) == old_target
+
+    deep = analyze(engine, source, target, deep=True)
+
+    assert deep.can_execute, deep.errors
+    assert deep.counts["update"] == 1
+    store = BaselineStore(engine.state_dir)
+    try:
+        assert store.records(forward.pair_id) == {}
+        assert store.records(reverse.pair_id) == {}
+    finally:
+        store.close()
+    assert analyze(engine, source, target).counts["update"] == 1
+    assert analyze(engine, target, source).counts["update"] == 1
+    assert source_file.read_bytes() == b"AAAA"
+    assert target_file.read_bytes() == b"BBBB"
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows metadata permits this cache-revival scenario")
+def test_observed_size_mismatch_cannot_revive_an_old_baseline(mirror):
+    engine, source, target = mirror
+    put(source, "note.md", b"AAAA")
+    target_file = put(target, "note.md", b"AAAA")
+    initial = analyze(engine, source, target)
+    assert initial.counts["skip"] == 1
+    old_target = paths_module.snapshot(target_file)
+
+    target_file.write_bytes(b"wrong")
+    mismatch = analyze(engine, source, target)
+    assert mismatch.counts["update"] == 1
+    target_file.write_bytes(b"CCCC")
+    os.utime(target_file, ns=(old_target["mtime_ns"], old_target["mtime_ns"]))
+    assert paths_module.snapshot(target_file) == old_target
+
+    revisited = analyze(engine, source, target)
+
+    assert revisited.counts["update"] == 1
+    store = BaselineStore(engine.state_dir)
+    try:
+        assert store.records(initial.pair_id) == {}
+    finally:
+        store.close()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows metadata permits this deep-check scenario")
+def test_deep_check_retires_old_claim_before_hashing(mirror, monkeypatch):
+    engine, source, target = mirror
+    put(source, "note.md", b"AAAA")
+    target_file = put(target, "note.md", b"AAAA")
+    initial = analyze(engine, source, target)
+    assert initial.counts["skip"] == 1
+    old_target = paths_module.snapshot(target_file)
+    target_file.write_bytes(b"BBBB")
+    os.utime(target_file, ns=(old_target["mtime_ns"], old_target["mtime_ns"]))
+    assert paths_module.snapshot(target_file) == old_target
+    store = BaselineStore(engine.state_dir)
+    store.connection.execute("""
+        CREATE TRIGGER reject_deep_invalidation
+        BEFORE DELETE ON baselines
+        BEGIN
+            SELECT RAISE(ABORT, 'simulated invalidation failure');
+        END;
+    """)
+    store.connection.commit()
+    store.close()
+    real_hash = engine_module._hash_file
+
+    def hash_must_not_start(*args, **kwargs):
+        pytest.fail("Deep hashing must not start while an old claim is still active")
+
+    monkeypatch.setattr(engine_module, "_hash_file", hash_must_not_start)
+    failed = analyze(engine, source, target, deep=True)
+    assert not failed.can_execute
+    assert any("simulated invalidation failure" in error for error in failed.errors)
+
+    store = BaselineStore(engine.state_dir)
+    store.connection.execute("DROP TRIGGER reject_deep_invalidation")
+    store.connection.commit()
+    store.close()
+    monkeypatch.setattr(engine_module, "_hash_file", real_hash)
+
+    deep = analyze(engine, source, target, deep=True)
+    assert deep.can_execute, deep.errors
+    assert deep.counts["update"] == 1
+    assert analyze(engine, source, target).counts["update"] == 1
 
 
 def test_analysis_does_not_write_or_delete_vault_files(mirror):
