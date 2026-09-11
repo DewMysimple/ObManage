@@ -296,9 +296,17 @@ class SyncEngine:
             result.copied_files += 1
             result.copied_bytes += copied
             dst_state = snapshot(dst_path)
-            if (identity(dst_state) != identity(staged_state) or dst_state["size"] != copied
-                    or dst_state["mtime_ns"] != staged_state["mtime_ns"]):
+            if dst_state is None or dst_state["kind"] != "file" or dst_state["size"] != copied:
                 raise SyncError(f"提交后目标文件发生变化：{relative}")
+            # FAT-family filesystems can issue a new file ID when a directory
+            # entry is renamed, so an inode mismatch after os.replace does not
+            # by itself prove that another process replaced the file. Keep the
+            # common-filesystem fast path, but verify the stable final path by
+            # content before accepting any identity or timestamp change.
+            if (identity(dst_state) != identity(staged_state)
+                    or dst_state["mtime_ns"] != staged_state["mtime_ns"]):
+                if _hash_file(dst_path, dst_state, cancel, progress, relative) != digest.hexdigest():
+                    raise SyncError(f"提交后目标文件发生变化：{relative}")
             _require_state(src_path, expected, "提交后源文件已改变")
             store.save(plan.pair_id, relative, expected, dst_state, digest.hexdigest())
             _emit(progress, "copied", relative_path=relative, message="文件已复制并校验",

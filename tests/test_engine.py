@@ -54,6 +54,30 @@ def require_rejected(operation):
     }, outcome
 
 
+def simulate_reissued_staging_identity(monkeypatch):
+    """Model a filesystem that assigns a new file ID when staging is renamed."""
+    real_utime = engine_module.os.utime
+    real_snapshot = engine_module.snapshot
+    staged_paths = set()
+
+    def remember_staged_path(path, *args, **kwargs):
+        result = real_utime(path, *args, **kwargs)
+        value = paths_module.canonical(path)
+        if os.path.basename(value).startswith(".obmanage-") and value.endswith(".tmp"):
+            staged_paths.add(os.path.normcase(value))
+        return result
+
+    def snapshot_with_pre_rename_identity(path):
+        state = real_snapshot(path)
+        if state is not None and os.path.normcase(paths_module.canonical(path)) in staged_paths:
+            state = dict(state)
+            state["inode"] += 1
+        return state
+
+    monkeypatch.setattr(engine_module.os, "utime", remember_staged_path)
+    monkeypatch.setattr(engine_module, "snapshot", snapshot_with_pre_rename_identity)
+
+
 def test_first_mirror_preserves_hidden_files_and_empty_directories(mirror):
     engine, source, target = mirror
     put(source, "笔记/中文.md", "第一篇笔记".encode())
@@ -429,6 +453,65 @@ def test_replace_failure_preserves_previous_file_and_stops_deletion(mirror, monk
     assert (target / "note.md").read_bytes() == b"old target"
     assert (target / "obsolete.md").read_bytes() == b"do not delete"
     assert sorted(path.name for path in target.iterdir()) == ["note.md", "obsolete.md"]
+
+
+def test_reissued_file_identity_after_replace_is_verified_and_accepted(mirror, monkeypatch):
+    engine, source, target = mirror
+    payload = b"new source content"
+    put(source, "note.md", payload)
+    put(target, "obsolete.md", b"delete only after the committed file is verified")
+    plan = analyze(engine, source, target)
+    simulate_reissued_staging_identity(monkeypatch)
+    real_hash = engine_module._hash_file
+    hashed_paths = []
+
+    def record_hash(path, *args, **kwargs):
+        hashed_paths.append(paths_module.canonical(path))
+        return real_hash(path, *args, **kwargs)
+
+    monkeypatch.setattr(engine_module, "_hash_file", record_hash)
+
+    result = engine.execute(plan)
+
+    assert result.status == "success", result.errors
+    assert (target / "note.md").read_bytes() == payload
+    assert not (target / "obsolete.md").exists()
+    assert paths_module.canonical(target / "note.md") in hashed_paths
+
+    def unnecessary_hash(*args, **kwargs):
+        pytest.fail("The verified committed snapshot must be saved as the baseline")
+
+    monkeypatch.setattr(engine_module, "_hash_file", unnecessary_hash)
+    next_plan = analyze(engine, source, target)
+    assert next_plan.can_execute, next_plan.errors
+    assert next_plan.counts["skip"] == 1
+    assert next_plan.bytes_to_copy == 0
+
+
+def test_reissued_identity_does_not_accept_wrong_committed_content(mirror, monkeypatch):
+    engine, source, target = mirror
+    payload = b"expected source bytes"
+    source_file = put(source, "note.md", payload)
+    put(target, "obsolete.md", b"must survive a failed committed-file check")
+    plan = analyze(engine, source, target)
+    simulate_reissued_staging_identity(monkeypatch)
+    real_replace = engine_module.os.replace
+
+    def replace_then_corrupt(staged, destination):
+        real_replace(staged, destination)
+        Path(paths_module.canonical(destination)).write_bytes(b"X" * len(payload))
+        source_stat = source_file.stat()
+        engine_module.os.utime(
+            destination, ns=(source_stat.st_atime_ns, source_stat.st_mtime_ns)
+        )
+
+    monkeypatch.setattr(engine_module.os, "replace", replace_then_corrupt)
+
+    result = engine.execute(plan)
+
+    assert result.status == "failed"
+    assert any("提交后目标文件发生变化" in error for error in result.errors)
+    assert (target / "obsolete.md").read_bytes() == b"must survive a failed committed-file check"
 
 
 def test_source_modified_while_copying_never_replaces_target(mirror):

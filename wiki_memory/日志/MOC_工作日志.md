@@ -3,7 +3,7 @@ type: moc
 status: active
 kind: process
 importance: high
-updated: 2026-09-10
+updated: 2026-09-11
 topic: work-log-index
 source_logs: []
 supersedes: null
@@ -15,6 +15,7 @@ supersedes: null
 
 | 时间 | 类型 | 目标 | 状态 | 主题 | 日志 |
 | --- | --- | --- | --- | --- | --- |
+| 2026-09-11 | bug | 解决本机仓库同步到 exFAT 移动盘时，在首个文件已正确落盘后仍报告“提交后目标文件发生变化”的问题。 | archived | exfat-post-replace-validation | [2026-09-11｜exFAT 提交校验修复](./2026-09-11-exFAT提交校验修复.md) |
 | 2026-09-10 | maintenance | 按用户提供模板建立 ObManage 工程记忆，优化公开产品说明和 Agent 规范，精简界面顶部与差异表，并按用户约束提交、推送本轮修改。 | archived | memory-and-ui-cleanup | [2026-09-10｜工程记忆与界面整理](./2026-09-10-工程记忆与界面整理.md) |
 
 ## 使用方式
