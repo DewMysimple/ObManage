@@ -8,7 +8,6 @@ from typing import Any, Iterable
 
 from PySide6.QtCore import QAbstractTableModel, QModelIndex, QSignalBlocker, Qt, Signal, Slot
 from PySide6.QtWidgets import (
-    QApplication,
     QCheckBox,
     QComboBox,
     QHBoxLayout,
@@ -84,7 +83,11 @@ class TrashVaultTableModel(QAbstractTableModel):
     def set_rows(self, rows: Iterable[TrashVaultPreview]) -> None:
         self.beginResetModel()
         self.rows = list(rows)
-        self._checked.clear()
+        self._checked = {
+            _path_key(row.vault_root)
+            for row in self.rows
+            if row.file_count or row.dir_count
+        }
         self.endResetModel()
         self.checked_changed.emit()
 
@@ -227,14 +230,14 @@ class TrashEntryTableModel(QAbstractTableModel):
 
 
 class TrashCleanupPage(FeaturePage):
-    """Preview, quarantine, restore and finally release vault-level trash."""
+    """Preview and directly clear vault-level trash."""
 
     page_key = "trash_cleanup"
 
     def __init__(self, state_dir: Path, settings: dict[str, Any], default_root: str) -> None:
         super().__init__(
             "回收站清理",
-            "只处理真实仓库根目录下的 .trash；先完整隔离并校验，再清理所选内容。",
+            "只处理真实仓库根目录下的 .trash；确认后直接清理所选预览内容，无法恢复。",
         )
         self.state_dir = Path(state_dir)
         self.plan: TrashPlan | None = None
@@ -263,7 +266,7 @@ class TrashCleanupPage(FeaturePage):
         title = QLabel("仓库回收站")
         title.setObjectName("SectionTitle")
         vault_header.addWidget(title)
-        self.vault_summary = QLabel("尚未扫描 · 默认不选择任何仓库")
+        self.vault_summary = QLabel("尚未扫描")
         self.vault_summary.setObjectName("Muted")
         vault_header.addWidget(self.vault_summary, 1)
         self.select_all_button = QPushButton("全选非空项")
@@ -272,9 +275,6 @@ class TrashCleanupPage(FeaturePage):
         self.select_none_button = QPushButton("清空选择")
         self.select_none_button.setObjectName("TextButton")
         vault_header.addWidget(self.select_none_button)
-        self.copy_vault_button = QPushButton("复制所选路径")
-        self.copy_vault_button.setObjectName("TextButton")
-        vault_header.addWidget(self.copy_vault_button)
         vault_layout.addLayout(vault_header)
 
         self.vault_table = QTableView()
@@ -305,9 +305,6 @@ class TrashCleanupPage(FeaturePage):
         self.entry_summary = QLabel("等待扫描")
         self.entry_summary.setObjectName("Muted")
         entry_header.addWidget(self.entry_summary, 1)
-        self.copy_entry_button = QPushButton("复制所选完整路径")
-        self.copy_entry_button.setObjectName("TextButton")
-        entry_header.addWidget(self.copy_entry_button)
         entries_layout.addLayout(entry_header)
         self.entry_table = QTableView()
         self.entry_table.setObjectName("trash_cleanup_entries")
@@ -325,9 +322,9 @@ class TrashCleanupPage(FeaturePage):
         entries_layout.addWidget(self.entry_table, 1)
         self.body.setStretch(self.body.count() - 1, 1)
 
-        _, recovery_layout = panel(self.body)
+        self.legacy_recovery_panel, recovery_layout = panel(self.body)
         recovery_header = QHBoxLayout()
-        recovery_title = QLabel("持久隔离批次")
+        recovery_title = QLabel("旧版隔离批次（升级兼容）")
         recovery_title.setObjectName("SectionTitle")
         recovery_header.addWidget(recovery_title)
         self.operation_selector = QComboBox()
@@ -355,6 +352,7 @@ class TrashCleanupPage(FeaturePage):
         self.finalize_confirm = QCheckBox("我确认永久清理所选批次（完成后不能恢复）")
         self.finalize_confirm.setObjectName("trash_cleanup_finalize_confirm")
         recovery_layout.addWidget(self.finalize_confirm)
+        self.legacy_recovery_panel.hide()
 
         self.clear_confirm = QCheckBox("尚未扫描并选择回收站。")
         self.clear_confirm.setObjectName("trash_cleanup_confirm")
@@ -362,7 +360,7 @@ class TrashCleanupPage(FeaturePage):
         self.root_layout.addWidget(self.clear_confirm)
         actions = QHBoxLayout()
         self.safety_hint = QLabel(
-            "仓库内容先复制到应用隔离区并逐文件校验；清理只删除预览中的项目并保留 .trash。"
+            "确认后直接删除所选预览项目并保留 .trash；不创建隔离备份，已删除内容无法恢复。"
         )
         self.safety_hint.setObjectName("Muted")
         self.safety_hint.setWordWrap(True)
@@ -371,8 +369,8 @@ class TrashCleanupPage(FeaturePage):
         self.cancel_button.setObjectName("Cancel")
         self.cancel_button.hide()
         actions.addWidget(self.cancel_button)
-        self.clear_button = QPushButton("隔离并清理所选回收站")
-        self.clear_button.setObjectName("Primary")
+        self.clear_button = QPushButton("确认清理所选回收站")
+        self.clear_button.setObjectName("Danger")
         actions.addWidget(self.clear_button)
         self.root_layout.addLayout(actions)
 
@@ -381,14 +379,6 @@ class TrashCleanupPage(FeaturePage):
         self.vault_model.checked_changed.connect(self._selection_changed)
         self.select_all_button.clicked.connect(lambda: self.vault_model.set_all(True))
         self.select_none_button.clicked.connect(lambda: self.vault_model.set_all(False))
-        self.vault_table.selectionModel().selectionChanged.connect(
-            lambda *_: self.refresh_actions()
-        )
-        self.entry_table.selectionModel().selectionChanged.connect(
-            lambda *_: self.refresh_actions()
-        )
-        self.copy_vault_button.clicked.connect(self.copy_selected_vault_paths)
-        self.copy_entry_button.clicked.connect(self.copy_selected_entry_paths)
         self.clear_confirm.toggled.connect(lambda *_: self.refresh_actions())
         self.finalize_confirm.toggled.connect(lambda *_: self.refresh_actions())
         self.clear_button.clicked.connect(self._start_clear)
@@ -419,7 +409,7 @@ class TrashCleanupPage(FeaturePage):
         self.catalog = None
         self.vault_model.set_rows(())
         self.entry_model.set_rows(())
-        self.vault_summary.setText("尚未扫描 · 默认不选择任何仓库")
+        self.vault_summary.setText("尚未扫描")
         self.entry_summary.setText("等待扫描")
         self.issues_label.setText("")
         self.issues_label.setToolTip("")
@@ -458,7 +448,8 @@ class TrashCleanupPage(FeaturePage):
         if selected:
             self.clear_confirm.setText(
                 f"我确认：仅清理所选 {len(selected)} 个仓库根级 .trash 中的 "
-                f"{files} 个文件、{directories} 个目录（{format_bytes(size)}）；先保留隔离备份。"
+                f"{files} 个文件、{directories} 个目录（{format_bytes(size)}）；"
+                "直接删除且无法恢复。"
             )
         else:
             self.clear_confirm.setText("请先明确勾选至少一个非空回收站。")
@@ -594,7 +585,8 @@ class TrashCleanupPage(FeaturePage):
             )
         else:
             self.set_status(
-                f"扫描完成：{files} 个文件、{directories} 个目录；默认均未选择。",
+                f"扫描完成：{files} 个文件、{directories} 个目录；"
+                f"已默认选择 {len(self.vault_model.checked_previews())} 个非空回收站。",
                 "success",
             )
 
@@ -681,6 +673,7 @@ class TrashCleanupPage(FeaturePage):
             del blocker
             self.operation_status.setText(f"隔离记录无法安全读取：{exc}")
             self.operation_status.setToolTip(str(exc))
+            self.legacy_recovery_panel.show()
             return
         self._recovery_blocked = False
         self._operations = operations
@@ -688,6 +681,7 @@ class TrashCleanupPage(FeaturePage):
             operation for operation in operations
             if self._operation_pending(operation)
         )
+        self.legacy_recovery_panel.setVisible(bool(self._pending_operations))
         choices = self._pending_operations or operations[:1]
         blocker = QSignalBlocker(self.operation_selector)
         self.operation_selector.clear()
@@ -723,8 +717,8 @@ class TrashCleanupPage(FeaturePage):
                 removed_files = sum(item.removed_files for item in result.vaults)
                 removed_dirs = sum(item.removed_dirs for item in result.vaults)
                 self.set_status(
-                    f"已从仓库清理 {removed_files} 个文件、{removed_dirs} 个目录；"
-                    "隔离备份仍保留，可恢复或永久清理。",
+                    f"已从仓库直接清理 {removed_files} 个文件、{removed_dirs} 个目录；"
+                    f"已移除内容大小 {format_bytes(result.bytes_freed)}，已删除内容无法恢复。",
                     "success",
                 )
             elif kind == "restore":
@@ -735,9 +729,29 @@ class TrashCleanupPage(FeaturePage):
                     "success",
                 )
         elif result.status == "cancelled":
-            self.set_status("操作已取消；已建立的隔离备份仍会显示在本页。", "warning")
+            if kind == "clear":
+                removed_files = sum(item.removed_files for item in result.vaults)
+                removed_dirs = sum(item.removed_dirs for item in result.vaults)
+                self.set_status(
+                    f"清理已取消；已直接删除 {removed_files} 个文件、"
+                    f"{removed_dirs} 个目录，已移除内容大小 "
+                    f"{format_bytes(result.bytes_freed)}，"
+                    "已删除内容无法恢复，请重新扫描确认剩余项。",
+                    "warning",
+                )
+            else:
+                self.set_status("旧版隔离批次操作已取消。", "warning")
         elif result.status == "rejected":
             self.set_status(f"操作被安全拒绝：{failure or '范围或内容已变化。'}", "error")
+        elif kind == "clear":
+            removed_files = sum(item.removed_files for item in result.vaults)
+            removed_dirs = sum(item.removed_dirs for item in result.vaults)
+            self.set_status(
+                f"清理未完整完成：已直接删除 {removed_files} 个文件、{removed_dirs} 个目录，"
+                f"已移除内容大小 {format_bytes(result.bytes_freed)}；已删除内容无法恢复。"
+                f"{f' 首个问题：{failure}' if failure else ''}",
+                "error",
+            )
         else:
             self.set_status(f"操作未完整完成：{failure or result.status}", "error")
         self.message_logged.emit(self.status_label.text())
@@ -805,28 +819,6 @@ class TrashCleanupPage(FeaturePage):
         }
         self.cancel_button.setVisible(cancellable)
         self.cancel_button.setEnabled(cancellable)
-        self.copy_vault_button.setEnabled(
-            bool(self.vault_table.selectionModel().selectedRows())
-        )
-        self.copy_entry_button.setEnabled(
-            bool(self.entry_table.selectionModel().selectedRows())
-        )
-
-    def copy_selected_vault_paths(self) -> None:
-        paths = [
-            self.vault_model.rows[index.row()].vault_root
-            for index in self.vault_table.selectionModel().selectedRows()
-        ]
-        if paths:
-            QApplication.clipboard().setText("\n".join(paths))
-
-    def copy_selected_entry_paths(self) -> None:
-        paths = [
-            self.entry_model.rows[index.row()].absolute_path
-            for index in self.entry_table.selectionModel().selectedRows()
-        ]
-        if paths:
-            QApplication.clipboard().setText("\n".join(paths))
 
 
 __all__ = [

@@ -18,5 +18,5 @@ FEATURES = (
     FeatureDescriptor("template_suite", "模板套件部署", "模板套件", "把选定模板组件安全部署到仓库"),
     FeatureDescriptor("obsidian_config", "Obsidian 配置分发", "配置分发", "将一个 .obsidian 配置分发到多个仓库"),
     FeatureDescriptor("templater", "Templater 分发", "Templater", "将 File/Templater 分发到多个仓库"),
-    FeatureDescriptor("trash_cleanup", "回收站清理", "回收站", "预览、隔离并清理仓库的 .trash 内容"),
+    FeatureDescriptor("trash_cleanup", "回收站清理", "回收站", "预览并直接清理仓库的 .trash 内容"),
 )

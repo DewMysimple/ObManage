@@ -1,10 +1,11 @@
 """Safe, preview-first cleanup for Obsidian's vault-level ``.trash`` folder.
 
-The module deliberately has no Qt dependency.  Analysis is read-only.  Cleanup
-is allowed only for vaults explicitly supplied by the caller and only after an
-exact, content-hashed preview has been revalidated.  Before any repository data
-is removed, a verified copy and an atomic JSON journal are written below the
-application state directory.
+The module deliberately has no Qt dependency.  Analysis is read-only.  New
+cleanup operations directly and irreversibly remove only explicitly selected,
+content-hashed preview entries after the whole selection has been revalidated.
+The durable quarantine reader remains solely so installations upgraded from
+2.0.0 can restore or finalize backups that already existed before this policy
+changed; new cleanup operations never create backups or journals.
 """
 from __future__ import annotations
 
@@ -826,10 +827,16 @@ def _clear_preview(preview: TrashVaultPreview, cancel: Event | None,
                 ))
     except SyncCancelled:
         status = "cancelled"
-        message = "清理已取消；已完成项目可从隔离备份恢复。"
+        message = "清理已取消；已删除的项目无法恢复。"
+    except (OSError, TrashSafetyError) as exc:
+        failures.append(TrashFailure(
+            preview.vault_root, preview.trash_path, "clear", str(exc)
+        ))
+        status = "partial"
+        message = "清理因路径或身份复核失败而中止；已删除的项目无法恢复。"
     else:
         status = "success" if not failures else "partial"
-        message = "回收站已清空并保留目录。" if not failures else "部分项目未能移除；隔离备份已保留。"
+        message = "回收站已清空并保留目录。" if not failures else "部分项目未能移除；已删除的项目无法恢复。"
 
     try:
         remaining = tuple(os.scandir(native(preview.trash_path)))
@@ -837,7 +844,7 @@ def _clear_preview(preview: TrashVaultPreview, cancel: Event | None,
         failures.append(TrashFailure(preview.vault_root, preview.trash_path, "verify", str(exc)))
         if status == "success":
             status = "partial"
-            message = "无法验证清理结果；隔离备份已保留。"
+            message = "无法验证清理结果；已删除的项目无法恢复。"
     else:
         if remaining and status == "success":
             status = "partial"
@@ -942,7 +949,12 @@ def _validated_manifest_subset(current: tuple[TrashEntry, ...],
 
 
 class TrashCleanupEngine:
-    """Analyze, quarantine, restore and finalize selected vault trash folders."""
+    """Analyze and directly clear selected vault trash folders.
+
+    ``list_operations``, ``restore`` and ``finalize`` are legacy migration
+    support for quarantine journals created by ObManage 2.0.0.  ``execute``
+    intentionally does not call any backup or journal helper.
+    """
 
     def __init__(self, state_dir: str | Path) -> None:
         self.state_dir = canonical(state_dir)
@@ -1342,29 +1354,76 @@ class TrashCleanupEngine:
         data = self._load_journal(operation_id)
         return self._operation_from_data(data)
 
-    def list_operations(self) -> tuple[TrashOperation, ...]:
-        """Return every durable operation, newest first, without creating state."""
-        if snapshot(self._journal_base) is None:
-            return ()
-        assert_plain_chain(self._journal_base)
-        _read_snapshot(self._journal_base, "dir")
-        operations: list[TrashOperation] = []
+    def _legacy_backup_operation_ids(self) -> set[str]:
+        """Return authenticated-namespace backup roots without adopting them."""
+        if snapshot(self._backup_base) is None:
+            return set()
+        assert_plain_chain(self._backup_base)
+        _read_snapshot(self._backup_base, "dir")
         try:
-            with os.scandir(native(self._journal_base)) as iterator:
-                journal_names = sorted(
-                    entry.name for entry in iterator if entry.name.endswith(".json")
-                )
+            with os.scandir(native(self._backup_base)) as iterator:
+                names = sorted(entry.name for entry in iterator)
         except OSError as exc:
-            raise TrashSafetyError(f"无法枚举隔离记录：{exc}") from exc
+            raise TrashSafetyError(f"无法枚举旧版隔离备份：{exc}") from exc
+
+        operation_ids: set[str] = set()
+        for name in names:
+            try:
+                operation_id = self._valid_operation_id(name)
+            except TrashSafetyError as exc:
+                raise TrashSafetyError(
+                    f"旧版隔离备份目录包含未知项目：{name}"
+                ) from exc
+            _read_snapshot(self._operation_backup_root(operation_id), "dir")
+            operation_ids.add(operation_id)
+        return operation_ids
+
+    def list_operations(self) -> tuple[TrashOperation, ...]:
+        """Return every safe legacy operation, newest first, without writes."""
+        journal_names: list[str] = []
+        if snapshot(self._journal_base) is not None:
+            assert_plain_chain(self._journal_base)
+            _read_snapshot(self._journal_base, "dir")
+            try:
+                with os.scandir(native(self._journal_base)) as iterator:
+                    journal_names = sorted(entry.name for entry in iterator)
+            except OSError as exc:
+                raise TrashSafetyError(f"无法枚举隔离记录：{exc}") from exc
+
+        operations: list[TrashOperation] = []
+        journal_ids: set[str] = set()
         for name in journal_names:
+            if not name.endswith(".json"):
+                raise TrashSafetyError(f"隔离记录目录包含未知项目：{name}")
             path = canonical(os.path.join(self._journal_base, name))
             _read_snapshot(path, "file")
             operation_id = name[:-5]
             self._valid_operation_id(operation_id)
             data = self._load_journal(operation_id)
             operations.append(self._operation_from_data(data))
+            journal_ids.add(operation_id)
+
+        orphaned = self._legacy_backup_operation_ids() - journal_ids
+        if orphaned:
+            identifiers = "、".join(sorted(item[:8] for item in orphaned)[:3])
+            raise TrashSafetyError(
+                f"发现缺少认证记录的旧版隔离备份（{identifiers}），已阻止新的写入。"
+            )
         operations.sort(key=lambda item: (-item.created_at, item.operation_id))
         return tuple(operations)
+
+    def _assert_no_pending_legacy_operations(self) -> None:
+        """Keep 2.0.0 recovery authority intact before a new direct cleanup."""
+        pending = tuple(
+            operation for operation in self.list_operations()
+            if any(record.status != "finalized" for record in operation.records)
+        )
+        if pending:
+            identifiers = "、".join(item.operation_id[:8] for item in pending[:3])
+            raise TrashSafetyError(
+                f"已有待处理的旧版回收站隔离批次（{identifiers}），"
+                "请先恢复或永久清理该批次。"
+            )
 
     def execute(self, plan: TrashPlan, selected_vaults: Iterable[str | Path], *,
                 cancel: Event | None = None,
@@ -1406,73 +1465,14 @@ class TrashCleanupEngine:
         try:
             selected = self._selected(plan, selected_vaults)
             self._validate_state_location(selected)
+            self._assert_no_pending_legacy_operations()
             _check_cancel(cancel)
             self._revalidate_all(selected, cancel, progress)
-            # Establish durable signing authority before creating an operation
-            # root.  A crash during first-key creation therefore cannot leave
-            # an unauthenticated backup that a later run silently adopts.
-            self._ensure_state_dirs()
-            self._auth_key(create=True)
         except SyncCancelled:
             return TrashOperationResult("cancelled")
         except (OSError, SyncError) as exc:
             return TrashOperationResult(
                 "rejected", failures=(TrashFailure("", "", "preflight", str(exc)),)
-            )
-
-        operation_id = str(uuid.uuid4())
-        operation_root = self._operation_backup_root(operation_id)
-        journal = {
-            "version": JOURNAL_VERSION,
-            "operation_id": operation_id,
-            "created_at": time.time(),
-            "vaults": [],
-        }
-        operation_anchor: PathSnapshot | None = None
-        owned_backups: list[tuple[str, PathSnapshot, tuple[TrashEntry, ...]]] = []
-        try:
-            os.mkdir(native(operation_root))
-            operation_anchor = _read_snapshot(operation_root, "dir")
-            journal["backup_root_snapshot"] = asdict(operation_anchor)
-            for index, preview in enumerate(selected):
-                _check_cancel(cancel)
-                backup_rel = f"vault_{index:04d}"
-                backup_path = self._backup_path(operation_id, backup_rel)
-                os.mkdir(native(backup_path))
-                backup_anchor = _read_snapshot(backup_path, "dir")
-                owned_backups.append((backup_path, backup_anchor, preview.entries))
-                _copy_entries(
-                    preview.trash_path, backup_path, preview.entries,
-                    cancel, progress, preview.vault_root, "backup",
-                    destination_exists=True,
-                )
-                source_after = _scan_vault(preview.vault_root, cancel, progress)
-                if _preview_signature(source_after) != _preview_signature(preview):
-                    raise TrashSafetyError(f"备份期间回收站已变化：{preview.vault_root}")
-                backup_entries, backup_digest = _scan_content(backup_path, cancel)
-                if (_content_signature(backup_entries) != _content_signature(preview.entries)
-                        or backup_digest != preview.tree_sha256):
-                    raise TrashSafetyError(f"隔离备份校验失败：{preview.vault_root}")
-                journal["vaults"].append({
-                    "backup_rel": backup_rel,
-                    "backup_snapshot": asdict(backup_anchor),
-                    "status": "backed_up",
-                    "freed_bytes": 0,
-                    "preview": _preview_to_json(preview),
-                })
-            self._revalidate_all(selected, cancel, progress)
-            self._save_journal(journal)
-        except SyncCancelled:
-            self._cleanup_uncommitted_operation(
-                operation_root, operation_anchor, owned_backups
-            )
-            return TrashOperationResult("cancelled")
-        except (OSError, SyncError) as exc:
-            self._cleanup_uncommitted_operation(
-                operation_root, operation_anchor, owned_backups
-            )
-            return TrashOperationResult(
-                "failed", failures=(TrashFailure("", "", "backup", str(exc)),)
             )
 
         results: list[TrashVaultResult] = []
@@ -1482,7 +1482,11 @@ class TrashCleanupEngine:
             if cancel is not None and cancel.is_set():
                 cancelled = True
                 results.extend(
-                    TrashVaultResult(item.vault_root, "cancelled", message="操作已取消，隔离备份已保留。")
+                    TrashVaultResult(
+                        item.vault_root,
+                        "cancelled",
+                        message="操作已取消；未开始处理该仓库。",
+                    )
                     for item in selected[index:]
                 )
                 break
@@ -1494,34 +1498,30 @@ class TrashCleanupEngine:
             except SyncCancelled:
                 cancelled = True
                 result = TrashVaultResult(
-                    preview.vault_root, "cancelled", message="操作已取消，隔离备份已保留。"
+                    preview.vault_root,
+                    "cancelled",
+                    message="操作已取消；已删除的项目无法恢复。",
                 )
                 item_failures = ()
             except (OSError, SyncError) as exc:
                 result = TrashVaultResult(
-                    preview.vault_root, "failed", message="清理前复核失败，隔离备份已保留。"
+                    preview.vault_root,
+                    "failed",
+                    message="清理前复核失败；该仓库未开始删除。",
                 )
                 item_failures = (TrashFailure(
                     preview.vault_root, preview.trash_path, "clear", str(exc)
                 ),)
             results.append(result)
             failures.extend(item_failures)
-            journal["vaults"][index]["status"] = result.status
-            try:
-                self._save_journal(journal)
-            except OSError as exc:
-                failures.append(TrashFailure(
-                    preview.vault_root, self._journal_path(operation_id), "journal", str(exc)
-                ))
-                if result.status == "success":
-                    results[-1] = TrashVaultResult(
-                        result.vault_root, "partial", result.removed_files,
-                        result.removed_dirs, result.removed_bytes,
-                        message="内容已移除，但记录更新失败；初始隔离记录仍可用于恢复。",
-                    )
-            if cancelled:
+            if result.status == "cancelled":
+                cancelled = True
                 results.extend(
-                    TrashVaultResult(item.vault_root, "cancelled", message="操作已取消，隔离备份已保留。")
+                    TrashVaultResult(
+                        item.vault_root,
+                        "cancelled",
+                        message="操作已取消；未开始处理该仓库。",
+                    )
                     for item in selected[index + 1:]
                 )
                 break
@@ -1533,7 +1533,11 @@ class TrashCleanupEngine:
         else:
             status = "partial"
         return TrashOperationResult(
-            status, operation_id, tuple(results), tuple(failures), bytes_freed=0
+            status,
+            None,
+            tuple(results),
+            tuple(failures),
+            bytes_freed=sum(item.removed_bytes for item in results),
         )
 
     @staticmethod

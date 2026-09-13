@@ -164,16 +164,19 @@ def test_statistics_page_runs_read_only_service_and_reports_totals(application, 
         dispose(application, window)
 
 
-def test_pending_quarantine_blocks_all_new_writes_and_due_mirror(application, tmp_path):
+def test_direct_trash_cleanup_creates_no_recovery_gate(application, tmp_path):
     state = tmp_path / "state"
     vault = tmp_path / "vault"
     (vault / ".obsidian").mkdir(parents=True)
     (vault / ".trash").mkdir()
-    (vault / ".trash" / "recover.md").write_text("recover", encoding="utf-8")
+    (vault / ".trash" / "remove.md").write_text("remove", encoding="utf-8")
     engine = TrashCleanupEngine(state)
     trash_plan = engine.analyze((vault,))
     cleared = engine.execute(trash_plan, (vault,))
     assert cleared.status == "success"
+    assert cleared.operation_id is None
+    assert not (state / "trash_backups").exists()
+    assert not (state / "trash_journal").exists()
 
     source = tmp_path / "source"
     target = tmp_path / "target"
@@ -191,30 +194,67 @@ def test_pending_quarantine_blocks_all_new_writes_and_due_mirror(application, tm
         window.confirm_direction_checkbox.setChecked(True)
         window._refresh_actions()
 
+        assert window.nav_recovery_button.isHidden()
+        assert window.sync_button.isEnabled()
+        assert not window.pages["trash_cleanup"].has_pending_recovery()
+        for key in ("template_suite", "obsidian_config", "templater"):
+            assert not window.pages[key]._external_recovery_pending
+    finally:
+        dispose(application, window)
+
+
+def test_legacy_trash_quarantine_still_blocks_writes_until_finalized(
+    application, tmp_path, seed_legacy_quarantine
+):
+    state = tmp_path / "state"
+    vault = tmp_path / "vault"
+    (vault / ".obsidian").mkdir(parents=True)
+    (vault / ".trash").mkdir()
+    (vault / ".trash" / "recover.md").write_text("recover", encoding="utf-8")
+    operation_id, _ = seed_legacy_quarantine(state, vault)
+    source = tmp_path / "source"
+    target = tmp_path / "target"
+    source.mkdir()
+    target.mkdir()
+    window = MainWindow(state)
+    try:
+        window.local_edit.setText(str(source))
+        window.portable_combo.setCurrentText(str(target))
+        window.set_direction("to_portable")
+        window._accept_plan(
+            SyncPlan(str(source), str(target), [PlanItem("add", "note.md", 4, "new")]),
+            scheduled=False,
+        )
+        window.confirm_direction_checkbox.setChecked(True)
+        window._refresh_actions()
+
+        assert window._recovery_page_keys() == ("trash_cleanup",)
         assert not window.nav_recovery_button.isHidden()
         assert not window.sync_button.isEnabled()
         assert window.pages["trash_cleanup"].has_pending_recovery()
         for key in ("template_suite", "obsidian_config", "templater"):
             assert window.pages[key]._external_recovery_pending
-
         window._execute_plan()
         assert not window.busy
-        assert "待恢复事务" in window.status_label.text()
 
         window.scheduler.next_run = datetime.now() - timedelta(seconds=1)
         window._timer_tick()
         assert not window.busy
         assert window.scheduler.next_run > datetime.now()
         assert any("待恢复事务" in line and "跳过" in line for line in window._log_lines)
-
         window.nav_recovery_button.click()
         assert window._current_page_key == "trash_cleanup"
 
-        finalized = engine.finalize(cleared.operation_id)
+        finalized = TrashCleanupEngine(state).finalize(operation_id)
         assert finalized.status == "success"
         window.pages["trash_cleanup"]._reload_operations()
         window._refresh_actions()
+        assert window._recovery_page_keys() == ()
         assert window.nav_recovery_button.isHidden()
+        window._show_page("mirror")
+        window.confirm_direction_checkbox.setChecked(True)
+        window._refresh_actions()
+        assert window.sync_button.isEnabled()
     finally:
         dispose(application, window)
 

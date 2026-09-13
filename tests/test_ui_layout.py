@@ -219,10 +219,7 @@ def test_every_management_page_fits_width_and_bottom_actions_are_reachable(
                 window.pages["templater"].rollback_button,
                 window.pages["templater"].execute_button,
             ),
-            "trash_cleanup": (
-                window.pages["trash_cleanup"].restore_button,
-                window.pages["trash_cleanup"].clear_button,
-            ),
+            "trash_cleanup": (window.pages["trash_cleanup"].clear_button,),
         }
         for key, controls in bottom_controls.items():
             window._show_page(key, persist=False)
@@ -242,8 +239,45 @@ def test_every_management_page_fits_width_and_bottom_actions_are_reachable(
                     f"is unreachable at {size}"
                 )
         if size == (980, 620):
-            for key in ("template_suite", "obsidian_config", "templater", "trash_cleanup"):
+            for key in ("template_suite", "obsidian_config", "templater"):
                 assert window.page_containers[key].verticalScrollBar().maximum() > 0
+    finally:
+        assert not window.busy
+        window._timer.stop()
+        window._save_timer.stop()
+        window.tray.hide()
+        window.hide()
+        window.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
+def test_legacy_trash_recovery_actions_fit_and_are_scroll_reachable(
+    application, tmp_path, seed_legacy_quarantine
+):
+    state = tmp_path / "state"
+    vault = tmp_path / "vault"
+    (vault / ".obsidian").mkdir(parents=True)
+    (vault / ".trash").mkdir()
+    (vault / ".trash" / "restore.md").write_text("restore", encoding="utf-8")
+    seed_legacy_quarantine(state, vault)
+    window = MainWindow(state)
+    window.resize(980, 620)
+    window.show()
+    try:
+        window._show_page("trash_cleanup", persist=False)
+        scroll = window.page_containers["trash_cleanup"]
+        page = window.pages["trash_cleanup"]
+        settle(application)
+        assert not page.legacy_recovery_panel.isHidden()
+        assert scroll.horizontalScrollBar().maximum() == 0
+        assert scroll.verticalScrollBar().maximum() > 0
+
+        for control in (page.restore_button, page.finalize_button):
+            scroll.ensureWidgetVisible(control)
+            settle(application)
+            viewport = scroll.viewport()
+            origin = control.mapTo(viewport, QPoint(0, 0))
+            assert viewport.rect().intersects(QRect(origin, control.size()))
     finally:
         assert not window.busy
         window._timer.stop()
