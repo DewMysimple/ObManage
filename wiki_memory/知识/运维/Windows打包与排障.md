@@ -16,7 +16,7 @@ supersedes: null
 
 项目使用普通 GIL 版 Python 3.14 x64。运行依赖 PySide6 6.11.2，开发构建使用 PyInstaller 6.22.0 和 pytest 9.1.1，版本以[requirements.txt](../../../requirements.txt)及[requirements-dev.txt](../../../requirements-dev.txt)为准。
 
-执行 `python tools/build.py` 输出 `dist/ObManage/ObManage.exe` 与 `_internal/`，把[docs/使用指南.md](../../../docs/使用指南.md)复制为包内 `使用说明.md`，同时拷贝第三方声明及 `licenses/`。GitHub README 包含仓库链接和示例图，因此不再直接充当包内文档。分发整个目录，单独 EXE 不完整。产物被 Git 忽略，不把本机生成包自动视为公开 Release。
+执行 `python tools/build.py` 输出 `dist/ObManage/ObManage.exe` 与 `_internal/`，把[docs/使用指南.md](../../../docs/使用指南.md)复制为包内 `使用说明.md`，同时拷贝第三方声明及 `licenses/`，并生成 `dist/ObManage.zip`。ZIP 直接收纳程序目录内容，解压后根目录就是程序根目录，`ObManage.exe` 与 `_internal/` 同级；单独 EXE 不完整。GitHub README 包含仓库链接和示例图，因此不再直接充当包内文档。产物被 Git 忽略，不把本机生成包自动视为公开 Release。
 
 构建脚本会清理并重建已知 `build/` 与 `dist/` 产物。重建前确认旧 EXE 已空闲退出，避免 DLL 被占用；不能为解锁强杀正在同步的进程。手工递归清理前确认绝对目标在项目构建目录内，禁止把计算路径交给其他 shell 删除。
 

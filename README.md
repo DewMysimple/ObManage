@@ -55,7 +55,7 @@ ObManage 2 不再只是仓库镜像工具。它把常用的仓库统计、配置
 
 ### 已有便携程序
 
-打开便携目录中的 `ObManage.exe`。保留旁边的 `_internal` 文件夹，移动时复制整个程序目录；运行便携版无须安装 Python。
+解压 `dist\ObManage.zip` 后，压缩包根目录就是程序根目录，直接打开其中的 `ObManage.exe`。保留旁边的 `_internal` 文件夹，移动时复制解压后的整个目录；运行便携版无须安装 Python。
 
 仓库镜像的基本流程：
 
@@ -85,7 +85,7 @@ python -m venv .venv
 .\.venv\Scripts\python.exe tools\build.py
 ```
 
-产物位于 `dist\ObManage\`。Git 源码仓库不跟踪构建产物；下载源码后需执行上述构建步骤才能得到 EXE。
+产物位于 `dist\ObManage\`，并自动生成 `dist\ObManage.zip`。ZIP 解压后直接得到程序根目录，不会再套一层 `ObManage` 文件夹；Git 源码仓库不跟踪构建产物，下载源码后需执行上述构建步骤才能得到 EXE 和 ZIP。
 
 命令行 `--preview --source ... --target ...` 仍只提供“仓库镜像”的只读差异 JSON；其余功能在桌面界面中使用。
 

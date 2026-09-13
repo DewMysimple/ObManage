@@ -10,6 +10,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 
+def _create_portable_archive(package_dir: Path) -> Path:
+    """Create a flat-root ZIP beside the onedir package."""
+    archive_base = package_dir.parent / package_dir.name
+    archive_path = archive_base.with_suffix(".zip")
+    shutil.make_archive(str(archive_base), "zip", root_dir=package_dir)
+    return archive_path
+
+
 def main() -> None:
     from make_icon import make_icon
 
@@ -35,7 +43,10 @@ def main() -> None:
     shutil.copy2(ROOT / "docs" / "使用指南.md", ROOT / "dist" / "ObManage" / "使用说明.md")
     shutil.copy2(ROOT / "THIRD_PARTY_NOTICES.md", ROOT / "dist" / "ObManage" / "THIRD_PARTY_NOTICES.md")
     shutil.copytree(ROOT / "licenses", ROOT / "dist" / "ObManage" / "licenses", dirs_exist_ok=True)
-    print(ROOT / "dist" / "ObManage" / "ObManage.exe")
+    package_dir = ROOT / "dist" / "ObManage"
+    archive_path = _create_portable_archive(package_dir)
+    print(package_dir / "ObManage.exe")
+    print(archive_path)
 
 
 if __name__ == "__main__":
