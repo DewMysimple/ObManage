@@ -15,6 +15,7 @@ supersedes: null
 
 | 时间 | 类型 | 目标 | 状态 | 主题 | 日志 |
 | --- | --- | --- | --- | --- | --- |
+| 2026-09-13 | maintenance | 基于提交 `64552a8` 构建最新 Windows 便携目录，并生成 ZIP 交付包。 | archived | portable-package-build | [2026-09-13｜最新便携包构建](./2026-09-13-最新便携包构建.md) |
 | 2026-09-13 | feature | 扫描回收站后默认选择全部非空项，移除回收站页的路径复制入口，并将新清理改为确认后直接删除、不创建隔离备份。 | archived | direct-trash-cleanup | [2026-09-13｜回收站直接清理](./2026-09-13-回收站直接清理.md) |
 | 2026-09-11 | feature | 缩短本机仓库与移动盘之间约五分钟的完整内容校验，同时继续逐字节读取两端、保持 SHA-256、来源只读和并发变化 fail-closed。 | archived | parallel-deep-content-verification | [2026-09-11｜完整内容校验并行优化](./2026-09-11-完整内容校验并行优化.md) |
 | 2026-09-11 | feature | 把五个旧版仓库小工具的业务意图重新设计为 ObManage 的独立页面和安全业务引擎，同时保留仓库镜像为第一页。 | archived | multi-page-repository-management | [2026-09-11｜多页面仓库管理升级](./2026-09-11-多页面仓库管理升级.md) |
