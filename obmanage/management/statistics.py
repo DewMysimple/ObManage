@@ -6,8 +6,11 @@ import os
 import stat
 import time
 from collections.abc import Callable, Iterable
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
+from itertools import groupby
 from pathlib import Path
-from threading import Event
+from threading import Event, Lock
 
 from ..models import Progress, SyncCancelled, SyncError
 from ..paths import assert_plain_chain, canonical, native, snapshot
@@ -23,7 +26,19 @@ from .models import (
 ProgressCallback = Callable[[Progress], None]
 _READ_SIZE = 1024 * 1024
 _PROGRESS_INTERVAL = 0.08
+_MAX_CHARACTER_WORKERS = 4
 _RESERVED_DIRECTORY_PREFIXES = (".obmanage-deploy-",)
+
+
+@dataclass
+class _MarkdownCandidate:
+    path: str
+    parent_path: str
+    relative_path: str
+    name: str
+    expected_state: dict
+    direct_children: list[tuple[str, bool, tuple | None]]
+    direct_child_index: int
 
 
 def _cancelled(cancel: Event | None) -> None:
@@ -68,9 +83,11 @@ def _read_utf8_characters(
     *,
     cancel: Event | None,
     on_bytes: Callable[[int], None],
+    parent_validated: bool = False,
 ) -> tuple[int, dict]:
     """Decode one stable regular file incrementally and return code-point count."""
-    assert_plain_chain(os.path.dirname(path))
+    if not parent_validated:
+        assert_plain_chain(os.path.dirname(path))
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
@@ -153,24 +170,29 @@ def collect_vault_statistics(
     completed_bytes = 0
     last_progress = 0.0
     last_reported_bytes = 0
+    progress_lock = Lock()
 
-    def report(vault_path: str, relative_path: str, *, force: bool = False) -> None:
-        nonlocal last_progress, last_reported_bytes
-        if progress is None:
-            return
-        now = time.monotonic()
-        first_data = completed_bytes > 0 and last_reported_bytes == 0
-        if not force and not first_data and now - last_progress < _PROGRESS_INTERVAL:
-            return
-        last_progress = now
-        last_reported_bytes = completed_bytes
-        progress(Progress(
-            phase="statistics",
-            message=f"正在统计仓库：{Path(vault_path).name or vault_path}",
-            relative_path=relative_path,
-            completed_bytes=completed_bytes,
-            completed_files=completed_files,
-        ))
+    def report(vault_path: str, relative_path: str, *, byte_delta: int = 0,
+               file_delta: int = 0, force: bool = False) -> None:
+        nonlocal completed_bytes, completed_files, last_progress, last_reported_bytes
+        with progress_lock:
+            completed_bytes += byte_delta
+            completed_files += file_delta
+            if progress is None:
+                return
+            now = time.monotonic()
+            first_data = completed_bytes > 0 and last_reported_bytes == 0
+            if not force and not first_data and now - last_progress < _PROGRESS_INTERVAL:
+                return
+            last_progress = now
+            last_reported_bytes = completed_bytes
+            progress(Progress(
+                phase="statistics",
+                message=f"正在统计仓库：{Path(vault_path).name or vault_path}",
+                relative_path=relative_path,
+                completed_bytes=completed_bytes,
+                completed_files=completed_files,
+            ))
 
     for vault_path in sorted(prepared.values(), key=_sort_key):
         _cancelled(cancel)
@@ -181,8 +203,9 @@ def collect_vault_statistics(
         folders = 0
         stack: list[tuple[str, bool]] = [(vault_path, True)]
         directory_guards: list[
-            tuple[str, dict, tuple[tuple[str, bool, tuple | None], ...]]
+            tuple[str, dict, list[tuple[str, bool, tuple | None]]]
         ] = []
+        markdown_candidates: list[_MarkdownCandidate] = []
         changed_directories: set[str] = set()
 
         def mark_directory_changed(path: str, message: str) -> None:
@@ -268,36 +291,17 @@ def collect_vault_statistics(
                 markdown_files += 1
                 markdown_bytes += state["size"]
                 if not count_characters:
-                    completed_files += 1
-                    report(vault_path, relative, force=True)
+                    report(vault_path, relative, file_delta=1, force=True)
                     continue
-
-                def on_bytes(amount: int) -> None:
-                    nonlocal completed_bytes
-                    completed_bytes += amount
-                    report(vault_path, relative)
-
-                try:
-                    characters, stable_state = _read_utf8_characters(
-                        child, state, cancel=cancel, on_bytes=on_bytes
-                    )
-                except UnicodeDecodeError as exc:
-                    issues.append(ManagementIssue(
-                        "markdown_invalid_utf8", f"Markdown 文件不是有效 UTF-8：{exc}", child
-                    ))
-                except (OSError, SyncError) as exc:
-                    issues.append(ManagementIssue(
-                        "markdown_unreadable", f"无法读取 Markdown 文件：{exc}", child
-                    ))
-                else:
-                    direct_children[direct_child_index] = (
-                        entry.name, True, _state_epoch(stable_state)
-                    )
-                    utf8_characters += characters
-                # A failed file is completed with an explicit issue.  Cancellation
-                # bypasses these lines so progress never labels a partial file done.
-                completed_files += 1
-                report(vault_path, relative, force=True)
+                markdown_candidates.append(_MarkdownCandidate(
+                    path=child,
+                    parent_path=current,
+                    relative_path=relative,
+                    name=entry.name,
+                    expected_state=state,
+                    direct_children=direct_children,
+                    direct_child_index=direct_child_index,
+                ))
 
             try:
                 folder_after = snapshot(current)
@@ -309,8 +313,91 @@ def collect_vault_statistics(
             if _state_epoch(folder_after) != _state_epoch(folder_before):
                 mark_directory_changed(current, "目录在枚举期间发生变化，统计结果不完整。")
             if folder_after is not None and folder_after["kind"] == "dir":
-                directory_guards.append((current, folder_after, tuple(direct_children)))
+                directory_guards.append((current, folder_after, direct_children))
             stack.extend((child, False) for child in reversed(child_dirs))
+
+        if count_characters and markdown_candidates:
+            def read_candidate(
+                candidate: _MarkdownCandidate,
+            ) -> tuple[_MarkdownCandidate, int | None, dict | None, Exception | None]:
+                try:
+                    characters, stable_state = _read_utf8_characters(
+                        candidate.path,
+                        candidate.expected_state,
+                        cancel=cancel,
+                        on_bytes=lambda amount: report(
+                            vault_path, candidate.relative_path, byte_delta=amount
+                        ),
+                        parent_validated=True,
+                    )
+                except (UnicodeDecodeError, OSError, SyncError) as exc:
+                    return candidate, None, None, exc
+                return candidate, characters, stable_state, None
+
+            worker_count = min(_MAX_CHARACTER_WORKERS, len(markdown_candidates))
+            with ThreadPoolExecutor(
+                max_workers=worker_count,
+                thread_name_prefix="obmanage-statistics",
+            ) as executor:
+                grouped = groupby(markdown_candidates, key=lambda item: item.parent_path)
+                for parent_path, candidate_group in grouped:
+                    group = list(candidate_group)
+                    try:
+                        # Validate the shared chain once immediately before this
+                        # directory's files are opened.  Each file handle and path
+                        # is still checked independently before and after reading.
+                        assert_plain_chain(parent_path)
+                        parent_state = snapshot(parent_path)
+                        if parent_state is None or parent_state["kind"] != "dir":
+                            raise OSError("目录在读取 Markdown 前已被移除或替换")
+                    except (OSError, SyncError) as exc:
+                        issues.append(ManagementIssue(
+                            "directory_unreadable",
+                            f"无法安全读取目录中的 Markdown：{exc}",
+                            parent_path,
+                        ))
+                        for candidate in group:
+                            report(
+                                vault_path,
+                                candidate.relative_path,
+                                file_delta=1,
+                                force=True,
+                            )
+                        continue
+
+                    outcomes = executor.map(
+                        read_candidate,
+                        group,
+                        buffersize=worker_count * 2,
+                    )
+                    for candidate, characters, stable_state, error in outcomes:
+                        if isinstance(error, UnicodeDecodeError):
+                            issues.append(ManagementIssue(
+                                "markdown_invalid_utf8",
+                                f"Markdown 文件不是有效 UTF-8：{error}",
+                                candidate.path,
+                            ))
+                        elif error is not None:
+                            issues.append(ManagementIssue(
+                                "markdown_unreadable",
+                                f"无法读取 Markdown 文件：{error}",
+                                candidate.path,
+                            ))
+                        else:
+                            assert characters is not None and stable_state is not None
+                            candidate.direct_children[candidate.direct_child_index] = (
+                                candidate.name, True, _state_epoch(stable_state)
+                            )
+                            utf8_characters += characters
+                        # A failed file is completed with an explicit issue.
+                        # Cancellation escapes the map iterator, so a partial file
+                        # is never reported as complete.
+                        report(
+                            vault_path,
+                            candidate.relative_path,
+                            file_delta=1,
+                            force=True,
+                        )
 
         # Re-enumerate every traversed directory after all content reads.  This
         # catches late additions/removals and replacements that a single scandir

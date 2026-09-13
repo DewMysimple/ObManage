@@ -128,6 +128,32 @@ def test_discovery_never_offers_vaults_inside_a_root_trash(tmp_path):
     assert result.issues == ()
 
 
+def test_discovery_uses_scandir_metadata_for_ordinary_files(tmp_path, monkeypatch):
+    search = tmp_path / "search"
+    vault = make_vault(search / "vault")
+    ordinary_files = []
+    for index in range(40):
+        path = search / f"ordinary-{index}.bin"
+        path.write_bytes(b"ordinary")
+        ordinary_files.append(os.path.normcase(canonical(path)))
+
+    real_snapshot = catalog_module.snapshot
+    ordinary_snapshots: list[str] = []
+
+    def observed_snapshot(path):
+        key = os.path.normcase(canonical(path))
+        if key in ordinary_files:
+            ordinary_snapshots.append(key)
+        return real_snapshot(path)
+
+    monkeypatch.setattr(catalog_module, "snapshot", observed_snapshot)
+
+    result = discover_vaults(search)
+
+    assert [item.path for item in result.vaults] == [canonical(vault)]
+    assert ordinary_snapshots == []
+
+
 @pytest.mark.parametrize("scope_suffix", [(".trash",), (".trash", "deleted-vault")])
 def test_explicit_scope_inside_a_vault_root_trash_is_safely_excluded(tmp_path, scope_suffix):
     parent = make_vault(tmp_path / "parent")

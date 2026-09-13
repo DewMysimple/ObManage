@@ -113,6 +113,24 @@ def test_schedule_binding_target_change_and_tray(application, window, monkeypatc
     assert not SettingsStore(widget.state_dir).load().schedule_enabled
 
 
+def test_operation_log_displays_newest_entries_first(application, window):
+    widget, _source, _target = window
+    widget._log("较早的测试日志")
+    widget._log("较新的测试日志")
+    widget.show_logs()
+    application.processEvents()
+
+    lines = widget.log_view.toPlainText().splitlines()
+    assert lines[0].endswith("较新的测试日志")
+    assert lines[1].endswith("较早的测试日志")
+    assert widget.log_view.verticalScrollBar().value() == 0
+
+    widget._log("日志窗口打开后的最新记录")
+    lines = widget.log_view.toPlainText().splitlines()
+    assert lines[0].endswith("日志窗口打开后的最新记录")
+    assert widget.log_view.verticalScrollBar().value() == 0
+
+
 def test_scheduled_tick_scans_then_executes_and_preserves_single_worker(application, window):
     widget, source, target = window
     (source / "定时.md").write_text("自动同步", encoding="utf-8")

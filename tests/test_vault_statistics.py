@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from threading import Event
+from threading import Event, Lock
 
 import pytest
 
@@ -139,6 +139,46 @@ def test_character_metric_is_strict_utf8_code_points_without_newline_rewriting(t
     assert stats.characters_counted
     assert stats.complete
     assert tree_contents(tmp_path) == before
+
+
+def test_character_reads_run_in_bounded_parallel_without_changing_totals(
+        tmp_path, monkeypatch):
+    vault = make_vault(tmp_path / "vault")
+    expected_characters = 0
+    for index in range(8):
+        text = f"第 {index} 篇🙂" * 200
+        expected_characters += len(text)
+        (vault / f"note-{index}.md").write_text(text, encoding="utf-8")
+
+    real_read = statistics_module._read_utf8_characters
+    guard = Lock()
+    two_active = Event()
+    active = 0
+    maximum_active = 0
+
+    def observed_read(*args, **kwargs):
+        nonlocal active, maximum_active
+        with guard:
+            active += 1
+            maximum_active = max(maximum_active, active)
+            if active >= 2:
+                two_active.set()
+        try:
+            two_active.wait(2)
+            return real_read(*args, **kwargs)
+        finally:
+            with guard:
+                active -= 1
+
+    monkeypatch.setattr(statistics_module, "_read_utf8_characters", observed_read)
+
+    result = collect_vault_statistics(vault)
+
+    stats = result.statistics[0]
+    assert 2 <= maximum_active <= statistics_module._MAX_CHARACTER_WORKERS
+    assert stats.markdown_files == 8
+    assert stats.utf8_characters == expected_characters
+    assert stats.complete
 
 
 def test_metadata_only_mode_skips_content_reads_and_trash_is_explicit(tmp_path, monkeypatch):

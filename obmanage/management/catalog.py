@@ -13,7 +13,7 @@ from pathlib import Path
 from threading import Event
 
 from ..models import Progress, SyncCancelled, SyncError
-from ..paths import assert_plain_chain, canonical, native, snapshot
+from ..paths import assert_plain_chain, canonical, is_reparse, native, snapshot
 from .models import ManagementIssue, OpenedVaultCandidates, VaultCatalogResult, VaultInfo
 
 ProgressCallback = Callable[[Progress], None]
@@ -58,11 +58,16 @@ def _physical_plain_directory(path: str | Path) -> tuple[str | None, ManagementI
         physical = canonical(os.path.realpath(native(selected)))
     except OSError as exc:
         return None, ManagementIssue("unsafe_path", f"无法解析目录的物理路径：{exc}", selected)
-    try:
-        assert_plain_chain(physical)
-        physical_state = snapshot(physical)
-    except (OSError, SyncError) as exc:
-        return None, ManagementIssue("unsafe_path", f"无法安全检查目录：{exc}", selected)
+    if _path_key(physical) == _path_key(selected):
+        # ``selected`` was just validated component by component.  Repeating the
+        # identical chain walk for the common no-alias case doubles metadata I/O.
+        physical_state = state
+    else:
+        try:
+            assert_plain_chain(physical)
+            physical_state = snapshot(physical)
+        except (OSError, SyncError) as exc:
+            return None, ManagementIssue("unsafe_path", f"无法安全检查目录：{exc}", selected)
     if physical_state is None or physical_state["kind"] != "dir":
         return None, ManagementIssue("unsafe_path", "目录在检查期间已改变。", selected)
     return physical, None
@@ -358,15 +363,22 @@ def discover_vaults(
                 continue
             child = canonical(os.path.join(physical, entry.name))
             try:
-                state = snapshot(child)
+                state = entry.stat(follow_symlinks=False)
+            except FileNotFoundError:
+                issues.append(ManagementIssue(
+                    "path_changed", "路径在发现期间消失。", child, "warning"
+                ))
+                continue
             except OSError as exc:
                 issues.append(ManagementIssue("path_unreadable", f"无法检查路径：{exc}", child))
                 continue
-            if state is None:
-                issues.append(ManagementIssue("path_changed", "路径在发现期间消失。", child, "warning"))
-            elif state["kind"] == "dir":
+            if is_reparse(state):
+                issues.append(ManagementIssue(
+                    "unsafe_item", "已跳过链接、重解析点或特殊项。", child
+                ))
+            elif stat.S_ISDIR(state.st_mode):
                 children.append(child)
-            elif state["kind"] in ("link", "special"):
+            elif not stat.S_ISREG(state.st_mode):
                 issues.append(ManagementIssue(
                     "unsafe_item", "已跳过链接、重解析点或特殊项。", child
                 ))

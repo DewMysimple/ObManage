@@ -1814,7 +1814,8 @@ class MainWindow(QMainWindow):
         self._log_lines.append(line)
         self._log_lines = self._log_lines[-3000:]
         if self._log_dialog is not None:
-            self.log_view.appendPlainText(line)
+            self.log_view.setPlainText("\n".join(reversed(self._log_lines)))
+            self.log_view.verticalScrollBar().setValue(0)
         if self._state_location_error():
             return
         logging.getLogger(__name__).info(message)
@@ -1843,7 +1844,8 @@ class MainWindow(QMainWindow):
             self.log_view.setObjectName("log_view")
             self.log_view.setReadOnly(True)
             self.log_view.setMaximumBlockCount(3000)
-            self.log_view.setPlainText("\n".join(self._log_lines))
+            self.log_view.setPlainText("\n".join(reversed(self._log_lines)))
+            self.log_view.verticalScrollBar().setValue(0)
             log_layout.addWidget(self.log_view)
             bottom = QHBoxLayout()
             hint = QLabel(str(self.state_dir / "ui.log"))
