@@ -1,6 +1,35 @@
 from __future__ import annotations
 
-from obmanage.app import acquire_instance_lock, main
+import time
+
+from PySide6.QtNetwork import QLocalServer
+from PySide6.QtWidgets import QApplication
+
+from obmanage.app import (
+    acquire_instance_lock,
+    create_instance_focus_server,
+    instance_focus_server_name,
+    main,
+    notify_existing_instance,
+)
+
+
+def test_second_instance_notifies_running_window_to_focus(tmp_path):
+    app = QApplication.instance() or QApplication([])
+    state_dir = tmp_path / "state"
+    calls: list[str] = []
+    server = create_instance_focus_server(state_dir, lambda: calls.append("focus"))
+    assert server is not None
+    try:
+        assert notify_existing_instance(state_dir)
+        deadline = time.monotonic() + 1.0
+        while not calls and time.monotonic() < deadline:
+            app.processEvents()
+            time.sleep(0.01)
+        assert calls == ["focus"]
+    finally:
+        server.close()
+        QLocalServer.removeServer(instance_focus_server_name(state_dir))
 
 
 def test_preview_uses_same_instance_lock_as_desktop_app(tmp_path, capsys):

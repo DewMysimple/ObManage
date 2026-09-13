@@ -7,6 +7,7 @@ updated: 2026-09-10
 topic: windows-build-troubleshooting
 source_logs:
   - "[[日志/2026-09-10-工程记忆与界面整理]]"
+  - "[[日志/2026-09-13-重复启动聚焦窗口]]"
 supersedes: null
 ---
 
@@ -38,6 +39,6 @@ supersedes: null
 | `ui.log` / `ui.previous.log` | 界面可读操作记录及原因 |
 | `instance.lock` | 同一状态目录的 GUI 实例锁 |
 
-配置损坏回退默认并记录错误，旧版本配置升级暂停定时。保留同目录运行进程时不要任意删除锁；先从托盘退出。遇到失败先查状态日志、盘连接和计划是否过期，再重新分析。删除数据库会丢失加速和临时文件所有权记录，不应作为常规排障第一步。
+配置损坏回退默认并记录错误，旧版本配置升级暂停定时。`instance.lock` 之外，GUI 还在同一状态目录监听一个由绝对路径哈希得到的 `QLocalServer` 通道；再次打开同一便携程序时，第二个进程通过该通道请求主进程恢复、置顶并激活窗口，然后立即退出。保留同目录运行进程时不要任意删除锁；先从托盘退出。遇到失败先查状态日志、盘连接和计划是否过期，再重新分析。删除数据库会丢失加速和临时文件所有权记录，不应作为常规排障第一步。
 
 来源：[build.py](../../../tools/build.py)、[app.py](../../../obmanage/app.py)、[settings.py](../../../obmanage/settings.py)、[UI 日志及退出](../../../obmanage/ui.py)、[第三方声明](../../../THIRD_PARTY_NOTICES.md)。

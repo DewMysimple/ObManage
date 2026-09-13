@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import argparse
 import ctypes
+import hashlib
 import json
 import logging
 import os
 import sys
 import tempfile
 import time
+from ctypes import wintypes
 from dataclasses import asdict
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from typing import Callable
 
 from .models import SyncError
 from .paths import validate_state_separation
@@ -43,6 +46,100 @@ def acquire_instance_lock(state_dir: Path):
     lock = QLockFile(str(state_dir / "instance.lock"))
     lock.setStaleLockTime(0)
     return lock if lock.tryLock(0) else None
+
+
+def instance_focus_server_name(state_dir: Path) -> str:
+    """Return a stable, short local IPC name for one application state tree."""
+    normalized = os.path.normcase(os.path.abspath(os.fspath(state_dir)))
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:32]
+    return f"ObManage-{digest}"
+
+
+def notify_existing_instance(state_dir: Path) -> bool:
+    """Ask the running instance for this state tree to focus its main window."""
+    from PySide6.QtNetwork import QLocalSocket
+
+    socket = QLocalSocket()
+    socket.connectToServer(instance_focus_server_name(state_dir))
+    if not socket.waitForConnected(300):
+        return False
+    socket.write(b"focus")
+    socket.waitForBytesWritten(300)
+    socket.disconnectFromServer()
+    return True
+
+
+def focus_main_window(window: object) -> None:
+    """Restore and activate the GUI window, including Windows foreground rules."""
+    show_window = getattr(window, "_show_window")
+    show_window()
+    if os.name != "nt":
+        return
+    try:
+        hwnd = int(window.winId())
+        user32 = ctypes.WinDLL("user32", use_last_error=True)
+        user32.GetForegroundWindow.restype = wintypes.HWND
+        user32.GetWindowThreadProcessId.argtypes = [wintypes.HWND, ctypes.POINTER(wintypes.DWORD)]
+        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+        user32.GetCurrentThreadId.restype = wintypes.DWORD
+        user32.AttachThreadInput.argtypes = [wintypes.DWORD, wintypes.DWORD, wintypes.BOOL]
+        user32.AttachThreadInput.restype = wintypes.BOOL
+        user32.ShowWindow.argtypes = [wintypes.HWND, ctypes.c_int]
+        user32.ShowWindow.restype = wintypes.BOOL
+        user32.BringWindowToTop.argtypes = [wintypes.HWND]
+        user32.BringWindowToTop.restype = wintypes.BOOL
+        user32.SetForegroundWindow.argtypes = [wintypes.HWND]
+        user32.SetForegroundWindow.restype = wintypes.BOOL
+        user32.SetActiveWindow.argtypes = [wintypes.HWND]
+        user32.SetActiveWindow.restype = wintypes.HWND
+
+        foreground = user32.GetForegroundWindow()
+        current_thread = user32.GetCurrentThreadId()
+        foreground_thread = user32.GetWindowThreadProcessId(foreground, None) if foreground else 0
+        attached = bool(foreground_thread and foreground_thread != current_thread
+                        and user32.AttachThreadInput(foreground_thread, current_thread, True))
+        try:
+            user32.ShowWindow(hwnd, 9)  # SW_RESTORE
+            user32.BringWindowToTop(hwnd)
+            user32.SetForegroundWindow(hwnd)
+            user32.SetActiveWindow(hwnd)
+        finally:
+            if attached:
+                user32.AttachThreadInput(foreground_thread, current_thread, False)
+    except (AttributeError, OSError, TypeError, ValueError):
+        logging.getLogger(__name__).debug("Windows 前台窗口激活兜底失败", exc_info=True)
+
+
+def create_instance_focus_server(state_dir: Path, on_focus: Callable[[], None]):
+    """Listen for second-launch requests and invoke ``on_focus`` in the GUI thread."""
+    from PySide6.QtNetwork import QLocalServer
+
+    server = QLocalServer()
+    name = instance_focus_server_name(state_dir)
+
+    # A crashed GUI can leave a local-server endpoint behind even though its
+    # QLockFile is no longer held.  The instance lock has already established
+    # ownership before this function is called, so removing that stale endpoint
+    # is safe here.
+    if not server.listen(name):
+        QLocalServer.removeServer(name)
+        if not server.listen(name):
+            logging.getLogger(__name__).warning(
+                "无法创建重复启动聚焦通道 %s: %s", name, server.errorString()
+            )
+            return None
+
+    def handle_connections() -> None:
+        while server.hasPendingConnections():
+            socket = server.nextPendingConnection()
+            if socket is None:
+                continue
+            on_focus()
+            socket.disconnectFromServer()
+            socket.deleteLater()
+
+    server.newConnection.connect(handle_connections)
+    return server
 
 
 def _configured_repository_paths(state_dir: Path, *, preview: bool,
@@ -148,7 +245,8 @@ def main(argv: list[str] | None = None) -> int:
     app.setFont(QFont("Microsoft YaHei UI", 10))
     lock = acquire_instance_lock(state_dir)
     if lock is None:
-        QMessageBox.information(None, "ObManage 已在运行", "请从右下角系统托盘打开已有的 ObManage 窗口。")
+        if not notify_existing_instance(state_dir):
+            QMessageBox.information(None, "ObManage 已在运行", "请从右下角系统托盘打开已有的 ObManage 窗口。")
         _shutdown_logging()
         if temporary_state:
             temporary_state.cleanup()
@@ -161,8 +259,17 @@ def main(argv: list[str] | None = None) -> int:
     sys.excepthook = report_exception
     from .ui import MainWindow
 
+    window_holder: list[MainWindow | None] = [None]
+
+    def focus_window() -> None:
+        window = window_holder[0]
+        if window is not None:
+            focus_main_window(window)
+
+    focus_server = create_instance_focus_server(state_dir, focus_window)
     logging.info("Creating main window")
     window = MainWindow(state_dir)
+    window_holder[0] = window
     window.show()
     logging.info("Main window ready")
     if args.smoke_test:
@@ -178,6 +285,8 @@ def main(argv: list[str] | None = None) -> int:
     try:
         return app.exec()
     finally:
+        if focus_server is not None:
+            focus_server.close()
         lock.unlock()
         _shutdown_logging()
         if temporary_state:

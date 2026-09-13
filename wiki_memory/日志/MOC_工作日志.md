@@ -15,6 +15,7 @@ supersedes: null
 
 | 时间 | 类型 | 目标 | 状态 | 主题 | 日志 |
 | --- | --- | --- | --- | --- | --- |
+| 2026-09-13 | feature | - | archived | repeated-launch-focus | [重复启动聚焦窗口](./2026-09-13-重复启动聚焦窗口.md) |
 | 2026-09-13 | maintenance | 基于提交 `64552a8` 构建最新 Windows 便携目录，并生成 ZIP 交付包。 | archived | portable-package-build | [2026-09-13｜最新便携包构建](./2026-09-13-最新便携包构建.md) |
 | 2026-09-13 | feature | 扫描回收站后默认选择全部非空项，移除回收站页的路径复制入口，并将新清理改为确认后直接删除、不创建隔离备份。 | archived | direct-trash-cleanup | [2026-09-13｜回收站直接清理](./2026-09-13-回收站直接清理.md) |
 | 2026-09-13 | maintenance | 把“每次完整对话的实质修改都提交、推送并生成最新 `ObManage.zip`”加入工程约束，并确保 ZIP 解压后直接就是程序根目录。 | archived | flat-portable-archive | [2026-09-13｜压缩包根目录结构约束](./2026-09-13-压缩包根目录结构约束.md) |
