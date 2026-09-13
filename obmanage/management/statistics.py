@@ -7,7 +7,7 @@ import stat
 import time
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import groupby
 from pathlib import Path
 from threading import Event, Lock
@@ -16,6 +16,7 @@ from ..models import Progress, SyncCancelled, SyncError
 from ..paths import assert_plain_chain, canonical, native, snapshot
 from .catalog import _marker_state, _physical_plain_directory, _same_name, _sort_key
 from .models import (
+    FileTypeStatistics,
     ManagementIssue,
     VaultCatalogResult,
     VaultInfo,
@@ -28,6 +29,60 @@ _READ_SIZE = 1024 * 1024
 _PROGRESS_INTERVAL = 0.08
 _MAX_CHARACTER_WORKERS = 4
 _RESERVED_DIRECTORY_PREFIXES = (".obmanage-deploy-",)
+_COMPOUND_EXTENSIONS = (".tar.bz2", ".tar.gz", ".tar.xz", ".tbz2", ".tgz", ".txz")
+_FILE_TYPE_DEFINITIONS = (
+    ("markdown", "Markdown", frozenset({".md"})),
+    ("canvas", "Obsidian 画布", frozenset({".canvas"})),
+    ("image", "图片", frozenset({
+        ".apng", ".avif", ".bmp", ".gif", ".heic", ".heif", ".ico",
+        ".jpeg", ".jpg", ".jxl", ".png", ".psd", ".raw", ".svg",
+        ".tif", ".tiff", ".webp",
+    })),
+    ("video", "视频", frozenset({
+        ".3gp", ".avi", ".flv", ".m2ts", ".m4v", ".mkv", ".mov",
+        ".mp4", ".mpeg", ".mpg", ".mts", ".ogv", ".webm", ".wmv",
+    })),
+    ("audio", "音频", frozenset({
+        ".aac", ".aiff", ".ape", ".flac", ".m4a", ".mid", ".midi",
+        ".mp3", ".oga", ".ogg", ".opus", ".wav", ".wma",
+    })),
+    ("pdf", "PDF", frozenset({".pdf"})),
+    ("word", "Word / 文字文档", frozenset({
+        ".doc", ".docm", ".docx", ".dot", ".dotm", ".dotx", ".odt", ".rtf",
+    })),
+    ("spreadsheet", "Excel / 表格", frozenset({
+        ".csv", ".numbers", ".ods", ".tsv", ".xls", ".xlsb", ".xlsm",
+        ".xlsx", ".xlt", ".xltm", ".xltx",
+    })),
+    ("presentation", "PowerPoint / 演示", frozenset({
+        ".key", ".odp", ".pot", ".potm", ".potx", ".pps", ".ppsm",
+        ".ppsx", ".ppt", ".pptm", ".pptx",
+    })),
+    ("ebook", "电子书", frozenset({
+        ".azw", ".azw3", ".djvu", ".epub", ".fb2", ".mobi",
+    })),
+    ("archive", "压缩包 / 镜像", frozenset({
+        ".7z", ".bz2", ".cab", ".gz", ".iso", ".rar", ".tar",
+        ".tar.bz2", ".tar.gz", ".tar.xz", ".tbz2", ".tgz", ".txz", ".xz", ".zip",
+    })),
+    ("code", "代码 / 脚本", frozenset({
+        ".bat", ".c", ".cc", ".cmd", ".cpp", ".cs", ".css", ".dart",
+        ".go", ".h", ".hpp", ".html", ".java", ".js", ".jsx", ".kt",
+        ".lua", ".php", ".ps1", ".py", ".rb", ".rs", ".scss", ".sh",
+        ".sql", ".swift", ".ts", ".tsx", ".vue",
+    })),
+    ("data", "数据 / 配置", frozenset({
+        ".cfg", ".db", ".env", ".gitattributes", ".gitignore", ".ini",
+        ".json", ".sqlite", ".sqlite3", ".toml", ".xml", ".yaml", ".yml",
+    })),
+    ("text", "其他文本", frozenset({".log", ".tex", ".text", ".txt"})),
+    ("font", "字体", frozenset({".eot", ".otf", ".ttc", ".ttf", ".woff", ".woff2"})),
+)
+_EXTENSION_CATEGORY = {
+    extension: (category, label)
+    for category, label, extensions in _FILE_TYPE_DEFINITIONS
+    for extension in extensions
+}
 
 
 @dataclass
@@ -39,6 +94,50 @@ class _MarkdownCandidate:
     expected_state: dict
     direct_children: list[tuple[str, bool, tuple | None]]
     direct_child_index: int
+
+
+@dataclass
+class _FileTypeAccumulator:
+    label: str
+    files: int = 0
+    total_bytes: int = 0
+    extensions: set[str] = field(default_factory=set)
+
+
+def _file_extension(name: str) -> str:
+    lowered = name.casefold()
+    for extension in _COMPOUND_EXTENSIONS:
+        if len(lowered) > len(extension) and lowered.endswith(extension):
+            return extension
+    suffix = Path(lowered).suffix
+    if suffix:
+        return suffix
+    if lowered.startswith(".") and lowered.count(".") == 1:
+        return lowered
+    return "无扩展名"
+
+
+def _file_category(name: str) -> tuple[str, str, str]:
+    extension = _file_extension(name)
+    category, label = _EXTENSION_CATEGORY.get(extension, ("other", "其他文件"))
+    return category, label, extension
+
+
+def _freeze_file_types(
+    accumulators: dict[str, _FileTypeAccumulator],
+) -> tuple[FileTypeStatistics, ...]:
+    return tuple(
+        FileTypeStatistics(
+            category=category,
+            label=values.label,
+            files=values.files,
+            total_bytes=values.total_bytes,
+            extensions=tuple(sorted(
+                values.extensions, key=lambda value: (value.casefold(), value)
+            )),
+        )
+        for category, values in accumulators.items()
+    )
 
 
 def _cancelled(cancel: Event | None) -> None:
@@ -133,14 +232,15 @@ def collect_vault_statistics(
     cancel: Event | None = None,
     progress: ProgressCallback | None = None,
 ) -> VaultStatisticsResult:
-    """Collect active Markdown statistics for every supplied vault.
+    """Collect read-only content and file-type statistics for supplied vaults.
 
     The root ``.obsidian`` tree is always excluded; root ``.trash`` is excluded
     unless ``include_trash`` is true.  A nested directory with its own ordinary
     ``.obsidian`` marker is a hard traversal boundary and is counted separately
     only when it is also supplied as a vault.  Set ``count_characters`` false to
-    collect metadata counts without opening and UTF-8 decoding every Markdown
-    file; each result then has ``characters_counted == False``.
+    collect all file metadata without opening and UTF-8 decoding every Markdown
+    file; each result then has ``characters_counted == False``.  Categories are
+    inferred from filename extensions; unknown types remain visible as other.
     """
     issues: list[ManagementIssue] = (
         list(vaults.issues) if isinstance(vaults, VaultCatalogResult) else []
@@ -197,10 +297,13 @@ def collect_vault_statistics(
     for vault_path in sorted(prepared.values(), key=_sort_key):
         _cancelled(cancel)
         vault_issues_start = len(issues)
+        total_files = 0
+        total_bytes = 0
         markdown_files = 0
         markdown_bytes = 0
         utf8_characters = 0
         folders = 0
+        file_type_accumulators: dict[str, _FileTypeAccumulator] = {}
         stack: list[tuple[str, bool]] = [(vault_path, True)]
         directory_guards: list[
             tuple[str, dict, list[tuple[str, bool, tuple | None]]]
@@ -278,7 +381,7 @@ def collect_vault_statistics(
                     folders += 1
                     child_dirs.append(child)
                     continue
-                if state["kind"] != "file" or Path(entry.name).suffix.casefold() != ".md":
+                if state["kind"] != "file":
                     direct_children.append((
                         entry.name, False, _state_epoch(state, content_sensitive=False)
                     ))
@@ -288,10 +391,22 @@ def collect_vault_statistics(
                 direct_children.append((entry.name, True, _state_epoch(state)))
 
                 relative = os.path.relpath(child, vault_path)
+                total_files += 1
+                total_bytes += state["size"]
+                category, category_label, extension = _file_category(entry.name)
+                type_totals = file_type_accumulators.setdefault(
+                    category, _FileTypeAccumulator(category_label)
+                )
+                type_totals.files += 1
+                type_totals.total_bytes += state["size"]
+                type_totals.extensions.add(extension)
+                if extension != ".md":
+                    report(vault_path, relative, file_delta=1)
+                    continue
                 markdown_files += 1
                 markdown_bytes += state["size"]
                 if not count_characters:
-                    report(vault_path, relative, file_delta=1, force=True)
+                    report(vault_path, relative, file_delta=1)
                     continue
                 markdown_candidates.append(_MarkdownCandidate(
                     path=child,
@@ -443,12 +558,16 @@ def collect_vault_statistics(
                     directory, "目录在统计期间的项目或身份已变化，统计结果不完整。"
                 )
 
+        report(vault_path, "", force=True)
         results.append(VaultStatistics(
             vault_path=vault_path,
+            total_files=total_files,
+            total_bytes=total_bytes,
             markdown_files=markdown_files,
             utf8_characters=utf8_characters,
             markdown_bytes=markdown_bytes,
             folders=folders,
+            file_types=_freeze_file_types(file_type_accumulators),
             characters_counted=count_characters,
             complete=len(issues) == vault_issues_start,
         ))

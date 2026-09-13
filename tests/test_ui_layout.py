@@ -11,6 +11,11 @@ from PySide6.QtCore import QCoreApplication, QEvent, QPoint, QRect, Qt
 from PySide6.QtWidgets import QApplication, QMenu
 
 from obmanage.models import PlanItem, SyncPlan
+from obmanage.management.models import (
+    FileTypeStatistics,
+    VaultStatistics,
+    VaultStatisticsResult,
+)
 from obmanage.ui import FILTERS, MainWindow
 
 
@@ -241,6 +246,55 @@ def test_every_management_page_fits_width_and_bottom_actions_are_reachable(
         if size == (980, 620):
             for key in ("template_suite", "obsidian_config", "templater"):
                 assert window.page_containers[key].verticalScrollBar().maximum() > 0
+    finally:
+        assert not window.busy
+        window._timer.stop()
+        window._save_timer.stop()
+        window.tray.hide()
+        window.hide()
+        window.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
+@pytest.mark.parametrize("size", [(980, 620), (1140, 920), (2560, 1440)])
+def test_rich_statistics_tables_fit_without_horizontal_scrolling(application, tmp_path, size):
+    window = MainWindow(tmp_path / f"statistics-state-{size[0]}-{size[1]}")
+    page = window.pages["statistics"]
+    file_types = (
+        FileTypeStatistics("video", "视频", 18, 8_600_000_000, (".mkv", ".mp4", ".webm")),
+        FileTypeStatistics("image", "图片", 438, 1_280_000_000, (".jpg", ".png", ".webp")),
+        FileTypeStatistics("pdf", "PDF", 36, 920_000_000, (".pdf",)),
+        FileTypeStatistics("word", "Word / 文字文档", 22, 146_000_000, (".docx", ".odt")),
+        FileTypeStatistics("markdown", "Markdown", 1_832, 48_000_000, (".md",)),
+    )
+    result = VaultStatisticsResult((VaultStatistics(
+        vault_path=r"D:\Obsidian\很长的仓库名称用于验证完整路径仍可悬停访问",
+        total_files=2_346,
+        total_bytes=10_994_000_000,
+        markdown_files=1_832,
+        utf8_characters=4_280_000,
+        markdown_bytes=48_000_000,
+        folders=312,
+        file_types=file_types,
+    ),))
+    window.resize(*size)
+    window._show_page("statistics", persist=False)
+    page.task_finished("ok", result)
+    window.show()
+    try:
+        settle(application)
+        scroll = window.page_containers["statistics"]
+        assert scroll.horizontalScrollBar().maximum() == 0
+        for table in (page.table, page.type_table):
+            header = table.horizontalHeader()
+            available = table.viewport().width()
+            assert abs(header.length() - available) <= 1
+            assert table.horizontalScrollBar().maximum() == 0
+            assert not table.horizontalScrollBar().isVisible()
+        page.table.selectRow(0)
+        settle(application)
+        assert "当前仓库" in page.type_scope_label.text()
+        assert page.type_scope_label.toolTip().endswith("完整路径仍可悬停访问")
     finally:
         assert not window.busy
         window._timer.stop()

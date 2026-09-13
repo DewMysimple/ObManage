@@ -43,13 +43,25 @@ class VaultCatalogResult:
 
 
 @dataclass(frozen=True, slots=True)
-class VaultStatistics:
-    """Counts for the active content of one vault.
+class FileTypeStatistics:
+    """Extension-based totals for one human-readable file category."""
 
-    ``folders`` excludes the vault root and every excluded subtree.  Markdown
-    byte/file counts describe all safely observed regular ``.md`` files;
-    ``utf8_characters`` only includes files decoded completely as strict UTF-8.
-    ``complete`` is false whenever part of the active tree could not be read.
+    category: str
+    label: str
+    files: int = 0
+    total_bytes: int = 0
+    extensions: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class VaultStatistics:
+    """Counts and logical sizes for the active content of one vault.
+
+    ``folders`` excludes the vault root and every excluded subtree.  File and
+    byte totals include every safely observed regular file.  Markdown byte/file
+    counts are retained as a focused subset; ``utf8_characters`` only includes
+    files decoded completely as strict UTF-8.  ``complete`` is false whenever
+    part of the active tree could not be read or changed during the scan.
     """
 
     vault_path: str
@@ -59,6 +71,13 @@ class VaultStatistics:
     folders: int = 0
     characters_counted: bool = True
     complete: bool = True
+    total_files: int = 0
+    total_bytes: int = 0
+    file_types: tuple[FileTypeStatistics, ...] = ()
+
+    @property
+    def non_markdown_files(self) -> int:
+        return max(0, self.total_files - self.markdown_files)
 
 
 @dataclass(frozen=True, slots=True)
@@ -69,3 +88,22 @@ class VaultStatisticsResult:
     @property
     def by_path(self) -> dict[str, VaultStatistics]:
         return {item.vault_path: item for item in self.statistics}
+
+    @property
+    def file_types(self) -> tuple[FileTypeStatistics, ...]:
+        """Aggregate category totals across every returned vault."""
+        totals: dict[str, FileTypeStatistics] = {}
+        for vault in self.statistics:
+            for item in vault.file_types:
+                current = totals.get(item.category)
+                totals[item.category] = FileTypeStatistics(
+                    category=item.category,
+                    label=item.label,
+                    files=item.files + (current.files if current else 0),
+                    total_bytes=item.total_bytes + (current.total_bytes if current else 0),
+                    extensions=tuple(sorted(
+                        set(item.extensions) | (set(current.extensions) if current else set()),
+                        key=lambda value: (value.casefold(), value),
+                    )),
+                )
+        return tuple(totals.values())

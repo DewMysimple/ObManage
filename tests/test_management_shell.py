@@ -134,6 +134,12 @@ def test_statistics_page_runs_read_only_service_and_reports_totals(application, 
     (vault / ".obsidian").mkdir(parents=True)
     note = vault / "第一课.md"
     note.write_text("你好\nObManage", encoding="utf-8")
+    video = vault / "演示.mp4"
+    video.write_bytes(b"video-data")
+    reference_vault = root / "参考资料"
+    (reference_vault / ".obsidian").mkdir(parents=True)
+    reference = reference_vault / "规范.pdf"
+    reference.write_bytes(b"pdf-data")
     before = {
         str(path.relative_to(root)): (path.is_dir(), path.read_bytes() if path.is_file() else b"")
         for path in root.rglob("*")
@@ -148,12 +154,33 @@ def test_statistics_page_runs_read_only_service_and_reports_totals(application, 
         page._start_scan()
         wait_until(application, lambda: not window.busy)
 
-        assert page.model.rowCount() == 1
-        assert page.summary_values["vaults"].text() == "1"
+        assert page.model.rowCount() == 2
+        assert page.summary_values["vaults"].text() == "2"
+        assert page.summary_values["files"].text() == "3"
+        assert page.summary_values["size"].text() == (
+            f"{note.stat().st_size + video.stat().st_size + reference.stat().st_size} B"
+        )
         assert page.summary_values["notes"].text() == "1"
         assert page.summary_values["characters"].text() == str(
             len(note.read_bytes().decode("utf-8"))
         )
+        type_rows = {item.label: item for item in page.type_model.rows}
+        assert set(type_rows) == {"Markdown", "视频", "PDF"}
+        assert type_rows["视频"].files == 1
+        assert type_rows["视频"].total_bytes == video.stat().st_size
+        source_row = next(
+            index for index, item in enumerate(page.model.rows)
+            if item.vault_path == str(vault)
+        )
+        proxy_index = page.proxy.mapFromSource(page.model.index(source_row, 0))
+        page.table.selectRow(proxy_index.row())
+        application.processEvents()
+        assert "课程笔记" in page.type_scope_label.text()
+        assert {item.label for item in page.type_model.rows} == {"Markdown", "视频"}
+        page.show_all_types_button.click()
+        application.processEvents()
+        assert page.type_scope_label.text() == "全部仓库"
+        assert set(item.label for item in page.type_model.rows) == {"Markdown", "视频", "PDF"}
         assert "统计完成" in page.status_label.text()
         after = {
             str(path.relative_to(root)): (path.is_dir(), path.read_bytes() if path.is_file() else b"")

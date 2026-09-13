@@ -62,15 +62,74 @@ def test_statistics_count_active_markdown_and_exclude_internal_trees(tmp_path):
     assert parent_stats.markdown_bytes == sum(len(text.encode("utf-8")) for text in (
         root_text, upper_text, nested_trash_text
     ))
+    assert parent_stats.total_files == 4  # Three Markdown files and ignored.txt.
+    assert parent_stats.total_bytes == parent_stats.markdown_bytes + len(b"ignore")
     assert parent_stats.folders == 2  # notes and notes/.trash
     assert parent_stats.complete
     child_stats = stats[canonical(child)]
     assert child_stats.markdown_files == 1
     assert child_stats.utf8_characters == len(child_text)
     assert child_stats.markdown_bytes == len(child_text.encode("utf-8"))
+    assert child_stats.total_files == 1
+    assert child_stats.total_bytes == child_stats.markdown_bytes
     assert child_stats.folders == 0
     assert child_stats.complete
     assert result.issues == ()
+    aggregate_types = {item.category: item for item in result.file_types}
+    assert aggregate_types["markdown"].files == 4
+    assert aggregate_types["text"].files == 1
+    assert tree_contents(tmp_path) == before
+
+
+def test_statistics_counts_every_regular_file_and_groups_common_formats(tmp_path):
+    vault = make_vault(tmp_path / "vault")
+    samples = {
+        "note.md": b"m",
+        "board.canvas": b"cc",
+        "photo.JPG": b"iii",
+        "clip.MP4": b"vvvv",
+        "sound.flac": b"aaaaa",
+        "handbook.pdf": b"pppppp",
+        "report.docx": b"wwwwwww",
+        "sheet.xlsx": b"eeeeeeee",
+        "slides.pptx": b"sssssssss",
+        "novel.epub": b"bbbbbbbbbb",
+        "bundle.tar.gz": b"zzzzzzzzzzz",
+        "helper.py": b"cccccccccccc",
+        "metadata.json": b"ddddddddddddd",
+        "readme.txt": b"tttttttttttttt",
+        "font.woff2": b"fffffffffffffff",
+        "opaque.bin": b"oooooooooooooooo",
+    }
+    for name, content in samples.items():
+        (vault / name).write_bytes(content)
+    (vault / ".obsidian" / "private.mp4").write_bytes(b"excluded")
+    before = tree_contents(tmp_path)
+
+    result = collect_vault_statistics(vault, count_characters=False)
+
+    stats = result.statistics[0]
+    assert stats.total_files == len(samples)
+    assert stats.total_bytes == sum(map(len, samples.values()))
+    assert stats.non_markdown_files == len(samples) - 1
+    assert stats.markdown_files == 1
+    categories = {item.category: item for item in stats.file_types}
+    assert set(categories) == {
+        "markdown", "canvas", "image", "video", "audio", "pdf", "word",
+        "spreadsheet", "presentation", "ebook", "archive", "code", "data",
+        "text", "font", "other",
+    }
+    assert categories["video"].label == "视频"
+    assert categories["video"].extensions == (".mp4",)
+    assert categories["pdf"].label == "PDF"
+    assert categories["word"].extensions == (".docx",)
+    assert categories["archive"].extensions == (".tar.gz",)
+    assert categories["other"].extensions == (".bin",)
+    assert sum(item.files for item in stats.file_types) == stats.total_files
+    assert sum(item.total_bytes for item in stats.file_types) == stats.total_bytes
+    assert result.file_types == stats.file_types
+    assert result.issues == ()
+    assert stats.complete
     assert tree_contents(tmp_path) == before
 
 
@@ -271,6 +330,34 @@ def test_same_size_same_mtime_markdown_change_is_not_reported_complete(tmp_path,
     assert stats.utf8_characters == 0
     assert not stats.complete
     assert any(issue.code == "markdown_unreadable" for issue in result.issues)
+
+
+def test_non_markdown_size_change_is_not_reported_as_complete(tmp_path, monkeypatch):
+    vault = make_vault(tmp_path / "vault")
+    video = vault / "clip.mp4"
+    video.write_bytes(b"old")
+    real_snapshot = statistics_module.snapshot
+    observed = 0
+
+    def changing_snapshot(path):
+        nonlocal observed
+        state = real_snapshot(path)
+        if canonical(path) == canonical(video):
+            observed += 1
+            if observed == 1:
+                video.write_bytes(b"new-and-larger")
+        return state
+
+    monkeypatch.setattr(statistics_module, "snapshot", changing_snapshot)
+
+    result = collect_vault_statistics(vault, count_characters=False)
+
+    stats = result.statistics[0]
+    assert observed >= 2
+    assert stats.total_files == 1
+    assert stats.total_bytes == len(b"old")
+    assert not stats.complete
+    assert any(issue.code == "directory_changed" for issue in result.issues)
 
 
 def test_late_directory_entry_marks_statistics_incomplete(tmp_path, monkeypatch):
