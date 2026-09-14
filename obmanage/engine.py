@@ -7,6 +7,7 @@ have succeeded and the complete source has been scanned again.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import shutil
 import sqlite3
@@ -18,6 +19,7 @@ from concurrent.futures import FIRST_EXCEPTION, Future, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Callable
 
+from .file_types import is_video_filename
 from .models import PlanItem, Progress, SyncCancelled, SyncError, SyncPlan, SyncResult
 from .paths import (assert_plain_chain, canonical, checked_child, identity, native,
                     revalidate_roots, snapshot, validate_roots,
@@ -37,6 +39,9 @@ _WINDOWS_REPLACE_READONLY_ERRORS = frozenset(
 )
 _RESERVED_DIRECTORY_PREFIXES = (".obmanage-deploy-",)
 _ENGINE_TASK_LOCK = threading.Lock()
+SYNC_MODE_MIRROR = "mirror"
+SYNC_MODE_NO_VIDEO = "no_video"
+_SYNC_MODES = frozenset((SYNC_MODE_MIRROR, SYNC_MODE_NO_VIDEO))
 
 
 def _cancelled(cancel: threading.Event | None) -> None:
@@ -53,13 +58,17 @@ def _key(relative: str) -> str:
     return os.path.normcase(relative)
 
 
-def _scan(root: str, cancel: threading.Event | None, progress: ProgressCallback) -> dict[str, dict]:
+def _scan(root: str, cancel: threading.Event | None, progress: ProgressCallback, *,
+          mode: str = SYNC_MODE_MIRROR) -> tuple[dict[str, dict], dict[str, dict]]:
+    if mode not in _SYNC_MODES:
+        raise SyncError("同步模式无效。")
     _cancelled(cancel)
     root_state = snapshot(root)
     if root_state is None:
-        return {}
+        return {}, {}
     assert_plain_chain(root)
     entries: dict[str, dict] = {}
+    excluded: dict[str, dict] = {}
     seen: set[str] = set()
     stack = [(root, "")]
     while stack:
@@ -88,6 +97,10 @@ def _scan(root: str, cancel: threading.Event | None, progress: ProgressCallback)
                     if _key(relative) in seen:
                         raise SyncError(f"存在 Windows 无法区分的大小写重名路径：{relative}")
                     seen.add(_key(relative))
+                    if (mode == SYNC_MODE_NO_VIDEO and state["kind"] == "file"
+                            and is_video_filename(entry.name)):
+                        excluded[relative] = state
+                        continue
                     entries[relative] = state
                     if state["kind"] == "dir":
                         stack.append((canonical(entry.path), relative + "/"))
@@ -97,7 +110,50 @@ def _scan(root: str, cancel: threading.Event | None, progress: ProgressCallback)
         except OSError as exc:
             raise SyncError(f"无法完整扫描目录 {folder}：{exc}") from exc
     _emit(progress, "scan", message=f"扫描完成：{len(entries):,} 个项目", completed_files=len(entries))
-    return entries
+    return entries, excluded
+
+
+def _profile_pair_id(pair_id: str, mode: str) -> str:
+    """Keep filtered and complete mirror equality claims in separate namespaces."""
+    if mode == SYNC_MODE_MIRROR:
+        return pair_id
+    return hashlib.sha256(json.dumps(
+        ["obmanage-sync-profile-v1", mode, pair_id],
+        ensure_ascii=False,
+    ).encode("utf-8")).hexdigest()
+
+
+def _protected_directory_keys(excluded: dict[str, dict]) -> set[str]:
+    """Return every directory that must remain because it contains ignored files."""
+    protected: set[str] = set()
+    for relative in excluded:
+        parts = relative.replace("\\", "/").split("/")[:-1]
+        for index in range(1, len(parts) + 1):
+            protected.add(_key("/".join(parts[:index])))
+    return protected
+
+
+def _excluded_plan_items(source: dict[str, dict], target: dict[str, dict]) -> list[PlanItem]:
+    source_names = {_key(path): path for path in source}
+    target_names = {_key(path): path for path in target}
+    items: list[PlanItem] = []
+    for key in sorted(source_names.keys() | target_names.keys()):
+        source_name = source_names.get(key)
+        target_name = target_names.get(key)
+        relative = source_name or target_name
+        assert relative is not None
+        if source_name is not None and target_name is not None:
+            reason = "视频已排除；两端现有文件均保持原样，不比较内容"
+            size = source[source_name]["size"]
+        elif source_name is not None:
+            reason = "来源视频已排除，不会复制到目标"
+            size = source[source_name]["size"]
+        else:
+            assert target_name is not None
+            reason = "目标视频已排除，将原样保留，不会删除"
+            size = target[target_name]["size"]
+        items.append(PlanItem("exclude", relative, size, reason))
+    return items
 
 
 def _require_state(path: str, expected: dict | None, message: str) -> None:
@@ -337,25 +393,47 @@ class SyncEngine:
         )
 
     def analyze(self, source: str, target: str, *, deep: bool = False,
+                mode: str = SYNC_MODE_MIRROR,
                 cancel: threading.Event | None = None, progress: ProgressCallback = None) -> SyncPlan:
         if not self._lock.acquire(blocking=False):
             raise SyncError("已有同步任务运行中。")
-        plan = SyncPlan(source=str(source), target=str(target))
+        plan = SyncPlan(source=str(source), target=str(target), mode=mode)
         store: BaselineStore | None = None
         hash_pool: ThreadPoolExecutor | None = None
         try:
             _cancelled(cancel)
             context = validate_roots(str(source), str(target))
+            if mode not in _SYNC_MODES:
+                raise SyncError("同步模式无效。")
+            context["base_pair_id"] = context["pair_id"]
+            context["base_reverse_pair_id"] = context["reverse_pair_id"]
+            context["pair_id"] = _profile_pair_id(context["pair_id"], mode)
+            context["reverse_pair_id"] = _profile_pair_id(
+                context["reverse_pair_id"], mode
+            )
+            context["mode"] = mode
             self._check_state_location(context["source"], context["target"])
             plan.source, plan.target = context["source"], context["target"]
             plan.pair_id = context["pair_id"]
             plan.context = context
-            source_entries = _scan(plan.source, cancel, progress)
-            target_entries = _scan(plan.target, cancel, progress)
+            source_entries, source_excluded = _scan(
+                plan.source, cancel, progress, mode=mode
+            )
+            target_entries, target_excluded = _scan(
+                plan.target, cancel, progress, mode=mode
+            )
             context["source_entries"] = source_entries
             context["target_entries"] = target_entries
             context["target_names"] = {_key(path): path for path in target_entries}
             plan.source_empty = not source_entries
+            plan.excluded_source_files = len(source_excluded)
+            plan.excluded_source_bytes = sum(
+                state["size"] for state in source_excluded.values()
+            )
+            plan.excluded_target_files = len(target_excluded)
+            plan.excluded_target_bytes = sum(
+                state["size"] for state in target_excluded.values()
+            )
             store = BaselineStore(self.state_dir)
             baselines = store.records(plan.pair_id)
             # Equality of two verified file versions is symmetric. Keep each
@@ -407,13 +485,22 @@ class SyncEngine:
                 # portable disk without making either disk seek across files.
                 hash_pool = ThreadPoolExecutor(max_workers=2, thread_name_prefix="obmanage-hash")
             source_names = {_key(path) for path in source_entries}
-            total = len(source_entries) + sum(_key(path) not in source_names for path in target_entries)
+            excluded_items = _excluded_plan_items(source_excluded, target_excluded)
+            protected_target_directories = _protected_directory_keys(target_excluded)
+            context["protected_target_directories"] = protected_target_directories
+            total = (
+                len(source_entries)
+                + sum(_key(path) not in source_names for path in target_entries)
+                + len(excluded_items)
+            )
             for relative, src in sorted(source_entries.items()):
                 _cancelled(cancel)
                 target_name = context["target_names"].get(_key(relative), relative)
                 dst = target_entries.get(target_name)
                 if (dst is not None and src["kind"] == dst["kind"] and os.name == "nt"
-                        and relative.rsplit("/", 1)[-1] != target_name.rsplit("/", 1)[-1]):
+                        and relative.rsplit("/", 1)[-1] != target_name.rsplit("/", 1)[-1]
+                        and not (src["kind"] == "dir"
+                                 and _key(relative) in protected_target_directories)):
                     plan.items.append(PlanItem("rename", relative, reason="统一文件名大小写，无需复制内容"))
                 if dst is not None and src["kind"] != dst["kind"]:
                     item = PlanItem("error", relative, reason="源与目标存在文件/文件夹同名冲突")
@@ -467,15 +554,20 @@ class SyncEngine:
             for relative, dst in sorted(target_entries.items()):
                 _cancelled(cancel)
                 if _key(relative) not in source_names:
+                    if (dst["kind"] == "dir"
+                            and _key(relative) in protected_target_directories):
+                        continue
                     plan.items.append(PlanItem("rmdir" if dst["kind"] == "dir" else "delete",
                                                relative, dst["size"], "源端已不存在"))
                     _emit(progress, "compare", relative_path=relative,
                           message="目标多余项目", completed_files=len(plan.items), total_files=total)
+            plan.items.extend(excluded_items)
             _cancelled(cancel)
             revalidate_roots(context)
             # A manifest scan is metadata-only, including for large unchanged
             # videos. It makes a preview generated during a write fail closed.
-            if _scan(plan.source, cancel, None) != source_entries or _scan(plan.target, cancel, None) != target_entries:
+            if (_scan(plan.source, cancel, None, mode=mode)[0] != source_entries
+                    or _scan(plan.target, cancel, None, mode=mode)[0] != target_entries):
                 raise SyncError("分析期间目录内容发生变化，请重新分析差异。")
             context["validated"] = True
             _emit(progress, "done", message="差异分析完成", completed_files=total, total_files=total)
@@ -606,7 +698,9 @@ class SyncEngine:
 
     def _verify_target(self, plan: SyncPlan, expected: dict[str, dict],
                        cancel: threading.Event | None) -> None:
-        scanned = _scan(plan.target, cancel, None)
+        scanned, _excluded = _scan(
+            plan.target, cancel, None, mode=plan.context["mode"]
+        )
         actual = {_key(path): state for path, state in scanned.items()}
         actual_names = {_key(path): path for path in scanned}
         if actual.keys() != expected.keys():
@@ -617,7 +711,14 @@ class SyncEngine:
             if not matches:
                 raise SyncError(f"目标项目在同步期间发生变化，请重新分析差异：{relative}")
         for source_name in plan.context["source_entries"]:
-            if actual_names.get(_key(source_name)) != source_name:
+            key = _key(source_name)
+            protected = plan.context.get("protected_target_directories", set())
+            inside_protected = any(
+                key == directory
+                or key.startswith(directory.rstrip("/\\") + os.sep)
+                for directory in protected
+            )
+            if actual_names.get(key) != source_name and not inside_protected:
                 raise SyncError(f"目标文件名的大小写与源端不同，请重新分析差异：{source_name}")
 
     def _rename(self, plan: SyncPlan, item: PlanItem, expected: dict[str, dict],
@@ -697,13 +798,16 @@ class SyncEngine:
             if not plan.can_execute or not plan.context.get("validated"):
                 raise SyncError("当前预览存在错误或不完整，请重新分析差异。")
             context = plan.context
-            if (plan.source, plan.target, plan.pair_id) != (context["source"], context["target"], context["pair_id"]):
+            if ((plan.source, plan.target, plan.pair_id, plan.mode)
+                    != (context["source"], context["target"], context["pair_id"], context["mode"])):
                 raise SyncError("预览路径已改变，请重新分析差异。")
             self._check_state_location(plan.source, plan.target)
             revalidate_roots(context)
-            if _scan(plan.source, cancel, progress) != context["source_entries"]:
+            if (_scan(plan.source, cancel, progress, mode=plan.mode)[0]
+                    != context["source_entries"]):
                 raise SyncError("源目录在预览后发生变化，请重新分析差异。")
-            if _scan(plan.target, cancel, progress) != context["target_entries"]:
+            if (_scan(plan.target, cancel, progress, mode=plan.mode)[0]
+                    != context["target_entries"]):
                 raise SyncError("目标目录在预览后发生变化，请重新分析差异。")
             deletions = [item for item in plan.items if item.action in ("delete", "rmdir")]
             if plan.source_empty and deletions and not allow_empty:
@@ -743,7 +847,8 @@ class SyncEngine:
             # No deletion at all unless all writes succeeded and the entire
             # source is still exactly the snapshot that was previewed.
             revalidate_roots(context, target_root=target_root)
-            if _scan(plan.source, cancel, progress) != context["source_entries"]:
+            if (_scan(plan.source, cancel, progress, mode=plan.mode)[0]
+                    != context["source_entries"]):
                 raise SyncError("源目录在同步期间发生变化，已停止删除；请重新分析差异。")
             self._verify_target(plan, expected_targets, cancel)
             # A case-only rename retains content identity. Update its own and
@@ -791,7 +896,8 @@ class SyncEngine:
                       completed_files=result.deleted_files + result.deleted_dirs, total_files=len(deletions))
             _cancelled(cancel)
             revalidate_roots(context, target_root=target_root)
-            if _scan(plan.source, cancel, None) != context["source_entries"]:
+            if (_scan(plan.source, cancel, None, mode=plan.mode)[0]
+                    != context["source_entries"]):
                 raise SyncError("同步结束时源目录发生变化，本次仅部分完成，请重新分析差异。")
             self._verify_target(plan, expected_targets, cancel)
             result.status = "success"
@@ -810,3 +916,6 @@ class SyncEngine:
             result.duration_seconds = time.monotonic() - started
             self._lock.release()
         return result
+
+
+__all__ = ["SYNC_MODE_MIRROR", "SYNC_MODE_NO_VIDEO", "SyncEngine"]

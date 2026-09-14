@@ -14,6 +14,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
 from PySide6.QtWidgets import QApplication
 
+from obmanage.engine import SYNC_MODE_NO_VIDEO
 from obmanage.models import PlanItem, SyncPlan
 from obmanage.pages.registry import FEATURES
 from obmanage.settings import AppSettings, SettingsStore
@@ -59,6 +60,32 @@ def main() -> None:
         ]
         if args.page == "mirror":
             window._accept_plan(SyncPlan(settings.source, settings.target, items), scheduled=False)
+        elif args.page == "vault_backup":
+            page = window.pages["vault_backup"]
+            page.local_picker.set_value(r"C:\Obsidian\ObsidianTest")
+            page.portable_picker.set_value(r"H:\ObsidianVault\完整仓库")
+            page.set_direction("to_local")
+            source, target = page._paths()
+            backup_items = [
+                item for item in items if not item.relative_path.casefold().endswith(".mp4")
+            ]
+            backup_items.extend((
+                PlanItem("exclude", "视频/旅行记录.mp4", 2_800_000_000,
+                         "视频已排除；两端现有文件均保持原样，不比较内容"),
+                PlanItem("exclude", "视频/课程录像.mkv", 4_600_000_000,
+                         "来源视频已排除，不会复制到目标"),
+            ))
+            page._accept_plan(SyncPlan(
+                source,
+                target,
+                backup_items,
+                mode=SYNC_MODE_NO_VIDEO,
+                excluded_source_files=2,
+                excluded_source_bytes=7_400_000_000,
+                excluded_target_files=1,
+                excluded_target_bytes=2_800_000_000,
+            ))
+            window._show_page(args.page, persist=False)
         else:
             window._show_page(args.page, persist=False)
         # Only presentation is exercised: no analyze/execute worker is started.
@@ -76,7 +103,13 @@ def main() -> None:
         assert not window.busy and not window.confirm_direction_checkbox.isChecked()
         args.output.parent.mkdir(parents=True, exist_ok=True)
         assert window.grab().save(str(args.output)), "Could not save demo screenshot"
-        table = window.table if args.page == "mirror" else None
+        table = (
+            window.table
+            if args.page == "mirror"
+            else window.pages["vault_backup"].table
+            if args.page == "vault_backup"
+            else None
+        )
         details = (
             f" viewport={table.viewport().width()} columns={table.horizontalHeader().length()} "
             f"horizontal_scroll={table.horizontalScrollBar().maximum()}"

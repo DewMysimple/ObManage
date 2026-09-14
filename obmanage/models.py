@@ -32,10 +32,15 @@ class SyncPlan:
     pair_id: str = ""
     created_at: float = field(default_factory=time.time)
     context: dict[str, Any] = field(default_factory=dict, repr=False)
+    mode: str = "mirror"
+    excluded_source_files: int = 0
+    excluded_source_bytes: int = 0
+    excluded_target_files: int = 0
+    excluded_target_bytes: int = 0
 
     @property
     def counts(self) -> dict[str, int]:
-        counts = dict.fromkeys(("add", "update", "rename", "delete", "skip", "mkdir", "rmdir", "error"), 0)
+        counts = dict.fromkeys(("add", "update", "rename", "delete", "skip", "exclude", "mkdir", "rmdir", "error"), 0)
         counts.update(Counter(item.action for item in self.items))
         return counts
 
@@ -45,7 +50,7 @@ class SyncPlan:
 
     @property
     def has_changes(self) -> bool:
-        return any(item.action not in ("skip", "error") for item in self.items)
+        return any(item.action not in ("skip", "exclude", "error") for item in self.items)
 
     @property
     def can_execute(self) -> bool:

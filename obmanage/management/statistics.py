@@ -12,6 +12,7 @@ from itertools import groupby
 from pathlib import Path
 from threading import Event, Lock
 
+from ..file_types import VIDEO_EXTENSIONS
 from ..models import Progress, SyncCancelled, SyncError
 from ..paths import assert_plain_chain, canonical, native, snapshot
 from .catalog import _marker_state, _physical_plain_directory, _same_name, _sort_key
@@ -39,8 +40,7 @@ _FILE_TYPE_DEFINITIONS = (
         ".tif", ".tiff", ".webp",
     })),
     ("video", "视频", frozenset({
-        ".3gp", ".avi", ".flv", ".m2ts", ".m4v", ".mkv", ".mov",
-        ".mp4", ".mpeg", ".mpg", ".mts", ".ogv", ".webm", ".wmv",
+        *VIDEO_EXTENSIONS,
     })),
     ("audio", "音频", frozenset({
         ".aac", ".aiff", ".ape", ".flac", ".m4a", ".mid", ".midi",

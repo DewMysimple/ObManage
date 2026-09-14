@@ -61,6 +61,7 @@ from .paths import validate_state_separation
 from .scheduler import Scheduler
 from .settings import SettingsStore
 from .tasking import FeatureWorker
+from .pages.backup import VaultBackupPage
 from .pages.common import FeaturePage
 from .pages.distribution import ObsidianConfigPage, TemplateSuitePage, TemplaterPage
 from .pages.registry import FEATURES
@@ -915,7 +916,14 @@ class MainWindow(QMainWindow):
             "templater": TemplaterPage,
         }
         for feature in FEATURES[1:]:
-            if feature.key == "statistics":
+            if feature.key == "vault_backup":
+                page = VaultBackupPage(
+                    self.state_dir,
+                    self.settings_document.features.get(feature.key, {}),
+                    str(Path.home() / "Desktop" / "ObsidianTest"),
+                    self.settings.portable_path,
+                )
+            elif feature.key == "statistics":
                 page = StatisticsPage(
                     self.settings_document.features.get(feature.key, {}),
                     self.settings.local_path,

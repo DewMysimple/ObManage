@@ -20,6 +20,7 @@ from obmanage.management.deployment import (
 )
 from obmanage.management.trash import TrashCleanupEngine
 from obmanage.models import PlanItem, SyncCancelled, SyncPlan
+from obmanage.pages.backup import VaultBackupPage
 from obmanage.pages.distribution import ObsidianConfigPage, TemplateSuitePage, TemplaterPage
 from obmanage.pages.registry import FEATURES
 from obmanage.pages.statistics import StatisticsPage
@@ -57,7 +58,7 @@ def dispose(app, window):
     QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
 
 
-def test_shell_registers_six_pages_with_mirror_first(application, tmp_path):
+def test_shell_registers_seven_pages_with_mirror_first(application, tmp_path):
     window = MainWindow(tmp_path / "state")
     try:
         assert tuple(window.pages) == tuple(feature.key for feature in FEATURES)
@@ -65,6 +66,7 @@ def test_shell_registers_six_pages_with_mirror_first(application, tmp_path):
         assert window.page_stack.currentWidget() is window.mirror_page
         assert window.navigation_buttons["mirror"].isChecked()
         assert "仓库镜像" in window.windowTitle()
+        assert isinstance(window.pages["vault_backup"], VaultBackupPage)
         assert isinstance(window.pages["statistics"], StatisticsPage)
         assert isinstance(window.pages["template_suite"], TemplateSuitePage)
         assert isinstance(window.pages["obsidian_config"], ObsidianConfigPage)
@@ -224,7 +226,7 @@ def test_direct_trash_cleanup_creates_no_recovery_gate(application, tmp_path):
         assert window.nav_recovery_button.isHidden()
         assert window.sync_button.isEnabled()
         assert not window.pages["trash_cleanup"].has_pending_recovery()
-        for key in ("template_suite", "obsidian_config", "templater"):
+        for key in ("vault_backup", "template_suite", "obsidian_config", "templater"):
             assert not window.pages[key]._external_recovery_pending
     finally:
         dispose(application, window)
@@ -259,6 +261,7 @@ def test_legacy_trash_quarantine_still_blocks_writes_until_finalized(
         assert not window.nav_recovery_button.isHidden()
         assert not window.sync_button.isEnabled()
         assert window.pages["trash_cleanup"].has_pending_recovery()
+        assert window.pages["vault_backup"]._external_recovery_pending
         for key in ("template_suite", "obsidian_config", "templater"):
             assert window.pages[key]._external_recovery_pending
         window._execute_plan()
@@ -331,6 +334,7 @@ def test_unknown_legacy_deployment_is_globally_blocked_and_reachable(
         assert not window.nav_recovery_button.isHidden()
         assert window.pages["obsidian_config"].has_pending_recovery()
         assert window.pages["template_suite"]._external_recovery_pending
+        assert window.pages["vault_backup"]._external_recovery_pending
         assert window.pages["trash_cleanup"]._external_recovery_pending
 
         window.nav_recovery_button.click()

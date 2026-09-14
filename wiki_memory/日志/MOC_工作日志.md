@@ -3,7 +3,7 @@ type: moc
 status: active
 kind: process
 importance: high
-updated: 2026-09-13
+updated: 2026-09-14
 topic: work-log-index
 source_logs: []
 supersedes: null
@@ -15,6 +15,7 @@ supersedes: null
 
 | 时间 | 类型 | 目标 | 状态 | 主题 | 日志 |
 | --- | --- | --- | --- | --- | --- |
+| 2026-09-14 | feature | - | draft | no-video-vault-backup-feature | [排除视频的仓库备份](./2026-09-14-排除视频的仓库备份.md) |
 | 2026-09-13 | feature | - | archived | repeated-launch-focus | [重复启动聚焦窗口](./2026-09-13-重复启动聚焦窗口.md) |
 | 2026-09-13 | maintenance | 基于提交 `64552a8` 构建最新 Windows 便携目录，并生成 ZIP 交付包。 | archived | portable-package-build | [2026-09-13｜最新便携包构建](./2026-09-13-最新便携包构建.md) |
 | 2026-09-13 | feature | - | archived | newest-first-log-and-parallel-statistics | [操作日志倒序与统计提速](./2026-09-13-操作日志倒序与统计提速.md) |
