@@ -15,15 +15,16 @@ import stat
 import tempfile
 import threading
 import time
-from concurrent.futures import FIRST_EXCEPTION, Future, ThreadPoolExecutor, wait
+from concurrent.futures import FIRST_EXCEPTION, Future, ThreadPoolExecutor, TimeoutError, wait
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
 from .copying import COPY_BUFFER_SIZE, copy_stream_and_hash
 from .file_types import is_video_filename
 from .models import PlanItem, Progress, SyncCancelled, SyncError, SyncPlan, SyncResult
-from .paths import (assert_plain_chain, canonical, checked_child, identity, native,
-                    revalidate_roots, snapshot, validate_roots,
+from .paths import (assert_plain_chain, canonical, checked_child, checked_child_snapshot,
+                    identity, native, revalidate_roots, snapshot, validate_roots,
                     validate_state_separation)
 from .store import BaselineStore
 
@@ -43,6 +44,27 @@ _ENGINE_TASK_LOCK = threading.Lock()
 SYNC_MODE_MIRROR = "mirror"
 SYNC_MODE_NO_VIDEO = "no_video"
 _SYNC_MODES = frozenset((SYNC_MODE_MIRROR, SYNC_MODE_NO_VIDEO))
+
+
+@dataclass
+class _PendingCopy:
+    """One registered target temp whose source write may run in the pipeline."""
+
+    item: PlanItem
+    expected: dict
+    target_expected: dict | None
+    source_root: str
+    source_path: str
+    target_path: str
+    temp_path: str
+    temp_identity: tuple | None
+    temp_fd: int | None
+    future: Future | None = None
+    written_bytes: int = 0
+    copied: int = 0
+    digest: str = ""
+    source_atime_ns: int = 0
+    temp_state: dict | None = None
 
 
 def _cancelled(cancel: threading.Event | None) -> None:
@@ -132,6 +154,19 @@ def _protected_directory_keys(excluded: dict[str, dict]) -> set[str]:
         for index in range(1, len(parts) + 1):
             protected.add(_key("/".join(parts[:index])))
     return protected
+
+
+def _inside_protected_directory(relative_key: str, protected: set[str]) -> bool:
+    """Check protected ancestry in path depth rather than scanning every video folder."""
+    current = relative_key
+    while current:
+        if current in protected:
+            return True
+        parent = os.path.dirname(current)
+        if not parent or parent == current:
+            return False
+        current = parent
+    return False
 
 
 def _excluded_plan_items(source: dict[str, dict], target: dict[str, dict]) -> list[PlanItem]:
@@ -591,141 +626,268 @@ class SyncEngine:
         actual_name = plan.context["target_names"].get(_key(relative), relative)
         return plan.context["target_entries"].get(actual_name)
 
-    def _copy_file(self, plan: SyncPlan, item: PlanItem, store: BaselineStore,
-                   cancel: threading.Event | None, progress: ProgressCallback,
-                   result: SyncResult, target_root: dict,
-                   root_checkpoint: Callable[[bool], None], *,
-                   total_copy_bytes: int, total_copy_files: int) -> dict:
+    def _start_copy(self, plan: SyncPlan, item: PlanItem, store: BaselineStore,
+                    cancel: threading.Event | _CombinedCancel | None,
+                    root_checkpoint: Callable[[bool], None],
+                    executor: ThreadPoolExecutor) -> _PendingCopy:
+        """Validate and register one temp before its source write is dispatched."""
         relative = item.relative_path
         expected = plan.context["source_entries"][relative]
-        src_path = checked_child(plan.source, relative)
-        dst_path = checked_child(plan.target, relative)
-        _require_state(src_path, expected, "复制前源文件已改变")
-        _require_state(dst_path, self._target_expected(plan, relative), "复制前目标文件已改变")
+        dst_path, target_state = checked_child_snapshot(plan.target, relative)
+        target_expected = self._target_expected(plan, relative)
+        if target_state != target_expected:
+            raise SyncError(f"复制前目标文件已改变，请重新分析差异：{dst_path}")
         root_checkpoint(False)
-        temp_path: str | None = None
-        temp_identity: tuple | None = None
-        temp_fd: int | None = None
+        temp_fd, temp_path = tempfile.mkstemp(
+            prefix=".obmanage-", suffix=".tmp", dir=native(os.path.dirname(dst_path))
+        )
+        descriptor_state = os.fstat(temp_fd)
+        temp_identity = ("file", descriptor_state.st_dev, descriptor_state.st_ino)
+        pending: _PendingCopy | None = None
         try:
-            temp_fd, temp_path = tempfile.mkstemp(prefix=".obmanage-", suffix=".tmp",
-                                                   dir=native(os.path.dirname(dst_path)))
-            temp_identity = identity(snapshot(temp_path))
-            store.register_temp(plan.pair_id, temp_path, temp_identity)
-            with os.fdopen(temp_fd, "wb") as output:
-                temp_fd = None
-                with open(native(src_path), "rb") as source:
-                    opened = os.fstat(source.fileno())
-                    if (opened.st_ino, opened.st_dev, opened.st_size, opened.st_mtime_ns) != (
-                            expected["inode"], expected["device"], expected["size"], expected["mtime_ns"]):
-                        raise SyncError(f"打开源文件时文件已改变：{relative}")
-                    copy_budget = expected["size"] // 2
-
-                    def copy_progress(copied_bytes: int) -> None:
-                        logical = (copied_bytes * copy_budget // expected["size"]
-                                   if expected["size"] else 0)
-                        _emit(progress, "copy", relative_path=relative, message="正在复制并校验",
-                              completed_bytes=result.copied_bytes + logical,
-                              total_bytes=total_copy_bytes,
-                              completed_files=result.copied_files,
-                              total_files=total_copy_files)
-
-                    copied, digest = copy_stream_and_hash(
-                        source,
-                        output,
-                        expected["size"],
-                        check_cancel=lambda: _cancelled(cancel),
-                        progress=copy_progress,
-                    )
-                    finished = os.fstat(source.fileno())
-                    if (finished.st_size, finished.st_mtime_ns, finished.st_ctime_ns) != (
-                            opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns):
-                        raise SyncError(f"复制期间源文件发生变化：{relative}")
-                # Closing flushes Python's buffer before the write-back hash.
-                # FlushFileBuffers per file made small-file vaults spend most
-                # of their time waiting, while not making the whole mirror
-                # power-loss atomic (directory metadata is not committed as a
-                # single transaction).  The stable-source and SHA-256 checks
-                # below retain the verified-copy guarantee.
-            _cancelled(cancel)
-            _require_state(src_path, expected, "复制期间源文件已改变")
-            if copied != expected["size"]:
-                raise SyncError(f"复制的文件大小不符：{relative}")
-            temp_state = snapshot(temp_path)
-            verify_budget = expected["size"] - copy_budget
-
-            def verify_progress(event: Progress) -> None:
-                logical = copy_budget
-                if expected["size"]:
-                    logical += event.completed_bytes * verify_budget // expected["size"]
-                _emit(
-                    progress,
-                    "copy",
-                    relative_path=relative,
-                    message="正在复制并校验",
-                    completed_bytes=result.copied_bytes + logical,
-                    total_bytes=total_copy_bytes,
-                    completed_files=result.copied_files,
-                    total_files=total_copy_files,
-                )
-
-            if _hash_file(temp_path, temp_state, cancel, verify_progress, relative) != digest:
-                raise SyncError(f"写入后内容校验失败：{relative}")
-            # Copy only timestamps; carrying a read-only mode onto a staging
-            # file would complicate cancellation cleanup and future overwrites.
-            source_stat = os.stat(native(src_path), follow_symlinks=False)
-            os.utime(temp_path, ns=(source_stat.st_atime_ns, expected["mtime_ns"]))
-            staged_state = snapshot(temp_path)
-            _cancelled(cancel)
-            root_checkpoint(False)
-            checked_child(plan.target, relative)
-            _require_state(src_path, expected, "提交前源文件已改变")
-            target_expected = self._target_expected(plan, relative)
-            _require_state(dst_path, target_expected, "提交前目标文件已改变")
-            _mutate_target_file(
-                dst_path,
-                target_expected,
-                "提交前目标文件已改变",
-                lambda: os.replace(temp_path, native(dst_path)),
-                _WINDOWS_REPLACE_READONLY_ERRORS,
+            # Bind ownership to the object returned by mkstemp, not merely to
+            # whatever may occupy its pathname a moment later.
+            if identity(snapshot(temp_path)) != temp_identity:
+                raise SyncError(f"复制暂存文件在登记前已被替换：{relative}")
+            pending = _PendingCopy(
+                item=item,
+                expected=expected,
+                target_expected=target_expected,
+                source_root=plan.source,
+                source_path="",
+                target_path=dst_path,
+                temp_path=temp_path,
+                temp_identity=temp_identity,
+                temp_fd=temp_fd,
             )
-            store.unregister_temp(temp_path)
-            temp_path = None
-            result.copied_files += 1
-            result.copied_bytes += copied
-            dst_state = snapshot(dst_path)
-            if dst_state is None or dst_state["kind"] != "file" or dst_state["size"] != copied:
-                raise SyncError(f"提交后目标文件发生变化：{relative}")
-            # FAT-family filesystems can issue a new file ID when a directory
-            # entry is renamed, so an inode mismatch after os.replace does not
-            # by itself prove that another process replaced the file. Keep the
-            # common-filesystem fast path, but verify the stable final path by
-            # content before accepting any identity or timestamp change.
-            if (identity(dst_state) != identity(staged_state)
-                    or dst_state["mtime_ns"] != staged_state["mtime_ns"]):
-                if _hash_file(dst_path, dst_state, cancel, None, relative) != digest:
-                    raise SyncError(f"提交后目标文件发生变化：{relative}")
-            _require_state(src_path, expected, "提交后源文件已改变")
-            store.save(plan.pair_id, relative, expected, dst_state, digest)
-            _emit(progress, "copied", relative_path=relative, message="正在复制并校验",
-                  completed_bytes=result.copied_bytes, total_bytes=total_copy_bytes,
-                  completed_files=result.copied_files,
-                  total_files=total_copy_files)
-            return dst_state
-        finally:
-            if temp_fd is not None:
-                os.close(temp_fd)
-            if temp_path is not None:
-                # Never glob temp names, and never unlink a replacement with a
-                # different identity. A crash/failed cleanup remains visible in
-                # the next preview as a target-only file.
+            store.register_temp(plan.pair_id, temp_path, temp_identity)
+            pending.future = executor.submit(self._write_copy_temp, pending, cancel)
+            return pending
+        except BaseException:
+            if pending is not None:
+                self._cleanup_pending_copy(pending, store)
+            else:
+                try:
+                    os.close(temp_fd)
+                except OSError:
+                    pass
                 try:
                     assert_plain_chain(os.path.dirname(canonical(temp_path)))
                     if identity(snapshot(temp_path)) == temp_identity:
                         os.unlink(temp_path)
-                    if snapshot(temp_path) is None:
-                        store.unregister_temp(temp_path)
                 except (OSError, SyncError):
                     pass
+            raise
+
+    @staticmethod
+    def _write_copy_temp(pending: _PendingCopy,
+                         cancel: threading.Event | _CombinedCancel | None) -> tuple[int, str, int]:
+        """Write and hash a source in the sole pipeline worker."""
+        relative = pending.item.relative_path
+        descriptor = pending.temp_fd
+        if descriptor is None:
+            raise SyncError(f"复制暂存文件未正确打开：{relative}")
+        pending.temp_fd = None
+        try:
+            output_stream = os.fdopen(descriptor, "wb")
+        except BaseException:
+            os.close(descriptor)
+            raise
+        with output_stream as output:
+            source_path, source_state = checked_child_snapshot(
+                pending.source_root, relative
+            )
+            pending.source_path = source_path
+            if source_state != pending.expected:
+                raise SyncError(
+                    f"复制前源文件已改变，请重新分析差异：{source_path}"
+                )
+            with open(native(source_path), "rb") as source:
+                opened = os.fstat(source.fileno())
+                expected = pending.expected
+                if (opened.st_ino, opened.st_dev, opened.st_size, opened.st_mtime_ns) != (
+                        expected["inode"], expected["device"], expected["size"], expected["mtime_ns"]):
+                    raise SyncError(f"打开源文件时文件已改变：{relative}")
+
+                def remember_progress(copied_bytes: int) -> None:
+                    pending.written_bytes = copied_bytes
+
+                copied, digest = copy_stream_and_hash(
+                    source,
+                    output,
+                    expected["size"],
+                    check_cancel=lambda: _cancelled(cancel),
+                    progress=remember_progress,
+                )
+                finished = os.fstat(source.fileno())
+                if (finished.st_size, finished.st_mtime_ns, finished.st_ctime_ns) != (
+                        opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns):
+                    raise SyncError(f"复制期间源文件发生变化：{relative}")
+                source_atime_ns = finished.st_atime_ns
+            # Closing flushes Python's buffer before the write-back hash. The
+            # registered temp remains the only target-side object touched.
+        return copied, digest, source_atime_ns
+
+    @staticmethod
+    def _emit_copy_write_progress(pending: _PendingCopy, progress: ProgressCallback,
+                                  result: SyncResult, total_copy_bytes: int,
+                                  total_copy_files: int) -> None:
+        expected_size = pending.expected["size"]
+        copy_budget = expected_size // 2
+        logical = (pending.written_bytes * copy_budget // expected_size
+                   if expected_size else 0)
+        _emit(
+            progress,
+            "copy",
+            relative_path=pending.item.relative_path,
+            message="正在复制并校验",
+            completed_bytes=result.copied_bytes + logical,
+            total_bytes=total_copy_bytes,
+            completed_files=result.copied_files,
+            total_files=total_copy_files,
+        )
+
+    def _await_copy_temp(self, pending: _PendingCopy,
+                         cancel: threading.Event | None, progress: ProgressCallback,
+                         result: SyncResult, *, total_copy_bytes: int,
+                         total_copy_files: int) -> None:
+        """Join a source write while keeping progress and cancellation responsive."""
+        assert pending.future is not None
+        while True:
+            try:
+                copied, digest, source_atime_ns = pending.future.result(
+                    timeout=HASH_PROGRESS_INTERVAL
+                )
+                break
+            except TimeoutError:
+                _cancelled(cancel)
+                self._emit_copy_write_progress(
+                    pending, progress, result, total_copy_bytes, total_copy_files
+                )
+        pending.copied = copied
+        pending.digest = digest
+        pending.source_atime_ns = source_atime_ns
+        pending.written_bytes = copied
+        # Emit before the stable-path check so a callback-triggered source
+        # mutation or cancellation is observed just as it was in serial copy.
+        self._emit_copy_write_progress(
+            pending, progress, result, total_copy_bytes, total_copy_files
+        )
+        _cancelled(cancel)
+        _require_state(pending.source_path, pending.expected, "复制期间源文件已改变")
+        if copied != pending.expected["size"]:
+            raise SyncError(f"复制的文件大小不符：{pending.item.relative_path}")
+        pending.temp_state = snapshot(pending.temp_path)
+
+    def _verify_commit_copy(self, plan: SyncPlan, pending: _PendingCopy,
+                            store: BaselineStore, cancel: threading.Event | None,
+                            progress: ProgressCallback, result: SyncResult,
+                            root_checkpoint: Callable[[bool], None], *,
+                            total_copy_bytes: int, total_copy_files: int) -> dict:
+        """Read back, atomically replace, and publish one staged file."""
+        relative = pending.item.relative_path
+        expected = pending.expected
+        temp_path = pending.temp_path
+        temp_state = pending.temp_state
+        if temp_state is None:
+            raise SyncError(f"写入后的暂存文件已消失：{relative}")
+        copy_budget = expected["size"] // 2
+        verify_budget = expected["size"] - copy_budget
+
+        def verify_progress(event: Progress) -> None:
+            logical = copy_budget
+            if expected["size"]:
+                logical += event.completed_bytes * verify_budget // expected["size"]
+            _emit(
+                progress,
+                "copy",
+                relative_path=relative,
+                message="正在复制并校验",
+                completed_bytes=result.copied_bytes + logical,
+                total_bytes=total_copy_bytes,
+                completed_files=result.copied_files,
+                total_files=total_copy_files,
+            )
+
+        if _hash_file(temp_path, temp_state, cancel, verify_progress, relative) != pending.digest:
+            raise SyncError(f"写入后内容校验失败：{relative}")
+        # Copy only timestamps; carrying a read-only mode onto a staging file
+        # would complicate cancellation cleanup and future overwrites.
+        os.utime(temp_path, ns=(pending.source_atime_ns, expected["mtime_ns"]))
+        staged_state = snapshot(temp_path)
+        _cancelled(cancel)
+        root_checkpoint(False)
+        checked_target, target_state = checked_child_snapshot(plan.target, relative)
+        if checked_target != pending.target_path or target_state != pending.target_expected:
+            raise SyncError(f"提交前目标文件已改变，请重新分析差异：{pending.target_path}")
+        _require_state(pending.source_path, expected, "提交前源文件已改变")
+        _mutate_target_file(
+            pending.target_path,
+            pending.target_expected,
+            "提交前目标文件已改变",
+            lambda: os.replace(temp_path, native(pending.target_path)),
+            _WINDOWS_REPLACE_READONLY_ERRORS,
+        )
+        result.copied_files += 1
+        result.copied_bytes += pending.copied
+        dst_state = snapshot(pending.target_path)
+        if (dst_state is None or dst_state["kind"] != "file"
+                or dst_state["size"] != pending.copied):
+            raise SyncError(f"提交后目标文件发生变化：{relative}")
+        # FAT-family filesystems can issue a new file ID when a directory
+        # entry is renamed. Verify the stable final path by content before
+        # accepting any identity or timestamp change.
+        if (identity(dst_state) != identity(staged_state)
+                or dst_state["mtime_ns"] != staged_state["mtime_ns"]):
+            if _hash_file(pending.target_path, dst_state, cancel, None, relative) != pending.digest:
+                raise SyncError(f"提交后目标文件发生变化：{relative}")
+        _require_state(pending.source_path, expected, "提交后源文件已改变")
+        store.finalize_copy(
+            plan.pair_id,
+            relative,
+            expected,
+            dst_state,
+            pending.digest,
+            temp_path,
+        )
+        pending.temp_path = ""
+        _emit(
+            progress,
+            "copied",
+            relative_path=relative,
+            message="正在复制并校验",
+            completed_bytes=result.copied_bytes,
+            total_bytes=total_copy_bytes,
+            completed_files=result.copied_files,
+            total_files=total_copy_files,
+        )
+        return dst_state
+
+    @staticmethod
+    def _cleanup_pending_copy(pending: _PendingCopy, store: BaselineStore) -> None:
+        """Remove only the exact registered temp after its writer has stopped."""
+        if pending.future is not None and not pending.future.done():
+            try:
+                pending.future.result()
+            except BaseException:
+                pass
+        if pending.temp_fd is not None:
+            try:
+                os.close(pending.temp_fd)
+            except OSError:
+                pass
+            pending.temp_fd = None
+        temp_path = pending.temp_path
+        if not temp_path:
+            return
+        try:
+            assert_plain_chain(os.path.dirname(canonical(temp_path)))
+            if identity(snapshot(temp_path)) == pending.temp_identity:
+                os.unlink(temp_path)
+            if snapshot(temp_path) is None:
+                store.unregister_temp(temp_path)
+        except (OSError, SyncError, sqlite3.Error):
+            pass
 
     def _verify_target(self, plan: SyncPlan, expected: dict[str, dict],
                        cancel: threading.Event | None) -> None:
@@ -741,14 +903,10 @@ class SyncEngine:
             matches = identity(current) == identity(state) if state["kind"] == "dir" else current == state
             if not matches:
                 raise SyncError(f"目标项目在同步期间发生变化，请重新分析差异：{relative}")
+        protected = plan.context.get("protected_target_directories", set())
         for source_name in plan.context["source_entries"]:
             key = _key(source_name)
-            protected = plan.context.get("protected_target_directories", set())
-            inside_protected = any(
-                key == directory
-                or key.startswith(directory.rstrip("/\\") + os.sep)
-                for directory in protected
-            )
+            inside_protected = _inside_protected_directory(key, protected)
             if actual_names.get(key) != source_name and not inside_protected:
                 raise SyncError(f"目标文件名的大小写与源端不同，请重新分析差异：{source_name}")
 
@@ -878,7 +1036,7 @@ class SyncEngine:
             revalidate_roots(context, target_root=target_root)
             last_root_check = time.monotonic()
             last_root_check_file = 0
-            current_copy_file = 0
+            started_copy_files = 0
 
             def root_checkpoint(force: bool = False) -> None:
                 """Recheck stable roots at bounded file/time intervals.
@@ -891,30 +1049,97 @@ class SyncEngine:
                 """
                 nonlocal last_root_check, last_root_check_file
                 now = time.monotonic()
-                full = (force or current_copy_file - last_root_check_file >= 16
+                full = (force or started_copy_files - last_root_check_file >= 16
                         or now - last_root_check >= 0.25)
                 if full:
                     revalidate_roots(context, target_root=target_root)
                     last_root_check = now
-                    last_root_check_file = current_copy_file
+                    last_root_check_file = started_copy_files
 
-            for current_copy_file, item in enumerate(copy_items, 1):
-                _cancelled(cancel)
-                copied_state = self._copy_file(
-                    plan,
-                    item,
-                    store,
-                    cancel,
-                    progress,
-                    result,
-                    target_root,
-                    root_checkpoint,
-                    total_copy_bytes=total_copy_bytes,
-                    total_copy_files=len(copy_items),
+            copy_pool: ThreadPoolExecutor | None = None
+            pipeline_abort = threading.Event()
+            pending_copies: list[_PendingCopy] = []
+            pipeline_cancel = _CombinedCancel(cancel, pipeline_abort)
+            overlap_copy_and_verify = (
+                context["source_volume"] != context["target_volume"]
+            )
+
+            def begin_copy(item: PlanItem) -> _PendingCopy:
+                nonlocal started_copy_files
+                _cancelled(pipeline_cancel)
+                started_copy_files += 1
+                assert copy_pool is not None
+                pending = self._start_copy(
+                    plan, item, store, pipeline_cancel, root_checkpoint, copy_pool
                 )
-                expected_targets[_key(item.relative_path)] = copied_state
+                pending_copies.append(pending)
+                return pending
+
+            try:
+                if copy_items:
+                    # Exactly one source writer may run ahead. While the main
+                    # thread reads back the current target temp, that writer
+                    # stages the next file. This overlaps independent source
+                    # and target I/O without parallel commits or unbounded
+                    # outstanding target mutations.
+                    copy_pool = ThreadPoolExecutor(
+                        max_workers=1, thread_name_prefix="obmanage-copy"
+                    )
+                    current = begin_copy(copy_items[0])
+                    for index, item in enumerate(copy_items):
+                        assert current.item is item
+                        self._await_copy_temp(
+                            current,
+                            cancel,
+                            progress,
+                            result,
+                            total_copy_bytes=total_copy_bytes,
+                            total_copy_files=len(copy_items),
+                        )
+                        following = (
+                            begin_copy(copy_items[index + 1])
+                            if (overlap_copy_and_verify
+                                and index + 1 < len(copy_items)) else None
+                        )
+                        copied_state = self._verify_commit_copy(
+                            plan,
+                            current,
+                            store,
+                            cancel,
+                            progress,
+                            result,
+                            root_checkpoint,
+                            total_copy_bytes=total_copy_bytes,
+                            total_copy_files=len(copy_items),
+                        )
+                        expected_targets[_key(item.relative_path)] = copied_state
+                        pending_copies.remove(current)
+                        if not overlap_copy_and_verify and index + 1 < len(copy_items):
+                            following = begin_copy(copy_items[index + 1])
+                        current = following
+            finally:
+                pipeline_abort.set()
+                if copy_pool is not None:
+                    copy_pool.shutdown(wait=True, cancel_futures=True)
+                for pending in pending_copies:
+                    self._cleanup_pending_copy(pending, store)
             result.skipped_files = plan.counts["skip"]
             _cancelled(cancel)
+            # A case-only rename retains content identity. Update its own and
+            # descendant skip baselines before the final filesystem barrier so
+            # a no-deletion run is still checked at the last meaningful step.
+            if plan.counts.get("rename", 0):
+                baselines = store.records(plan.pair_id)
+                for item in (item for item in plan.items if item.action == "skip"):
+                    record = baselines.get(item.relative_path)
+                    if record is not None:
+                        store.save(
+                            plan.pair_id,
+                            item.relative_path,
+                            context["source_entries"][item.relative_path],
+                            expected_targets[_key(item.relative_path)],
+                            record[2],
+                        )
             # No deletion at all unless all writes succeeded and the entire
             # source is still exactly the snapshot that was previewed.
             root_checkpoint(True)
@@ -922,55 +1147,57 @@ class SyncEngine:
                     != context["source_entries"]):
                 raise SyncError("源目录在同步期间发生变化，已停止删除；请重新分析差异。")
             self._verify_target(plan, expected_targets, cancel)
-            # A case-only rename retains content identity. Update its own and
-            # descendant skip baselines using the verified post-rename stats.
-            if plan.counts.get("rename", 0):
-                baselines = store.records(plan.pair_id)
-                for item in (item for item in plan.items if item.action == "skip"):
-                    record = baselines.get(item.relative_path)
-                    if record is not None:
-                        store.save(plan.pair_id, item.relative_path,
-                                   context["source_entries"][item.relative_path],
-                                   expected_targets[_key(item.relative_path)], record[2])
-            for item in sorted(deletions, key=lambda item: (item.action == "rmdir", -item.relative_path.count("/"))):
+            if deletions:
+                for item in sorted(
+                        deletions,
+                        key=lambda item: (
+                            item.action == "rmdir", -item.relative_path.count("/")
+                        )):
+                    _cancelled(cancel)
+                    revalidate_roots(context, target_root=target_root)
+                    relative = item.relative_path
+                    source_path = checked_child(plan.source, relative)
+                    if snapshot(source_path) is not None:
+                        raise SyncError(f"源端重新出现此项目，已停止删除：{relative}")
+                    target_path = checked_child(plan.target, relative)
+                    expected = context["target_entries"][relative]
+                    actual = snapshot(target_path)
+                    if item.action == "delete":
+                        if actual != expected:
+                            raise SyncError(f"待删除文件在预览后发生变化，已停止删除：{relative}")
+                        _mutate_target_file(
+                            target_path,
+                            expected,
+                            "待删除文件在预览后发生变化",
+                            lambda: os.unlink(native(target_path)),
+                            _WINDOWS_DELETE_READONLY_ERRORS,
+                        )
+                        result.deleted_files += 1
+                        store.remove(plan.pair_id, relative)
+                    else:
+                        if identity(actual) != identity(expected):
+                            raise SyncError(f"待删除文件夹已被替换，已停止删除：{relative}")
+                        # rmdir only removes an empty, individually checked folder.
+                        # Unexpected files inserted by another program are retained.
+                        os.rmdir(native(target_path))
+                        result.deleted_dirs += 1
+                    expected_targets.pop(_key(relative))
+                    _emit(
+                        progress,
+                        "delete",
+                        relative_path=relative,
+                        message="已删除目标多余项目",
+                        completed_bytes=result.copied_bytes,
+                        total_bytes=plan.bytes_to_copy,
+                        completed_files=result.deleted_files + result.deleted_dirs,
+                        total_files=len(deletions),
+                    )
                 _cancelled(cancel)
                 revalidate_roots(context, target_root=target_root)
-                relative = item.relative_path
-                source_path = checked_child(plan.source, relative)
-                if snapshot(source_path) is not None:
-                    raise SyncError(f"源端重新出现此项目，已停止删除：{relative}")
-                target_path = checked_child(plan.target, relative)
-                expected = context["target_entries"][relative]
-                actual = snapshot(target_path)
-                if item.action == "delete":
-                    if actual != expected:
-                        raise SyncError(f"待删除文件在预览后发生变化，已停止删除：{relative}")
-                    _mutate_target_file(
-                        target_path,
-                        expected,
-                        "待删除文件在预览后发生变化",
-                        lambda: os.unlink(native(target_path)),
-                        _WINDOWS_DELETE_READONLY_ERRORS,
-                    )
-                    result.deleted_files += 1
-                    store.remove(plan.pair_id, relative)
-                else:
-                    if identity(actual) != identity(expected):
-                        raise SyncError(f"待删除文件夹已被替换，已停止删除：{relative}")
-                    # rmdir only removes an empty, individually checked folder.
-                    # Unexpected files inserted by another program are retained.
-                    os.rmdir(native(target_path))
-                    result.deleted_dirs += 1
-                expected_targets.pop(_key(relative))
-                _emit(progress, "delete", relative_path=relative, message="已删除目标多余项目",
-                      completed_bytes=result.copied_bytes, total_bytes=plan.bytes_to_copy,
-                      completed_files=result.deleted_files + result.deleted_dirs, total_files=len(deletions))
-            _cancelled(cancel)
-            revalidate_roots(context, target_root=target_root)
-            if (_scan(plan.source, cancel, None, mode=plan.mode)[0]
-                    != context["source_entries"]):
-                raise SyncError("同步结束时源目录发生变化，本次仅部分完成，请重新分析差异。")
-            self._verify_target(plan, expected_targets, cancel)
+                if (_scan(plan.source, cancel, None, mode=plan.mode)[0]
+                        != context["source_entries"]):
+                    raise SyncError("同步结束时源目录发生变化，本次仅部分完成，请重新分析差异。")
+                self._verify_target(plan, expected_targets, cancel)
             result.status = "success"
             _emit(progress, "done", message="镜像同步完成", completed_bytes=result.copied_bytes,
                   total_bytes=plan.bytes_to_copy)

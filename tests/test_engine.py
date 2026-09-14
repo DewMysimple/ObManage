@@ -141,6 +141,225 @@ def test_copy_progress_is_monotonic_across_write_and_verification(mirror):
     assert {event.message for event in transfer} == {"正在复制并校验"}
 
 
+def test_next_source_write_overlaps_current_target_verification(mirror, monkeypatch):
+    engine, source, target = mirror
+    put(source, "first.bin", b"a" * 4096)
+    put(source, "second.bin", b"b" * 4096)
+    pretend_separate_volumes(monkeypatch, source, target)
+    plan = analyze(engine, source, target)
+    real_copy = engine_module.copy_stream_and_hash
+    real_hash = engine_module._hash_file
+    second_write_started = Event()
+    copy_calls = 0
+    copy_lock = Lock()
+
+    def observed_copy(*args, **kwargs):
+        nonlocal copy_calls
+        with copy_lock:
+            copy_calls += 1
+            if copy_calls == 2:
+                second_write_started.set()
+        return real_copy(*args, **kwargs)
+
+    first_verification = True
+
+    def require_pipeline(path, *args, **kwargs):
+        nonlocal first_verification
+        if first_verification and Path(path).name.startswith(".obmanage-"):
+            first_verification = False
+            assert second_write_started.wait(timeout=3), (
+                "The next registered temp must start writing before the current temp is read back"
+            )
+        return real_hash(path, *args, **kwargs)
+
+    monkeypatch.setattr(engine_module, "copy_stream_and_hash", observed_copy)
+    monkeypatch.setattr(engine_module, "_hash_file", require_pipeline)
+    caller_thread = get_ident()
+    callback_threads = []
+
+    result = engine.execute(
+        plan, progress=lambda event: callback_threads.append(get_ident())
+    )
+
+    assert result.status == "success", result.errors
+    assert copy_calls == 2
+    assert callback_threads and set(callback_threads) == {caller_thread}
+    assert not any(thread.name.startswith("obmanage-copy") for thread in enumerate_threads())
+
+
+def test_same_volume_keeps_copy_and_writeback_verification_serial(mirror, monkeypatch):
+    engine, source, target = mirror
+    put(source, "first.bin", b"a" * 4096)
+    put(source, "second.bin", b"b" * 4096)
+    plan = analyze(engine, source, target)
+    assert plan.context["source_volume"] == plan.context["target_volume"]
+    real_copy = engine_module.copy_stream_and_hash
+    real_hash = engine_module._hash_file
+    second_write_started = Event()
+    copy_calls = 0
+
+    def observed_copy(*args, **kwargs):
+        nonlocal copy_calls
+        copy_calls += 1
+        if copy_calls == 2:
+            second_write_started.set()
+        return real_copy(*args, **kwargs)
+
+    checked_first = False
+
+    def require_serial(path, *args, **kwargs):
+        nonlocal checked_first
+        if not checked_first and Path(path).name.startswith(".obmanage-"):
+            checked_first = True
+            assert not second_write_started.is_set(), (
+                "Same-volume media must not interleave the next write with this read"
+            )
+        return real_hash(path, *args, **kwargs)
+
+    monkeypatch.setattr(engine_module, "copy_stream_and_hash", observed_copy)
+    monkeypatch.setattr(engine_module, "_hash_file", require_serial)
+
+    result = engine.execute(plan)
+
+    assert result.status == "success", result.errors
+    assert checked_first and copy_calls == 2
+
+
+@pytest.mark.parametrize(("with_deletion", "expected_scans_per_root"), [
+    (False, 2),
+    (True, 3),
+])
+def test_final_full_scan_is_repeated_only_after_actual_deletions(
+        mirror, monkeypatch, with_deletion, expected_scans_per_root):
+    engine, source, target = mirror
+    put(source, "new.md", b"new content")
+    if with_deletion:
+        put(target, "obsolete.md", b"remove only after copy verification")
+    plan = analyze(engine, source, target)
+    real_scan = engine_module._scan
+    scan_counts = {str(source): 0, str(target): 0}
+
+    def counted_scan(root, *args, **kwargs):
+        scan_counts[paths_module.canonical(root)] += 1
+        return real_scan(root, *args, **kwargs)
+
+    monkeypatch.setattr(engine_module, "_scan", counted_scan)
+
+    result = engine.execute(plan)
+
+    assert result.status == "success", result.errors
+    assert scan_counts == {
+        str(source): expected_scans_per_root,
+        str(target): expected_scans_per_root,
+    }
+
+
+def test_pipeline_verification_failure_commits_nothing_and_cleans_next_temp(
+        mirror, monkeypatch):
+    engine, source, target = mirror
+    put(source, "first.bin", b"a" * 4096)
+    put(source, "second.bin", b"b" * 4096)
+    put(target, "obsolete.md", b"must survive")
+    pretend_separate_volumes(monkeypatch, source, target)
+    plan = analyze(engine, source, target)
+    real_copy = engine_module.copy_stream_and_hash
+    real_hash = engine_module._hash_file
+    second_write_started = Event()
+    copy_calls = 0
+    copy_lock = Lock()
+
+    def observed_copy(*args, **kwargs):
+        nonlocal copy_calls
+        with copy_lock:
+            copy_calls += 1
+            if copy_calls == 2:
+                second_write_started.set()
+        return real_copy(*args, **kwargs)
+
+    corrupted = False
+
+    def fail_first_verification(path, *args, **kwargs):
+        nonlocal corrupted
+        digest = real_hash(path, *args, **kwargs)
+        if not corrupted and Path(path).name.startswith(".obmanage-"):
+            assert second_write_started.wait(timeout=3)
+            corrupted = True
+            return "0" * 64
+        return digest
+
+    monkeypatch.setattr(engine_module, "copy_stream_and_hash", observed_copy)
+    monkeypatch.setattr(engine_module, "_hash_file", fail_first_verification)
+
+    result = engine.execute(plan)
+
+    assert result.status == "failed"
+    assert result.copied_files == 0
+    assert (target / "obsolete.md").read_bytes() == b"must survive"
+    assert not (target / "first.bin").exists()
+    assert not (target / "second.bin").exists()
+    assert not any(path.name.startswith(".obmanage-") for path in target.iterdir())
+    store = BaselineStore(engine.state_dir)
+    try:
+        assert store.temps(plan.pair_id) == []
+        assert store.records(plan.pair_id) == {}
+    finally:
+        store.close()
+    assert not any(thread.name.startswith("obmanage-copy") for thread in enumerate_threads())
+
+
+def test_pipeline_failure_cancels_and_joins_running_next_writer(mirror, monkeypatch):
+    engine, source, target = mirror
+    put(source, "first.bin", b"a" * 4096)
+    put(source, "second.bin", b"b" * 4096)
+    pretend_separate_volumes(monkeypatch, source, target)
+    plan = analyze(engine, source, target)
+    real_copy = engine_module.copy_stream_and_hash
+    real_hash = engine_module._hash_file
+    second_write_started = Event()
+    second_write_finished = Event()
+    pause = Event()
+    copy_calls = 0
+    copy_lock = Lock()
+
+    def block_second_copy(*args, **kwargs):
+        nonlocal copy_calls
+        with copy_lock:
+            copy_calls += 1
+            this_call = copy_calls
+        if this_call == 1:
+            return real_copy(*args, **kwargs)
+        second_write_started.set()
+        try:
+            while True:
+                kwargs["check_cancel"]()
+                pause.wait(0.001)
+        finally:
+            second_write_finished.set()
+
+    failed_first = False
+
+    def fail_first_verification(path, *args, **kwargs):
+        nonlocal failed_first
+        digest = real_hash(path, *args, **kwargs)
+        if not failed_first and Path(path).name.startswith(".obmanage-"):
+            assert second_write_started.wait(timeout=3)
+            failed_first = True
+            return "0" * 64
+        return digest
+
+    monkeypatch.setattr(engine_module, "copy_stream_and_hash", block_second_copy)
+    monkeypatch.setattr(engine_module, "_hash_file", fail_first_verification)
+
+    result = engine.execute(plan)
+
+    assert result.status == "failed"
+    assert second_write_finished.is_set()
+    assert not (target / "first.bin").exists()
+    assert not (target / "second.bin").exists()
+    assert not any(path.name.startswith(".obmanage-") for path in target.iterdir())
+    assert not any(thread.name.startswith("obmanage-copy") for thread in enumerate_threads())
+
+
 def test_full_root_chain_checks_are_batched_during_small_file_copy(mirror, monkeypatch):
     engine, source, target = mirror
     for number in range(65):

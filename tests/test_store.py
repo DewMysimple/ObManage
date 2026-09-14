@@ -124,6 +124,51 @@ def test_invalidation_of_both_directions_is_one_transactional_operation(tmp_path
         store.close()
 
 
+def test_finalize_copy_publishes_baseline_and_retires_temp_in_one_transaction(tmp_path):
+    store = BaselineStore(tmp_path / "state")
+    try:
+        source, target = file_state(1), file_state(2)
+        store.register_temp("pair", "registered.tmp", ("file", 1, 2))
+
+        store.finalize_copy(
+            "pair", "note.md", source, target, "verified", "registered.tmp"
+        )
+
+        assert store.records("pair") == {
+            "note.md": (source, target, "verified")
+        }
+        assert store.temps("pair") == []
+    finally:
+        store.close()
+
+
+def test_finalize_copy_failure_keeps_temp_registration_and_no_baseline(tmp_path):
+    store = BaselineStore(tmp_path / "state")
+    try:
+        store.register_temp("pair", "registered.tmp", ("file", 1, 2))
+        store.connection.execute("""
+            CREATE TRIGGER reject_final_baseline
+            BEFORE INSERT ON baselines
+            BEGIN
+                SELECT RAISE(ABORT, 'simulated finalize failure');
+            END;
+        """)
+        store.connection.commit()
+
+        with pytest.raises(sqlite3.IntegrityError):
+            store.finalize_copy(
+                "pair", "note.md", file_state(1), file_state(2),
+                "verified", "registered.tmp",
+            )
+
+        assert store.records("pair") == {}
+        assert store.temps("pair") == [
+            ("registered.tmp", ("file", 1, 2))
+        ]
+    finally:
+        store.close()
+
+
 def test_invalidation_failure_rolls_back_both_directions(tmp_path):
     store = BaselineStore(tmp_path / "state")
     try:

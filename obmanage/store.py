@@ -141,6 +141,28 @@ class BaselineStore:
         self.connection.execute("DELETE FROM owned_temps WHERE path = ?", (path,))
         self.connection.commit()
 
+    def finalize_copy(self, pair_id: str, path: str, source: dict, target: dict,
+                      digest: str, temp_path: str) -> None:
+        """Publish one verified baseline and retire its temp ownership atomically."""
+        relative_key = self._relative_key(path)
+        with self._write_transaction():
+            known_paths = self._paths(pair_id)
+            variants = set(known_paths.get(relative_key, ()))
+            self.connection.executemany(
+                "DELETE FROM baselines WHERE pair_id = ? AND relative_path = ?",
+                ((pair_id, variant) for variant in variants),
+            )
+            self.connection.execute(
+                "INSERT INTO baselines "
+                "(pair_id, relative_path, source_state, target_state, digest) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (pair_id, path, json.dumps(source), json.dumps(target), digest),
+            )
+            self.connection.execute(
+                "DELETE FROM owned_temps WHERE path = ?", (temp_path,)
+            )
+        known_paths[relative_key] = {path}
+
     def temps(self, pair_id: str) -> list[tuple[str, tuple]]:
         return [(path, tuple(json.loads(record))) for path, record in
                 self.connection.execute("SELECT path, identity FROM owned_temps WHERE pair_id = ?",

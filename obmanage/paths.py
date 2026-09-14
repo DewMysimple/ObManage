@@ -98,7 +98,14 @@ def validate_state_separation(state_dir: str | Path, roots: tuple[str, ...] | li
     return resolved_state
 
 
-def checked_child(root: str, relative: str) -> str:
+def checked_child_snapshot(root: str, relative: str) -> tuple[str, dict | None]:
+    """Return a safe child path and the snapshot observed by that same check.
+
+    Callers that must immediately compare the child with a preview can reuse
+    the snapshot instead of issuing a second, adjacent ``lstat``.  The full
+    ancestor-chain and reparse-point checks remain identical to
+    :func:`checked_child`.
+    """
     parts = relative.replace("\\", "/").split("/")
     if not relative or any(part in ("", ".", "..") for part in parts):
         raise SyncError(f"无效的相对路径：{relative}")
@@ -111,7 +118,11 @@ def checked_child(root: str, relative: str) -> str:
     state = snapshot(candidate)
     if state is not None and state["kind"] in ("link", "special"):
         raise SyncError(f"路径已变成链接或特殊文件：{relative}")
-    return candidate
+    return candidate, state
+
+
+def checked_child(root: str, relative: str) -> str:
+    return checked_child_snapshot(root, relative)[0]
 
 
 def existing_anchor(path: str) -> str:
