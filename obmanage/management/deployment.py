@@ -22,6 +22,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
+from ..copying import COPY_BUFFER_SIZE, copy_stream_and_hash
 from ..models import SyncCancelled, SyncError
 from ..paths import (assert_plain_chain, canonical, checked_child, identity, native,
                      snapshot, volume_identity)
@@ -29,7 +30,7 @@ from .journal import (DeploymentJournal, JournalBatch, JournalError, JournalTarg
                       OwnedDirectory)
 
 
-CHUNK_SIZE = 4 * 1024 * 1024
+CHUNK_SIZE = COPY_BUFFER_SIZE
 _DEPLOYMENT_TASK_LOCK = threading.Lock()
 _OWNED_PREFIX = ".obmanage-deploy-"
 _WINDOWS_ACCESS_DENIED = 5
@@ -1232,8 +1233,6 @@ class DeploymentEngine:
             destination = checked_child(stage, entry.relative_path)
             if not _entry_matches(_entry_state(source), entry.snapshot):
                 raise DeploymentError(f"暂存前来源文件已改变：{entry.relative_path}")
-            digest = hashlib.sha256()
-            copied = 0
             try:
                 with open(native(source), "rb") as input_stream:
                     opened = os.fstat(input_stream.fileno())
@@ -1243,29 +1242,23 @@ class DeploymentEngine:
                             opened.st_ino, opened.st_dev) != expected_tuple:
                         raise DeploymentError(f"打开来源文件时内容身份已改变：{entry.relative_path}")
                     with open(native(destination), "xb") as output_stream:
-                        while True:
-                            _cancelled(cancel)
-                            block = input_stream.read(CHUNK_SIZE)
-                            if not block:
-                                break
-                            output_stream.write(block)
-                            digest.update(block)
-                            copied += len(block)
-                        output_stream.flush()
-                        os.fsync(output_stream.fileno())
+                        copied, digest = copy_stream_and_hash(
+                            input_stream,
+                            output_stream,
+                            entry.snapshot.size,
+                            check_cancel=lambda: _cancelled(cancel),
+                        )
                     finished = os.fstat(input_stream.fileno())
                     if (finished.st_size, finished.st_mtime_ns,
                             finished.st_ino, finished.st_dev) != expected_tuple:
                         raise DeploymentError(f"复制期间来源文件已改变：{entry.relative_path}")
             except OSError as exc:
                 raise DeploymentError(f"暂存文件失败：{entry.relative_path}（{exc}）") from exc
-            if copied != entry.snapshot.size or digest.hexdigest() != entry.snapshot.sha256:
+            if copied != entry.snapshot.size or digest != entry.snapshot.sha256:
                 raise DeploymentError(f"暂存期间来源内容已改变：{entry.relative_path}")
             staged_state = _entry_state(destination)
             if staged_state is None or staged_state.kind != "file" or staged_state.size != copied:
                 raise DeploymentError(f"暂存文件不完整：{entry.relative_path}")
-            if _hash_file(destination, staged_state, cancel) != entry.snapshot.sha256:
-                raise DeploymentError(f"暂存文件 SHA-256 校验失败：{entry.relative_path}")
             # The path was just created by this transaction and revalidated as
             # a regular file.  Windows does not implement follow_symlinks=False
             # for os.utime, so use the already-checked extended path directly.
@@ -1278,10 +1271,20 @@ class DeploymentEngine:
                   target_id=item.target_id, relative_path=entry.relative_path,
                   completed_files=number, total_files=len(files),
                   completed_bytes=completed_bytes, total_bytes=item.source_tree.total_bytes,
-                  message="已暂存并完成 SHA-256 校验")
+                  message="已暂存，正在准备整体验证")
+        # One stable whole-tree pass verifies every staged byte and the final
+        # directory manifest.  A second per-file target hash immediately before
+        # this pass read every staged file twice without strengthening the
+        # transaction boundary.
         manifest, _ = _manifest_tree(stage, cancel)
         if manifest != item.source_tree.manifest():
             raise DeploymentError(f"目标卷暂存目录校验不一致：{item.target_id}")
+        _emit(progress, "stage", batch_id=plan.batch_id,
+              selection_id=item.selection_id, component_id=item.component_id,
+              target_id=item.target_id, completed_files=len(files),
+              total_files=len(files), completed_bytes=completed_bytes,
+              total_bytes=item.source_tree.total_bytes,
+              message="暂存目录已完成 SHA-256 整体验证")
 
     def _cleanup_stage(self, batch_id: str, record: JournalTarget) -> None:
         if not record.stage_path or snapshot(record.stage_path) is None:

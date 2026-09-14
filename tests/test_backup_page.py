@@ -10,10 +10,13 @@ import pytest
 from PySide6.QtCore import QCoreApplication, QEvent, QPoint, QRect
 from PySide6.QtWidgets import QApplication
 
+import obmanage.tasking as tasking_module
 from obmanage.engine import SYNC_MODE_NO_VIDEO
 from obmanage.models import PlanItem, SyncPlan
 from obmanage.pages.backup import VaultBackupPage
+from obmanage.pages.common import FeaturePage
 from obmanage.settings import SettingsStore
+from obmanage.tasking import FeatureWorker
 from obmanage.ui import MainWindow
 
 
@@ -58,6 +61,40 @@ def put(root: Path, relative: str, content: bytes) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(content)
     return path
+
+
+def test_feature_worker_coalesces_rapid_copy_phase_transitions(
+    application, monkeypatch
+):
+    timestamps = iter((100.0, 100.01, 100.02, 100.11, 100.12))
+    monkeypatch.setattr(tasking_module.time, "monotonic", lambda: next(timestamps))
+    worker = FeatureWorker(lambda cancel, progress: None)
+    received = []
+    worker.progress.connect(received.append)
+    try:
+        for phase in ("copy", "hash", "copied", "copy", "done"):
+            worker._progress(type("Event", (), {"phase": phase})())
+
+        assert [event.phase for event in received] == ["copy", "copy", "done"]
+    finally:
+        worker.deleteLater()
+
+
+def test_feature_status_skips_identical_text_and_style_redraws(application):
+    page = FeaturePage("测试", "状态去重")
+    original = page.status_label.setText
+    writes = []
+
+    def record(text):
+        writes.append(text)
+        original(text)
+
+    page.status_label.setText = record
+    page.set_status("正在复制并校验", "busy")
+    page.set_status("正在复制并校验", "busy")
+    page.set_status("正在复制并校验", "success")
+
+    assert writes == ["正在复制并校验", "正在复制并校验"]
 
 
 def test_shell_registers_backup_page_with_requested_laptop_default(application, tmp_path):

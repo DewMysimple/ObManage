@@ -1705,7 +1705,9 @@ class MainWindow(QMainWindow):
             "delete": f"正在清理{target_name}多余内容",
             "done": "正在完成本轮任务",
         }
-        if progress.phase == "hash":
+        if self._operation == "execute" and progress.phase in ("copy", "copied", "hash"):
+            message = f"正在复制并校验至{target_name}；{source_name}只读取"
+        elif progress.phase == "hash":
             message = "当前文件写入校验" if self._operation == "execute" else "当前文件内容校验"
         elif progress.phase == "delete":
             message = f"仅从{target_name}删除多余内容；{source_name}只读取"
@@ -1773,6 +1775,9 @@ class MainWindow(QMainWindow):
 
     def _set_status(self, text: str, kind: str = "neutral") -> None:
         colors = {"neutral": "#8A9A9F", "busy": "#5E8AA2", "success": "#53916F", "warning": "#B38749", "error": "#B66B5D"}
+        if self.status_label.text() == text and getattr(self, "_status_kind", "") == kind:
+            return
+        self._status_kind = kind
         self.status_label.setText(text)
         self.status_label.setToolTip(text)
         self.status_dot.setStyleSheet(f"color: {colors.get(kind, colors['neutral'])}; font-size: 9px;")

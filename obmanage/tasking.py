@@ -23,7 +23,7 @@ class FeatureWorker(QThread):
         super().__init__()
         self.operation = operation
         self.cancel_event = threading.Event()
-        self._last_progress = 0.0
+        self._last_progress: float | None = None
         self._last_phase = ""
 
     def request_cancel(self) -> None:
@@ -32,7 +32,11 @@ class FeatureWorker(QThread):
     def _progress(self, event: Progress) -> None:
         now = time.monotonic()
         terminal = event.phase in {"done", "error"}
-        if terminal or event.phase != self._last_phase or now - self._last_progress >= 0.08:
+        # Phase changes can occur several times per tiny copied file
+        # (copy/verify/copied).  Treat the event stream as one visual timeline
+        # and coalesce it by time; otherwise phase transitions bypass the
+        # throttle and flood the GUI queue. Terminal state is never delayed.
+        if terminal or self._last_progress is None or now - self._last_progress >= 0.10:
             self._last_progress = now
             self._last_phase = event.phase
             self.progress.emit(event)

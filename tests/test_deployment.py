@@ -113,6 +113,30 @@ def test_successful_deployment_can_be_rolled_back_from_new_instance(layout):
     assert DeploymentEngine(state).get_batch(plan.batch_id).status == "rolled_back"
 
 
+def test_stage_has_no_redundant_per_file_target_hash_pass(layout, monkeypatch):
+    source, vault_a, _, state = layout
+    put(source, "one.txt", b"one")
+    put(source, "nested/two.txt", b"two")
+    engine = DeploymentEngine(state)
+    plan = engine.analyze(request_for(source, [("a", vault_a)]))
+    original_hash = deployment._hash_file
+    staged_hashes = []
+
+    def record(path, *args, **kwargs):
+        if ".stage" in str(path):
+            staged_hashes.append(os.path.basename(str(path)))
+        return original_hash(path, *args, **kwargs)
+
+    monkeypatch.setattr(deployment, "_hash_file", record)
+    result = engine.execute(plan)
+
+    assert result.success
+    # One pass establishes the prepared tree and one later pass revalidates it
+    # at the commit boundary. The removed implementation hashed each file once
+    # more immediately before the first whole-tree pass.
+    assert sorted(staged_hashes) == ["one.txt", "one.txt", "two.txt", "two.txt"]
+
+
 def test_finalize_from_new_instance_keeps_deployment_and_removes_only_backup(layout):
     source, vault_a, _, state = layout
     put(source, "new.txt", b"new")

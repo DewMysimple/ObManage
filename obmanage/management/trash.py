@@ -24,6 +24,7 @@ from pathlib import Path
 from threading import Event, Lock
 from typing import Callable, Iterable, Literal
 
+from ..copying import copy_stream_and_hash
 from ..models import SyncCancelled, SyncError
 from ..paths import assert_plain_chain, canonical, identity, native, snapshot
 
@@ -663,24 +664,21 @@ def _copy_file_verified(source: str, destination: str, expected: TrashEntry,
     before = _read_snapshot(source, "file")
     if before != expected.snapshot:
         raise TrashSafetyError(f"复制前文件已改变：{source}")
-    digest = hashlib.sha256()
-    completed = 0
     try:
         with open(native(source), "rb", buffering=0) as src, open(native(destination), "xb", buffering=0) as dst:
-            while True:
-                _check_cancel(cancel)
-                block = src.read(HASH_CHUNK_SIZE)
-                if not block:
-                    break
-                dst.write(block)
-                digest.update(block)
-                completed += len(block)
+            def report(completed_bytes: int) -> None:
                 _emit(progress, TrashProgress(
-                    phase, vault_root, expected.relative_path, completed, expected.size
+                    phase, vault_root, expected.relative_path, completed_bytes, expected.size
                 ))
-            dst.flush()
-            os.fsync(dst.fileno())
-        if completed != expected.snapshot.size or digest.hexdigest() != expected.sha256:
+
+            completed, digest = copy_stream_and_hash(
+                src,
+                dst,
+                expected.snapshot.size,
+                check_cancel=lambda: _check_cancel(cancel),
+                progress=report,
+            )
+        if completed != expected.snapshot.size or digest != expected.sha256:
             raise TrashSafetyError(f"复制内容校验失败：{source}")
         if _read_snapshot(source, "file") != expected.snapshot:
             raise TrashSafetyError(f"复制期间文件已改变：{source}")

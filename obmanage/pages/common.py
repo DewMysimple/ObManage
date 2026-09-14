@@ -74,6 +74,7 @@ class FeaturePage(QWidget):
         self._global_busy = False
         self._external_recovery_pending = False
         self._task_kind = ""
+        self._status_kind = ""
         self.root_layout = QVBoxLayout(self)
         self.root_layout.setContentsMargins(22, 15, 22, 12)
         self.root_layout.setSpacing(10)
@@ -198,6 +199,9 @@ class FeaturePage(QWidget):
             "warning": "#B38749",
             "error": "#B66B5D",
         }
+        if self.status_label.text() == text and self._status_kind == kind:
+            return
+        self._status_kind = kind
         self.status_label.setText(text)
         self.status_label.setToolTip(text)
         self.status_dot.setStyleSheet(

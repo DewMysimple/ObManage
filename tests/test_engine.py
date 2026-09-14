@@ -119,6 +119,50 @@ def test_first_mirror_preserves_hidden_files_and_empty_directories(mirror):
     assert (target / "空目录/仍然为空").is_dir()
 
 
+def test_copy_progress_is_monotonic_across_write_and_verification(mirror):
+    engine, source, target = mirror
+    first = put(source, "first.bin", b"a" * 17)
+    second = put(source, "second.bin", b"b" * 32)
+    plan = analyze(engine, source, target)
+    events = []
+
+    result = engine.execute(plan, progress=events.append)
+
+    assert result.status == "success", result.errors
+    transfer = [
+        event for event in events
+        if event.phase in {"copy", "copied"} and event.total_bytes
+    ]
+    assert transfer
+    values = [event.completed_bytes for event in transfer]
+    assert values == sorted(values)
+    assert values[-1] == first.stat().st_size + second.stat().st_size
+    assert {event.total_bytes for event in transfer} == {values[-1]}
+    assert {event.message for event in transfer} == {"正在复制并校验"}
+
+
+def test_full_root_chain_checks_are_batched_during_small_file_copy(mirror, monkeypatch):
+    engine, source, target = mirror
+    for number in range(65):
+        put(source, f"small-{number:03d}.bin", b"data")
+    plan = analyze(engine, source, target)
+    real_revalidate = engine_module.revalidate_roots
+    calls = []
+    monkeypatch.setattr(engine_module.time, "monotonic", lambda: 100.0)
+
+    def counted(*args, **kwargs):
+        calls.append((args, kwargs))
+        return real_revalidate(*args, **kwargs)
+
+    monkeypatch.setattr(engine_module, "revalidate_roots", counted)
+    result = engine.execute(plan)
+
+    assert result.status == "success", result.errors
+    # The complete selected-volume/root check happens at phase barriers and at
+    # least every 16 files or 250 ms, rather than twice for every tiny file.
+    assert 4 <= len(calls) < 20
+
+
 def test_mirror_never_copies_or_deletes_deployment_recovery_directories(mirror):
     engine, source, target = mirror
     put(source, "note.md", b"active source")
