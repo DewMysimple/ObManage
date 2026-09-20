@@ -974,6 +974,33 @@ class SyncEngine:
                 continue
         return [item for item in deletions if _key(item.relative_path) not in recovered]
 
+    def _validate_plan(self, plan: SyncPlan, cancel: threading.Event | None,
+                       progress: ProgressCallback) -> None:
+        """Read-only preflight shared by single-vault and batch execution."""
+        _cancelled(cancel)
+        if not plan.can_execute or not plan.context.get("validated"):
+            raise SyncError("当前预览存在错误或不完整，请重新分析差异。")
+        context = plan.context
+        if ((plan.source, plan.target, plan.pair_id, plan.mode)
+                != (context["source"], context["target"], context["pair_id"], context["mode"])):
+            raise SyncError("预览路径已改变，请重新分析差异。")
+        self._check_state_location(plan.source, plan.target)
+        revalidate_roots(context)
+        if _scan(plan.source, cancel, progress, mode=plan.mode)[0] != context["source_entries"]:
+            raise SyncError("源目录在预览后发生变化，请重新分析差异。")
+        if _scan(plan.target, cancel, progress, mode=plan.mode)[0] != context["target_entries"]:
+            raise SyncError("目标目录在预览后发生变化，请重新分析差异。")
+
+    def validate_plan(self, plan: SyncPlan, *, cancel: threading.Event | None = None,
+                      progress: ProgressCallback = None) -> None:
+        """Validate a preview without creating targets, temps or changing baselines."""
+        if not self._lock.acquire(blocking=False):
+            raise SyncError("已有同步任务运行中。")
+        try:
+            self._validate_plan(plan, cancel, progress)
+        finally:
+            self._lock.release()
+
     def execute(self, plan: SyncPlan, *, allow_empty: bool = False,
                 cancel: threading.Event | None = None, progress: ProgressCallback = None) -> SyncResult:
         started = time.monotonic()
@@ -983,21 +1010,8 @@ class SyncEngine:
             return result
         store: BaselineStore | None = None
         try:
-            _cancelled(cancel)
-            if not plan.can_execute or not plan.context.get("validated"):
-                raise SyncError("当前预览存在错误或不完整，请重新分析差异。")
+            self._validate_plan(plan, cancel, progress)
             context = plan.context
-            if ((plan.source, plan.target, plan.pair_id, plan.mode)
-                    != (context["source"], context["target"], context["pair_id"], context["mode"])):
-                raise SyncError("预览路径已改变，请重新分析差异。")
-            self._check_state_location(plan.source, plan.target)
-            revalidate_roots(context)
-            if (_scan(plan.source, cancel, progress, mode=plan.mode)[0]
-                    != context["source_entries"]):
-                raise SyncError("源目录在预览后发生变化，请重新分析差异。")
-            if (_scan(plan.target, cancel, progress, mode=plan.mode)[0]
-                    != context["target_entries"]):
-                raise SyncError("目标目录在预览后发生变化，请重新分析差异。")
             deletions = [item for item in plan.items if item.action in ("delete", "rmdir")]
             if plan.source_empty and deletions and not allow_empty:
                 raise SyncError("源目录为空。清空目标前必须在界面手动确认。")

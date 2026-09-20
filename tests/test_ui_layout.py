@@ -211,6 +211,10 @@ def test_every_management_page_fits_width_and_bottom_actions_are_reachable(
     window.show()
     try:
         bottom_controls = {
+            "incremental": (
+                window.pages["incremental"].confirm_checkbox,
+                window.pages["incremental"].execute_button,
+            ),
             "vault_backup": (
                 window.pages["vault_backup"].confirm_checkbox,
                 window.pages["vault_backup"].execute_button,

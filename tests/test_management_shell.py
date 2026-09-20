@@ -21,6 +21,7 @@ from obmanage.management.deployment import (
 from obmanage.management.trash import TrashCleanupEngine
 from obmanage.models import PlanItem, SyncCancelled, SyncPlan
 from obmanage.pages.backup import VaultBackupPage
+from obmanage.pages.incremental import IncrementalPage
 from obmanage.pages.distribution import ObsidianConfigPage, TemplateSuitePage, TemplaterPage
 from obmanage.pages.registry import FEATURES
 from obmanage.pages.statistics import StatisticsPage
@@ -58,7 +59,7 @@ def dispose(app, window):
     QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
 
 
-def test_shell_registers_seven_pages_with_mirror_first(application, tmp_path):
+def test_shell_registers_eight_pages_with_mirror_first(application, tmp_path):
     window = MainWindow(tmp_path / "state")
     try:
         assert tuple(window.pages) == tuple(feature.key for feature in FEATURES)
@@ -67,6 +68,7 @@ def test_shell_registers_seven_pages_with_mirror_first(application, tmp_path):
         assert window.navigation_buttons["mirror"].isChecked()
         assert "仓库镜像" in window.windowTitle()
         assert isinstance(window.pages["vault_backup"], VaultBackupPage)
+        assert isinstance(window.pages["incremental"], IncrementalPage)
         assert isinstance(window.pages["statistics"], StatisticsPage)
         assert isinstance(window.pages["template_suite"], TemplateSuitePage)
         assert isinstance(window.pages["obsidian_config"], ObsidianConfigPage)

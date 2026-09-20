@@ -152,7 +152,7 @@ def _configured_repository_paths(state_dir: Path, *, preview: bool,
     for settings in document.features.values():
         if not isinstance(settings, dict):
             continue
-        for field in ("root", "source"):
+        for field in ("root", "source", "local_path", "portable_path"):
             value = settings.get(field)
             if isinstance(value, str) and value.strip():
                 paths.append(value)

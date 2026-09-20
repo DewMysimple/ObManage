@@ -63,6 +63,7 @@ from .settings import SettingsStore
 from .tasking import FeatureWorker
 from .pages.backup import VaultBackupPage
 from .pages.common import FeaturePage
+from .pages.incremental import IncrementalPage
 from .pages.distribution import ObsidianConfigPage, TemplateSuitePage, TemplaterPage
 from .pages.registry import FEATURES
 from .pages.statistics import StatisticsPage
@@ -916,7 +917,14 @@ class MainWindow(QMainWindow):
             "templater": TemplaterPage,
         }
         for feature in FEATURES[1:]:
-            if feature.key == "vault_backup":
+            if feature.key == "incremental":
+                page = IncrementalPage(
+                    self.state_dir,
+                    self.settings_document.features.get(feature.key, {}),
+                    self.settings.local_path,
+                    self.settings.portable_path,
+                )
+            elif feature.key == "vault_backup":
                 page = VaultBackupPage(
                     self.state_dir,
                     self.settings_document.features.get(feature.key, {}),

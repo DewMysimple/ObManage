@@ -3,7 +3,7 @@ type: moc
 status: active
 kind: process
 importance: high
-updated: 2026-09-14
+updated: 2026-09-20
 topic: work-log-index
 source_logs: []
 supersedes: null
@@ -15,6 +15,7 @@ supersedes: null
 
 | 时间 | 类型 | 目标 | 状态 | 主题 | 日志 |
 | --- | --- | --- | --- | --- | --- |
+| 2026-09-20 | feature | - | archived | per-vault-incremental-workbench | [2026-09-20｜逐仓库方向增量工作台](./2026-09-20-逐仓库方向增量工作台.md) |
 | 2026-09-14 | feature | - | archived | verified-copy-throughput-optimization | [2026-09-14｜验证复制吞吐优化](./2026-09-14-验证复制吞吐优化.md) |
 | 2026-09-14 | feature | - | archived | bounded-verified-copy-pipeline | [2026-09-14｜有界验证复制流水线](./2026-09-14-有界验证复制流水线.md) |
 | 2026-09-14 | feature | - | archived | no-video-vault-backup-feature | [排除视频的仓库备份](./2026-09-14-排除视频的仓库备份.md) |

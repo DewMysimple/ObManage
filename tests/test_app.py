@@ -96,3 +96,21 @@ def test_preview_closes_logging_handle_before_return(tmp_path, capsys):
     moved = state_dir / "closed.log"
     log_path.replace(moved)
     assert moved.is_file()
+
+
+def test_startup_checks_incremental_endpoints_before_creating_logs(tmp_path, monkeypatch):
+    from obmanage import app as app_module
+    from obmanage.settings import SettingsDocument, SettingsStore
+
+    collection = tmp_path / "collection"
+    state = collection / "state"
+    document = SettingsDocument(features={"incremental": {
+        "local_path": str(collection), "portable_path": str(tmp_path / "portable"),
+    }})
+    SettingsStore(state).save_document(document)
+    before = {path.relative_to(state): path.read_bytes() for path in state.rglob("*") if path.is_file()}
+    messages = []
+    monkeypatch.setattr(app_module, "_report_startup_rejection", lambda message, **kwargs: messages.append(message))
+    assert main(["--state-dir", str(state)]) == 2
+    assert "程序数据目录" in messages[0]
+    assert {path.relative_to(state): path.read_bytes() for path in state.rglob("*") if path.is_file()} == before

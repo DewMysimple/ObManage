@@ -14,6 +14,7 @@ class FeatureDescriptor:
 # Static registration keeps every page discoverable in a frozen PyInstaller build.
 FEATURES = (
     FeatureDescriptor("mirror", "仓库镜像", "仓库镜像", "本机与移动硬盘之间的增量镜像"),
+    FeatureDescriptor("incremental", "仓库增量处理", "仓库增量处理", "逐仓库选择来源，在两端按所选方向更新"),
     FeatureDescriptor("vault_backup", "仓库备份", "仓库备份", "双向同步除视频之外的仓库内容"),
     FeatureDescriptor("statistics", "仓库统计", "仓库统计", "统计容量、文件类型、Markdown 和字符"),
     FeatureDescriptor("template_suite", "模板套件部署", "模板套件", "把选定模板组件安全部署到仓库"),

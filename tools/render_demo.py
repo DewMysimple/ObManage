@@ -16,6 +16,7 @@ from PySide6.QtWidgets import QApplication
 
 from obmanage.engine import SYNC_MODE_NO_VIDEO
 from obmanage.models import PlanItem, SyncPlan
+from obmanage.management.incremental import IncrementalAnalysis, VaultPair
 from obmanage.pages.registry import FEATURES
 from obmanage.settings import AppSettings, SettingsStore
 from obmanage.ui import MainWindow
@@ -60,6 +61,31 @@ def main() -> None:
         ]
         if args.page == "mirror":
             window._accept_plan(SyncPlan(settings.source, settings.target, items), scheduled=False)
+        elif args.page == "incremental":
+            page = window.pages["incremental"]
+            local, portable = r"C:\Obsidian\仓库集合", r"H:\ObsidianVault\仓库集合"
+            page.local_picker.set_value(local)
+            page.portable_picker.set_value(portable)
+            pairs = []
+            for key, label in (("a", "工作/A仓库"), ("b", "学习/B仓库"), ("c", "资料/C仓库")):
+                left, right = str(Path(local) / label), str(Path(portable) / label)
+                forward = SyncPlan(left, right, [
+                    PlanItem("add", "笔记/电脑新稿.md", 4380, "目标中不存在"),
+                    PlanItem("update", "笔记/项目进度.md", 15280, "内容不同，以源端为准"),
+                    PlanItem("delete", "归档/旧草稿.md", 2100, "源端已不存在"),
+                ])
+                backward = SyncPlan(right, left, [
+                    PlanItem("add", "归档/旧草稿.md", 2100, "目标中不存在"),
+                    PlanItem("update", "笔记/项目进度.md", 19480, "内容不同，以源端为准"),
+                    PlanItem("delete", "笔记/电脑新稿.md", 4380, "源端已不存在"),
+                ])
+                pairs.append(VaultPair(key, label, left, right, forward, backward))
+            page._accept_analysis(IncrementalAnalysis(local, portable, tuple(pairs), 6))
+            for key, side in (("a", "portable"), ("b", "local")):
+                selector = page.source_selectors[key]
+                selector.setCurrentIndex(selector.findData(side))
+            page.vault_table.selectRow(0)
+            window._show_page(args.page, persist=False)
         elif args.page == "vault_backup":
             page = window.pages["vault_backup"]
             page.local_picker.set_value(r"C:\Obsidian\ObsidianTest")
@@ -106,8 +132,8 @@ def main() -> None:
         table = (
             window.table
             if args.page == "mirror"
-            else window.pages["vault_backup"].table
-            if args.page == "vault_backup"
+            else window.pages[args.page].table
+            if args.page in {"vault_backup", "incremental"}
             else None
         )
         details = (

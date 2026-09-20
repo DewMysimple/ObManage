@@ -101,7 +101,7 @@ def test_shell_registers_backup_page_with_requested_laptop_default(application, 
     window = MainWindow(tmp_path / "state")
     try:
         keys = tuple(window.pages)
-        assert keys[:3] == ("mirror", "vault_backup", "statistics")
+        assert keys[:4] == ("mirror", "incremental", "vault_backup", "statistics")
         page = window.pages["vault_backup"]
         assert isinstance(page, VaultBackupPage)
         assert Path(page.local_picker.value) == Path.home() / "Desktop" / "ObsidianTest"
