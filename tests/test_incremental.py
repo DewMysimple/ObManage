@@ -163,6 +163,9 @@ def test_stale_later_preview_blocks_all_writes(collections, side):
     assert result.status == "failed"
     assert result.outcomes == []
     assert (tree(local), tree(portable)) == before
+    assert "执行前复核失败，仓库 B" in result.errors[0]
+    assert "x.md" in result.errors[0]
+    assert ("源端" if side == "local" else "目标端") in result.errors[0]
 
 
 def test_nested_selection_cannot_overwrite_another_selected_source(collections):

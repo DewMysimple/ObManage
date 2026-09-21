@@ -82,6 +82,35 @@ def _key(relative: str) -> str:
     return os.path.normcase(relative)
 
 
+def _require_manifest(expected: dict[str, dict], current: dict[str, dict], *,
+                      root: str, side: str, message: str) -> None:
+    """Explain the exact failed snapshot comparison without rereading or relaxing it."""
+    if current == expected:
+        return
+    changed = sorted(path for path in expected.keys() | current.keys()
+                     if expected.get(path) != current.get(path))
+    labels = {"kind": "类型", "size": "大小（字节）", "mtime_ns": "修改时间（纳秒）",
+              "ctime_ns": "ctime（纳秒）", "inode": "文件标识", "device": "设备标识"}
+    details = []
+    for path in changed[:8]:
+        old, new = expected.get(path), current.get(path)
+        if old is None:
+            reason = "新增"
+        elif new is None:
+            reason = "消失或改名"
+        else:
+            reason = "；".join(
+                f"{labels.get(field, field)} {old.get(field)} → {new.get(field)}"
+                for field in sorted(old.keys() | new.keys()) if old.get(field) != new.get(field))
+        # Quote control characters so filenames cannot forge extra log records.
+        details.append(f"{json.dumps(path, ensure_ascii=False)}：{reason}")
+    omitted = f"；另有 {len(changed) - 8} 项未列出" if len(changed) > 8 else ""
+    raise SyncError(
+        f"{message} {side}根目录 {json.dumps(root, ensure_ascii=False)}；"
+        f"检测到 {len(changed)} 项快照变化：" + " | ".join(details) + omitted
+        + "。这是路径或元数据变化，不代表已确认正文变化；请停止相关编辑或自动写入后重新扫描。")
+
+
 def _scan(root: str, cancel: threading.Event | None, progress: ProgressCallback, *,
           mode: str = SYNC_MODE_MIRROR) -> tuple[dict[str, dict], dict[str, dict]]:
     if mode not in _SYNC_MODES:
@@ -606,9 +635,11 @@ class SyncEngine:
             revalidate_roots(context)
             # A manifest scan is metadata-only, including for large unchanged
             # videos. It makes a preview generated during a write fail closed.
-            if (_scan(plan.source, cancel, None, mode=mode)[0] != source_entries
-                    or _scan(plan.target, cancel, None, mode=mode)[0] != target_entries):
-                raise SyncError("分析期间目录内容发生变化，请重新分析差异。")
+            for side, root, entries in (("源端", plan.source, source_entries),
+                                        ("目标端", plan.target, target_entries)):
+                _require_manifest(entries, _scan(root, cancel, None, mode=mode)[0],
+                                  root=root, side=side,
+                                  message="分析期间目录内容发生变化，请重新分析差异。")
             context["validated"] = True
             _emit(progress, "done", message="差异分析完成", completed_files=total, total_files=total)
         except SyncCancelled:
@@ -1084,10 +1115,12 @@ class SyncEngine:
             raise SyncError("预览路径已改变，请重新分析差异。")
         self._check_state_location(plan.source, plan.target)
         revalidate_roots(context)
-        if _scan(plan.source, cancel, progress, mode=plan.mode)[0] != context["source_entries"]:
-            raise SyncError("源目录在预览后发生变化，请重新分析差异。")
-        if _scan(plan.target, cancel, progress, mode=plan.mode)[0] != context["target_entries"]:
-            raise SyncError("目标目录在预览后发生变化，请重新分析差异。")
+        for key, side, label in (("source", "源端", "源"), ("target", "目标端", "目标")):
+            root = getattr(plan, key)
+            _require_manifest(context[key + "_entries"],
+                              _scan(root, cancel, progress, mode=plan.mode)[0],
+                              root=root, side=side,
+                              message=f"{label}目录在预览后发生变化，请重新分析差异。")
 
     def validate_plan(self, plan: SyncPlan, *, cancel: threading.Event | None = None,
                       progress: ProgressCallback = None) -> None:
@@ -1255,9 +1288,10 @@ class SyncEngine:
             # No deletion at all unless all writes succeeded and the entire
             # source is still exactly the snapshot that was previewed.
             root_checkpoint(True)
-            if (_scan(plan.source, cancel, progress, mode=plan.mode)[0]
-                    != context["source_entries"]):
-                raise SyncError("源目录在同步期间发生变化，已停止删除；请重新分析差异。")
+            _require_manifest(context["source_entries"],
+                              _scan(plan.source, cancel, progress, mode=plan.mode)[0],
+                              root=plan.source, side="源端",
+                              message="源目录在同步期间发生变化，已停止删除；请重新分析差异。")
             self._verify_target(plan, expected_targets, cancel)
             if deletions:
                 for item in sorted(
@@ -1306,9 +1340,10 @@ class SyncEngine:
                     )
                 _cancelled(cancel)
                 revalidate_roots(context, target_root=target_root)
-                if (_scan(plan.source, cancel, None, mode=plan.mode)[0]
-                        != context["source_entries"]):
-                    raise SyncError("同步结束时源目录发生变化，本次仅部分完成，请重新分析差异。")
+                _require_manifest(context["source_entries"],
+                                  _scan(plan.source, cancel, None, mode=plan.mode)[0],
+                                  root=plan.source, side="源端",
+                                  message="同步结束时源目录发生变化，本次仅部分完成，请重新分析差异。")
                 self._verify_target(plan, expected_targets, cancel)
             result.status = "success"
             _emit(progress, "done", message="镜像同步完成", completed_bytes=result.copied_bytes,

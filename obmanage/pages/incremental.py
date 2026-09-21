@@ -324,22 +324,28 @@ class IncrementalPage(FeaturePage):
                             self.message_logged.emit(f"{pair.relative_path}：{text}；实际复制 {format_bytes(result.copied_bytes)}。")
                         elif pair.key in self.choices:
                             self.vault_table.item(row, 3).setText("未执行")
+                            self.vault_table.item(row, 3).setToolTip("\n".join(payload.errors))
                 completed = sum(item.result.status == "success" for item in payload.outcomes)
                 summary = (f"完成 {completed}/{len(self.choices)} 个仓库；"
                            + ("请重新扫描核对。" if payload.status == "success"
-                              else "任务已停止，已完成部分保留；请重新扫描。"))
+                              else "执行前已停止，本批尚未写入任何仓库；请重新扫描。"
+                              if not payload.outcomes
+                              else "执行中已停止，可能已有部分修改；请重新扫描。"))
                 if payload.errors:
-                    summary += " " + payload.errors[0]
-                self.set_status(summary, "success" if payload.status == "success" else "warning")
+                    summary += " " + " | ".join(payload.errors)
+                self.set_status(summary if len(summary) <= 200 else summary[:200] + "…（完整诊断见悬停或操作日志）",
+                                "success" if payload.status == "success" else "warning")
+                self.status_label.setToolTip(summary)
+                self.message_logged.emit(summary)
             else:
                 self.set_status("任务已停止，可能已有部分修改；请重新扫描。 " + str(payload or ""), "error")
+                self.message_logged.emit(self.status_label.text())
             # Keep the preview as an execution record, but revoke all write authority.
             self.choices.clear()
             self.confirm_checkbox.setChecked(False)
             for selector in self.source_selectors.values():
                 selector.setEnabled(False)
             self.analysis = None
-            self.message_logged.emit(self.status_label.text())
         self._task_kind = ""
         self.refresh_actions()
 

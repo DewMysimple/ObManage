@@ -217,7 +217,10 @@ class IncrementalEngine:
                 _cancelled(cancel)
                 if progress:
                     progress(Progress("preflight", f"执行前复核：{pair.relative_path}"))
-                engine.validate_plan(plan, cancel=cancel)
+                try:
+                    engine.validate_plan(plan, cancel=cancel)
+                except (OSError, SyncError, ValueError) as exc:
+                    raise SyncError(f"执行前复核失败，仓库 {pair.relative_path}：{exc}") from exc
                 if (plan.source_empty and any(item.action in {"delete", "rmdir"}
                                               for item in plan.items) and not allow_empty):
                     raise SyncError("来源为空，清空目标前需要额外确认。")

@@ -121,6 +121,49 @@ def test_deep_mode_is_explicit_and_invalidates_old_plan(application, prepared):
 
 
 @pytest.mark.parametrize("size", [(980, 620), (1140, 920), (2560, 1440)])
+def test_stale_preflight_is_zero_write_and_full_diagnostics_are_logged(application, prepared, size):
+    window, page, local, portable = prepared
+    page._accept_analysis(IncrementalEngine(window.state_dir).analyze(str(local), str(portable)))
+    choose(page, "a", "portable")
+    (portable / "A/note.md").write_bytes(b"changed after preview")
+    before = tree(local), tree(portable)
+    messages = []
+    page.message_logged.connect(messages.append)
+    page.confirm_checkbox.setChecked(True)
+    page.execute_button.click()
+    wait_until(application, lambda: not window.busy)
+    assert page.last_result.status == "failed" and not page.last_result.outcomes
+    assert "本批尚未写入任何仓库" in page.status_label.text()
+    assert "仓库 A" in page.status_label.toolTip()
+    assert "note.md" in page.status_label.toolTip()
+    assert "大小（字节）" in messages[-1]
+    assert "note.md" in page.vault_table.item(0, 3).toolTip()
+    assert messages[-1] in (window.state_dir / "ui.log").read_text(encoding="utf-8")
+    assert (tree(local), tree(portable)) == before
+    window.resize(*size)
+    window.show()
+    settle(application)
+    assert window.page_containers["incremental"].horizontalScrollBar().maximum() == 0
+    assert page.analysis is None and not page.execute_button.isEnabled()
+
+
+def test_partial_execution_never_claims_zero_writes(application, prepared):
+    from obmanage.management.incremental import IncrementalResult, VaultOutcome
+    from obmanage.models import SyncResult
+    window, page, local, portable = prepared
+    page._accept_analysis(IncrementalEngine(window.state_dir).analyze(str(local), str(portable)))
+    choose(page, "a", "portable")
+    page._task_kind = "execute"
+    page.task_finished("ok", IncrementalResult(
+        status="failed", outcomes=[VaultOutcome("a", str(portable / "A"), str(local / "A"),
+                                                SyncResult("failed", copied_files=1))],
+        errors=["仓库 A：执行中断"],
+    ))
+    assert "执行中已停止，可能已有部分修改" in page.status_label.text()
+    assert "尚未写入" not in page.status_label.toolTip()
+
+
+@pytest.mark.parametrize("size", [(980, 620), (1140, 920), (2560, 1440)])
 def test_populated_tables_and_bottom_actions_fit(application, prepared, size):
     window, page, local, portable = prepared
     analysis = IncrementalEngine(window.state_dir).analyze(str(local), str(portable))
