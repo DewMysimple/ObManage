@@ -15,6 +15,7 @@ import stat
 import tempfile
 import threading
 import time
+import uuid
 from concurrent.futures import FIRST_EXCEPTION, Future, ThreadPoolExecutor, TimeoutError, wait
 from dataclasses import dataclass
 from pathlib import Path
@@ -205,12 +206,15 @@ def _hash_file(path: str, expected: dict, cancel: threading.Event | None,
     _require_state(path, expected, "校验前文件已改变")
     digest = hashlib.sha256()
     read_bytes = 0
+    # A fixed 4 MiB read allocates multi-megabyte objects even for tiny JSON/MD
+    # files. Bound allocation by file size while still reading through EOF.
+    block_size = min(CHUNK_SIZE, max(1, expected["size"]))
     with open(native(path), "rb") as stream:
         opened = os.fstat(stream.fileno())
         if (opened.st_ino, opened.st_dev, opened.st_size, opened.st_mtime_ns) != (
                 expected["inode"], expected["device"], expected["size"], expected["mtime_ns"]):
             raise SyncError(f"打开文件时内容已改变：{relative_path}")
-        while chunk := stream.read(CHUNK_SIZE):
+        while chunk := stream.read(block_size):
             _cancelled(cancel)
             digest.update(chunk)
             read_bytes += len(chunk)
@@ -620,6 +624,59 @@ class SyncEngine:
             self._lock.release()
         return plan
 
+    def analyze_pair(self, source: str, target: str, *, deep: bool = False,
+                     cancel: threading.Event | None = None,
+                     progress: ProgressCallback = None) -> tuple[SyncPlan, SyncPlan]:
+        """Build both mirror directions from one verified comparison epoch.
+
+        Equality and inequality are symmetric. Reversing the manifests and
+        operations needs neither a second tree walk nor a second content read.
+        Both plans retain independent root bindings and execution preflights.
+        """
+        forward = self.analyze(source, target, deep=deep, cancel=cancel, progress=progress)
+        backward = SyncPlan(forward.target, forward.source)
+        if forward.errors:
+            backward.errors = list(forward.errors)
+            return forward, backward
+        _cancelled(cancel)
+        context = validate_roots(backward.source, backward.target)
+        revalidate_roots(forward.context)
+        # analyze_pair is for two existing vaults, never a missing source.
+        if (identity(context["source_root"]) != identity(forward.context["target_root"])
+                or identity(context["target_root"]) != identity(forward.context["source_root"])):
+            raise SyncError("仓库在生成反向预览时改变，请重新扫描。")
+        context.update(base_pair_id=context["pair_id"],
+                       base_reverse_pair_id=context["reverse_pair_id"], mode=SYNC_MODE_MIRROR)
+        source_entries = forward.context["target_entries"]
+        target_entries = forward.context["source_entries"]
+        target_names = {_key(path): path for path in target_entries}
+        context.update(source_entries=source_entries, target_entries=target_entries,
+                       target_names=target_names, protected_target_directories=set(), validated=True)
+        backward.context = context
+        backward.pair_id = context["pair_id"]
+        backward.source_empty = not source_entries
+        comparison = {_key(item.relative_path): item for item in forward.items
+                      if item.action in ("skip", "update")}
+        source_keys = {_key(path) for path in source_entries}
+        for relative, src in sorted(source_entries.items()):
+            _cancelled(cancel)
+            target_name = target_names.get(_key(relative))
+            dst = target_entries.get(target_name)
+            if dst is None:
+                backward.items.append(PlanItem("mkdir" if src["kind"] == "dir" else "add",
+                                               relative, src["size"], "目标中不存在"))
+                continue
+            if os.name == "nt" and relative.rsplit("/", 1)[-1] != target_name.rsplit("/", 1)[-1]:
+                backward.items.append(PlanItem("rename", relative, reason="统一文件名大小写，无需复制内容"))
+            if src["kind"] == "file":
+                item = comparison[_key(relative)]
+                backward.items.append(PlanItem(item.action, relative, src["size"], item.reason))
+        for relative, dst in sorted(target_entries.items()):
+            if _key(relative) not in source_keys:
+                backward.items.append(PlanItem("rmdir" if dst["kind"] == "dir" else "delete",
+                                               relative, dst["size"], "源端已不存在"))
+        return forward, backward
+
     def _target_expected(self, plan: SyncPlan, relative: str) -> dict | None:
         if hasattr(self, "_execution_target_states"):
             return self._execution_target_states.get(_key(relative))
@@ -931,6 +988,47 @@ class SyncEngine:
             _require_state(old_path, state, "重命名前目标文件已改变")
             _require_state(new_path, state, "重命名前目标文件已改变")
         os.rename(native(old_path), native(new_path))
+        # exFAT can report success for a case-only rename while preserving the
+        # old spelling. Use a unique sibling only when enumeration proves that
+        # happened; never delete/replace the original to achieve a name change.
+        parent = os.path.dirname(new_path)
+        desired = os.path.basename(new_path)
+        with os.scandir(native(parent)) as entries:
+            exact = any(entry.name == desired for entry in entries)
+        if not exact:
+            _require_state(old_path, state, "大小写改名前目标项目已改变")
+            # exFAT derives IDs from directory-entry positions. A longer name
+            # may relocate that entry, so keep the hop no longer than the old
+            # leaf (also no longer in UTF-16 units) and require stable identity.
+            temporary = ""
+            for _ in range(64):
+                candidate = os.path.join(parent, uuid.uuid4().hex[:min(12, len(os.path.basename(old_path)))])
+                if snapshot(candidate) is None:
+                    temporary = candidate
+                    break
+            if not temporary:
+                raise SyncError("大小写改名临时路径已被占用，请重新分析。")
+            os.rename(native(old_path), native(temporary))
+            try:
+                if identity(snapshot(temporary)) != identity(state):
+                    raise SyncError("大小写改名期间目标身份已改变")
+                revalidate_roots(plan.context, target_root=target_root)
+                assert_plain_chain(parent)
+                if snapshot(new_path) is not None:
+                    raise SyncError("大小写改名期间目标名称被其他程序占用")
+                os.rename(native(temporary), native(new_path))
+            except (OSError, SyncError) as exc:
+                # No cancellation point between the two moves. On failure,
+                # restore only our still-identical object into a vacant name.
+                try:
+                    revalidate_roots(plan.context, target_root=target_root)
+                    assert_plain_chain(parent)
+                    if (identity(snapshot(temporary)) == identity(state)
+                            and snapshot(old_path) is None):
+                        os.rename(native(temporary), native(old_path))
+                except (OSError, SyncError):
+                    pass
+                raise SyncError(f"大小写改名未完成：{relative}；请检查原位置及 {temporary}。{exc}") from exc
         after = snapshot(new_path)
         if identity(after) != identity(state) or (state["kind"] == "file" and
                 (after["size"], after["mtime_ns"]) != (state["size"], state["mtime_ns"])):

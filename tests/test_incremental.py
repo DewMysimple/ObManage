@@ -89,10 +89,37 @@ def test_content_comparison_ignores_timestamps_and_old_baselines(collections):
     stamp = path.stat()
     path.write_bytes(b"diff")
     os.utime(path, ns=(stamp.st_atime_ns, stamp.st_mtime_ns))
-    analysis = engine.analyze(str(local), str(portable))
+    analysis = engine.analyze(str(local), str(portable), deep=True)
     assert len(analysis.pairs) == 1
     assert analysis.pairs[0].local_plan.counts["update"] == 1
     assert analysis.pairs[0].portable_plan.counts["update"] == 1
+
+
+def test_warm_scan_reuses_equality_and_compares_changed_files(collections, monkeypatch):
+    import obmanage.engine as implementation
+    local, portable, engine = collections
+    for root in (local, portable):
+        vault(root, "A", {"same.mp4": b"video", "change.md": b"old"})
+    assert engine.analyze(str(local), str(portable)).identical_count == 1
+    original = implementation._hash_pair
+    calls = []
+    def counted(*args, **kwargs):
+        calls.append(args[6])
+        return original(*args, **kwargs)
+    monkeypatch.setattr(implementation, "_hash_pair", counted)
+    assert engine.analyze(str(local), str(portable)).identical_count == 1
+    assert calls == []
+    path = local / "A/change.md"
+    path.write_bytes(b"new")
+    stamp = path.stat()
+    os.utime(path, ns=(stamp.st_atime_ns, stamp.st_mtime_ns + 2_000_000_000))
+    analysis = engine.analyze(str(local), str(portable))
+    assert calls == ["change.md"]  # mismatch is not hashed again for reverse
+    assert analysis.pairs[0].local_plan.counts["update"] == 1
+    assert analysis.pairs[0].portable_plan.counts["update"] == 1
+    calls.clear()
+    engine.analyze(str(local), str(portable), deep=True)
+    assert sorted(calls) == ["change.md", "same.mp4"]
 
 
 def test_relative_paths_pair_duplicate_names_and_missing_vaults(collections):

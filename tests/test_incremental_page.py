@@ -102,6 +102,24 @@ def test_path_changes_and_recovery_gate_revoke_execution(application, prepared):
     assert not page.execute_button.isEnabled()
 
 
+def test_deep_mode_is_explicit_and_invalidates_old_plan(application, prepared):
+    window, page, local, portable = prepared
+    assert not page.deep_checkbox.isChecked()
+    page._start_scan()
+    wait_until(application, lambda: not window.busy)
+    assert not page.analysis.deep
+    choose(page, "a", "portable")
+    page.confirm_checkbox.setChecked(True)
+    page.deep_checkbox.setChecked(True)
+    assert page.analysis is None
+    assert not page.confirm_checkbox.isChecked()
+    page._start_scan()
+    assert not page.deep_checkbox.isEnabled()
+    wait_until(application, lambda: not window.busy)
+    assert page.analysis.deep
+    assert "完整校验" in page.summary_label.text()
+
+
 @pytest.mark.parametrize("size", [(980, 620), (1140, 920), (2560, 1440)])
 def test_populated_tables_and_bottom_actions_fit(application, prepared, size):
     window, page, local, portable = prepared

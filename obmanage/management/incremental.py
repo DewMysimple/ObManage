@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import threading
+import time
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Mapping
@@ -52,6 +53,8 @@ class IncrementalAnalysis:
     identical_count: int = 0
     issues: tuple[str, ...] = ()
     context: dict = field(default_factory=dict, repr=False)
+    duration_seconds: float = 0.0
+    deep: bool = False
 
 
 @dataclass(frozen=True)
@@ -109,12 +112,13 @@ class IncrementalEngine:
     def __init__(self, state_dir: str | Path):
         self.state_dir = Path(state_dir)
 
-    def analyze(self, local_root: str, portable_root: str, *,
+    def analyze(self, local_root: str, portable_root: str, *, deep: bool = False,
                 cancel: threading.Event | None = None,
                 progress: ProgressCallback = None) -> IncrementalAnalysis:
         if not _TASK_LOCK.acquire(blocking=False):
             raise SyncError("已有仓库增量任务运行中。")
         try:
+            started = time.monotonic()
             _cancelled(cancel)
             context = validate_roots(local_root, portable_root)
             if context["target_root"] is None:
@@ -138,7 +142,8 @@ class IncrementalEngine:
             engine = SyncEngine(self.state_dir)
             pairs = []
             identical = 0
-            for key in sorted(indexed[0].keys() | indexed[1].keys()):
+            keys = sorted(indexed[0].keys() | indexed[1].keys())
+            for index, key in enumerate(keys):
                 _cancelled(cancel)
                 local, portable = indexed[0].get(key), indexed[1].get(key)
                 relative = (local or portable)[0]
@@ -152,24 +157,20 @@ class IncrementalEngine:
                     if entry is None and snapshot(path) is not None:
                         errors.append(f"对应位置已存在但不是已发现的仓库：{path}")
                 plans: dict[str, SyncPlan] = {}
+                def report(event: Progress) -> None:
+                    if progress:
+                        progress(replace(event, phase="incremental_scan",
+                                         message=f"{index + 1}/{len(keys)} · {relative} · {event.message}"))
                 if not errors:
-                    for side, present, source, target in (
-                        ("local", local, local_path, portable_path),
-                        ("portable", portable, portable_path, local_path),
-                    ):
-                        if present is None:
-                            continue
-
-                        def report(event: Progress) -> None:
-                            if progress:
-                                progress(replace(event, phase="incremental_scan",
-                                                 message=f"{relative} · {event.message}"))
-
-                        # Always establish equality from content, not timestamps.
-                        # The reverse pass may reuse equality proven in this pass.
-                        plan = engine.analyze(source, target, deep=not plans,
-                                              cancel=cancel, progress=report)
-                        plans[side] = plan
+                    if local and portable:
+                        plans["local"], plans["portable"] = engine.analyze_pair(
+                            local_path, portable_path, deep=deep, cancel=cancel, progress=report)
+                    else:
+                        side, source, target = (("local", local_path, portable_path) if local
+                                                else ("portable", portable_path, local_path))
+                        plans[side] = engine.analyze(source, target, deep=deep,
+                                                     cancel=cancel, progress=report)
+                    for plan in plans.values():
                         errors.extend(plan.errors)
                 pair = VaultPair(key, relative, local_path, portable_path,
                                  plans.get("local"), plans.get("portable"), tuple(errors))
@@ -179,7 +180,7 @@ class IncrementalEngine:
                     identical += 1
             revalidate_roots(context)
             return IncrementalAnalysis(local_root, portable_root, tuple(pairs), identical,
-                                       tuple(issues), context)
+                                       tuple(issues), context, time.monotonic() - started, deep)
         finally:
             _TASK_LOCK.release()
 
@@ -242,7 +243,7 @@ class IncrementalEngine:
                 result.outcomes.append(VaultOutcome(pair.key, plan.source, plan.target, outcome))
                 if outcome.status != "success":
                     result.status = outcome.status
-                    result.errors.extend(outcome.errors)
+                    result.errors.extend(f"{pair.relative_path}：{error}" for error in outcome.errors)
                     return result
                 completed_bytes += outcome.copied_bytes
             result.status = "success"

@@ -47,6 +47,10 @@ class IncrementalPage(FeaturePage):
         hint.setWordWrap(True)
         actions.addWidget(hint, 1)
         inputs.addLayout(actions)
+        self.deep_checkbox = QCheckBox("完整内容校验（重新读取全部文件，较慢）")
+        self.deep_checkbox.setToolTip("默认快速扫描复用已校验且两端快照未变的记录；首次或变化文件仍做 SHA-256。\n"
+                                     "若怀疑静默损坏或修改后元数据未变，请勾选完整内容校验。")
+        inputs.addWidget(self.deep_checkbox)
 
         _, vaults = panel(self.body)
         self.summary_label = QLabel("选择两端集合目录后扫描；程序不判断哪一端更新。")
@@ -110,6 +114,7 @@ class IncrementalPage(FeaturePage):
         self.local_picker.changed.connect(self._inputs_changed)
         self.portable_picker.changed.connect(self._inputs_changed)
         self.analyze_button.clicked.connect(self._start_scan)
+        self.deep_checkbox.toggled.connect(self._scan_mode_changed)
         self.execute_button.clicked.connect(self._start_execute)
         self.cancel_button.clicked.connect(self.cancel_requested)
         self.confirm_checkbox.toggled.connect(self.refresh_actions)
@@ -160,10 +165,15 @@ class IncrementalPage(FeaturePage):
             return
         self._clear_analysis()
         state = self.state_dir
+        deep = self.deep_checkbox.isChecked()
         self.start_task("scan", lambda cancel, progress: IncrementalEngine(state).analyze(
-            local, portable, cancel=cancel, progress=progress))
+            local, portable, deep=deep, cancel=cancel, progress=progress))
         if self._task_active:
-            self.message_logged.emit("开始扫描对应仓库差异；两端仓库只读取。")
+            self.message_logged.emit(f"开始{'完整内容校验' if deep else '快速扫描'}对应仓库差异；两端仓库只读取。")
+
+    def _scan_mode_changed(self) -> None:
+        self._clear_analysis()
+        self.set_status("扫描模式已改变，请重新扫描。")
 
     def _accept_analysis(self, analysis: IncrementalAnalysis) -> None:
         self._clear_analysis()
@@ -202,7 +212,8 @@ class IncrementalPage(FeaturePage):
             self.vault_table.setCellWidget(row, 2, selector)
             selector.currentIndexChanged.connect(lambda _index, key=pair.key: self._choice_changed(key))
         self.summary_label.setText(
-            f"待查看 {len(analysis.pairs)} 个仓库；已隐藏 {analysis.identical_count} 个完全一致的仓库。"
+            f"待查看 {len(analysis.pairs)} 个仓库；已隐藏 {analysis.identical_count} 个一致仓库。"
+            f"{'完整校验' if analysis.deep else '快速扫描'}耗时 {analysis.duration_seconds:.1f} 秒。"
         )
         issues = [*analysis.issues, *(error for pair in analysis.pairs for error in pair.errors)]
         self.issues_label.setText("\n".join(issues))
@@ -290,8 +301,8 @@ class IncrementalPage(FeaturePage):
             analysis, choices, allow_empty=bool(empty), cancel=cancel, progress=progress))
         if self._task_active:
             for pair, plan in selected:
-                self.message_logged.emit(f"仓库增量更新 {pair.relative_path}：{plan.source} → {plan.target}；"
-                                         f"复制 {format_bytes(plan.bytes_to_copy)}。")
+                self.message_logged.emit(f"计划更新（尚未完成） {pair.relative_path}：{plan.source} → {plan.target}；"
+                                         f"预计复制 {format_bytes(plan.bytes_to_copy)}。")
 
     def task_finished(self, status: str, payload: Any) -> None:
         kind = self._task_kind
@@ -310,6 +321,7 @@ class IncrementalPage(FeaturePage):
                                     f"复制 {result.copied_files} / 删 {result.deleted_files + result.deleted_dirs}")
                             self.vault_table.item(row, 3).setText(text)
                             self.vault_table.item(row, 3).setToolTip(text + "\n" + "\n".join(result.errors))
+                            self.message_logged.emit(f"{pair.relative_path}：{text}；实际复制 {format_bytes(result.copied_bytes)}。")
                         elif pair.key in self.choices:
                             self.vault_table.item(row, 3).setText("未执行")
                 completed = sum(item.result.status == "success" for item in payload.outcomes)
@@ -338,6 +350,7 @@ class IncrementalPage(FeaturePage):
         self.local_picker.set_controls_enabled(available)
         self.portable_picker.set_controls_enabled(available)
         self.analyze_button.setEnabled(available and bool(self.local_picker.value and self.portable_picker.value))
+        self.deep_checkbox.setEnabled(available)
         for selector in self.source_selectors.values():
             selector.setEnabled(available and self.analysis is not None and selector.count() > 1)
         executable = False
