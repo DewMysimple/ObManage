@@ -15,7 +15,7 @@ supersedes: null
 
 | 时间 | 类型 | 目标 | 状态 | 主题 | 日志 |
 | --- | --- | --- | --- | --- | --- |
-| 2026-09-21 | bug | - | draft | exfat-case-and-incremental-scan-performance | [2026-09-21｜exFAT 大小写修复与扫描提速](./2026-09-21-exFAT大小写修复与扫描提速.md) |
+| 2026-09-21 | bug | - | archived | exfat-case-and-incremental-scan-performance | [2026-09-21｜exFAT 大小写修复与扫描提速](./2026-09-21-exFAT大小写修复与扫描提速.md) |
 | 2026-09-20 | feature | - | archived | per-vault-incremental-workbench | [2026-09-20｜逐仓库方向增量工作台](./2026-09-20-逐仓库方向增量工作台.md) |
 | 2026-09-14 | feature | - | archived | verified-copy-throughput-optimization | [2026-09-14｜验证复制吞吐优化](./2026-09-14-验证复制吞吐优化.md) |
 | 2026-09-14 | feature | - | archived | bounded-verified-copy-pipeline | [2026-09-14｜有界验证复制流水线](./2026-09-14-有界验证复制流水线.md) |
