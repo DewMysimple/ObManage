@@ -3,9 +3,10 @@ type: knowledge
 status: active
 kind: operations
 importance: high
-updated: 2026-09-10
+updated: 2026-09-23
 topic: windows-build-troubleshooting
 source_logs:
+  - "[[日志/2026-09-23-本地构建入口]]"
   - "[[日志/2026-09-10-工程记忆与界面整理]]"
   - "[[日志/2026-09-13-重复启动聚焦窗口]]"
 supersedes: null
@@ -17,9 +18,11 @@ supersedes: null
 
 项目使用普通 GIL 版 Python 3.14 x64。运行依赖 PySide6 6.11.2，开发构建使用 PyInstaller 6.22.0 和 pytest 9.1.1，版本以[requirements.txt](../../../requirements.txt)及[requirements-dev.txt](../../../requirements-dev.txt)为准。
 
-执行 `python tools/build.py` 输出 `dist/ObManage/ObManage.exe` 与 `_internal/`，把[docs/使用指南.md](../../../docs/使用指南.md)复制为包内 `使用说明.md`，同时拷贝第三方声明及 `licenses/`，并生成 `dist/ObManage.zip`。ZIP 直接收纳程序目录内容，解压后根目录就是程序根目录，`ObManage.exe` 与 `_internal/` 同级；单独 EXE 不完整。GitHub README 包含仓库链接和示例图，因此不再直接充当包内文档。产物被 Git 忽略，不把本机生成包自动视为公开 Release。
+已有开发环境可从任意工作目录运行仓库根目录的 [`buildStart.cmd`](../../../buildStart.cmd)：入口切回自身目录、检查 `.venv`，精确匹配并强制结束本工作区旧 EXE，等待其退出后调用 `tools/build.py`。这会中断该实例正在处理的任务。`git pull` 不更新被 Git 忽略的 `dist/`，拉取源码后需重新构建。
 
-构建脚本会清理并重建已知 `build/` 与 `dist/` 产物。重建前确认旧 EXE 已空闲退出，避免 DLL 被占用；不能为解锁强杀正在同步的进程。手工递归清理前确认绝对目标在项目构建目录内，禁止把计算路径交给其他 shell 删除。
+执行 `tools/build.py` 输出 `dist/ObManage/ObManage.exe` 与 `_internal/`，把[docs/使用指南.md](../../../docs/使用指南.md)复制为包内 `使用说明.md`，同时拷贝第三方声明及 `licenses/`，并生成 `dist/ObManage.zip`。ZIP 直接收纳程序目录内容，解压后根目录就是程序根目录，`ObManage.exe` 与 `_internal/` 同级；单独 EXE 不完整。GitHub README 包含仓库链接和示例图，因此不再直接充当包内文档。产物被 Git 忽略，不把本机生成包自动视为公开 Release。
+
+构建脚本会清理并重建已知 `build/` 与 `dist/` 产物。直接调用 `tools/build.py` 时，先确认旧 EXE 已退出；根目录批处理入口按用户授权仅结束其所在工作区 `dist/ObManage/ObManage.exe`，不影响其他副本。手工递归清理前确认绝对目标在项目构建目录内，禁止把计算路径交给其他 shell 删除。
 
 ## DLL 与启动检查
 

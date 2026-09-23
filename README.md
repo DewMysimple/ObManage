@@ -110,10 +110,10 @@ python -m venv .venv
 生成便携程序：
 
 ```powershell
-.\.venv\Scripts\python.exe tools\build.py
+.\buildStart.cmd
 ```
 
-产物位于 `dist\ObManage\`，并自动生成 `dist\ObManage.zip`。ZIP 解压后直接得到程序根目录，不会再套一层 `ObManage` 文件夹；Git 源码仓库不跟踪构建产物，下载源码后需执行上述构建步骤才能得到 EXE 和 ZIP。
+脚本从当前源码目录调用 `tools\build.py`，即使从其他工作目录启动也会使用本仓库的 `.venv`。打包前会强制结束当前工作区 `dist\ObManage\ObManage.exe` 的运行进程，正在处理的任务会被中断。产物位于 `dist\ObManage\`，并自动生成 `dist\ObManage.zip`。ZIP 解压后直接得到程序根目录，不会再套一层 `ObManage` 文件夹；Git 源码仓库不跟踪构建产物，下载源码后需执行上述构建步骤才能得到 EXE 和 ZIP。
 
 命令行 `--preview --source ... --target ...` 仍只提供“仓库镜像”的只读差异 JSON；其余功能在桌面界面中使用。
 
