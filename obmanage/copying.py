@@ -3,9 +3,10 @@ from __future__ import annotations
 
 import hashlib
 from typing import BinaryIO, Callable
+from .reading import BUFFER_LIMIT, buffer_size
 
 
-COPY_BUFFER_SIZE = 4 * 1024 * 1024
+COPY_BUFFER_SIZE = BUFFER_LIMIT
 
 
 def copy_stream_and_hash(
@@ -22,8 +23,7 @@ def copy_stream_and_hash(
     for every block while also avoiding a multi-megabyte allocation for each
     tiny Obsidian metadata file.  Short writes are completed explicitly.
     """
-    buffer_size = min(COPY_BUFFER_SIZE, max(1, int(expected_size)))
-    buffer = bytearray(buffer_size)
+    buffer = bytearray(buffer_size(expected_size))
     view = memoryview(buffer)
     digest = hashlib.sha256()
     copied = 0

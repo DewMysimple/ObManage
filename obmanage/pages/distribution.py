@@ -32,7 +32,6 @@ from PySide6.QtWidgets import (
 )
 
 from ..management import discover_vaults, read_opened_vault_candidates
-from ..management.catalog import read_registered_vault_candidates
 from ..management.deployment import (
     DeploymentComponent,
     DeploymentEngine,
@@ -54,7 +53,6 @@ from ..models import Progress, SyncCancelled
 from ..paths import canonical, native
 from .common import FeaturePage, PathPicker, format_bytes, panel
 from .icons import action_icon
-from .vault_chooser import VaultSourceDialog
 
 
 _ACTION_TEXT = {
@@ -192,12 +190,6 @@ class AnalyzeTaskResult:
 class ExecuteTaskResult:
     result: DeploymentResult
     open_state: OpenVaultState
-
-
-@dataclass(frozen=True)
-class SourceVaultResult:
-    choices: VaultCatalogResult
-    collection: VaultCatalogResult
 
 
 class VaultTargetTableModel(QAbstractTableModel):
@@ -360,7 +352,6 @@ class DistributionPage(FeaturePage):
     component_options: tuple[ComponentOption, ...] = ()
     source_label = "模板来源"
     source_hint = "选择包含待部署组件的目录"
-    supports_opened_sources = False
     compact_sync = False
 
     def __init__(self, state_dir: Path, settings: dict[str, Any], default_root: str,
@@ -406,40 +397,8 @@ class DistributionPage(FeaturePage):
         self.source_picker.edit.setObjectName(f"{self.page_key}_source")
         self.source_picker.edit.setPlaceholderText(self.source_hint)
         config.addWidget(self.source_picker)
-        self.opened_source_button: QPushButton | None = None
-        self.opened_source_menu: QMenu | None = None
-        self.opened_source_status: QLabel | None = None
-        if self.supports_opened_sources:
-            opened_row = QHBoxLayout()
-            opened_row.addSpacing(116)
-            self.opened_source_button = QPushButton(
-                "从仓库列表选择…" if self.compact_sync else "从 Obsidian 当前打开仓库选择…"
-            )
-            self.opened_source_button.setObjectName(f"{self.page_key}_opened_source")
-            self.opened_source_button.setToolTip(
-                "查看 Obsidian 已登记的所有仓库（含已关闭）和当前集合中的仓库；支持搜索。"
-                if self.compact_sync else
-                "仅在点击后读取 Obsidian 的本机配置；候选仍会经过真实仓库校验。"
-            )
-            if self.compact_sync:
-                self.opened_source_button.setIcon(action_icon("search"))
-            if self.compact_sync:
-                self.source_picker.layout().insertWidget(2, self.opened_source_button)
-            else:
-                opened_row.addWidget(self.opened_source_button)
-            self.opened_source_status = QLabel(
-                "可选择已关闭的仓库，也可直接浏览文件夹。"
-                if self.compact_sync else "不会自动读取 Obsidian 配置"
-            )
-            self.opened_source_status.setObjectName("Muted")
-            self.opened_source_status.setWordWrap(True)
-            if self.compact_sync:
-                self.opened_source_status.setParent(self)
-                self.opened_source_status.hide()
-            else:
-                opened_row.addWidget(self.opened_source_status, 1)
-                config.addLayout(opened_row)
-            self.opened_source_menu = QMenu(self)
+        self.source_picker.selection.config_path = self.obsidian_config_path
+        self.source_picker.selection.roots = lambda: (self.root_picker.value,)
 
         self.component_frame, component_layout = panel(self.body)
         component_grid = QGridLayout()
@@ -502,7 +461,7 @@ class DistributionPage(FeaturePage):
         target_controls.addWidget(self.clear_targets_button)
         self.catalog_button = QPushButton("扫描仓库" if self.compact_sync else "发现仓库")
         if self.compact_sync:
-            self.root_picker.layout().addWidget(self.catalog_button)
+            self.root_picker.input_layout.addWidget(self.catalog_button)
         else:
             target_controls.addWidget(self.catalog_button)
         target_layout.addLayout(target_controls)
@@ -684,8 +643,6 @@ class DistributionPage(FeaturePage):
             lambda *_: self.refresh_actions()
         )
         self.catalog_button.clicked.connect(self._start_catalog)
-        if self.opened_source_button is not None:
-            self.opened_source_button.clicked.connect(self._start_opened_sources)
         self.analyze_button.clicked.connect(self._start_analyze)
         self.execute_button.clicked.connect(self._start_execute)
         self.cancel_button.clicked.connect(self.cancel_requested)
@@ -850,7 +807,7 @@ class DistributionPage(FeaturePage):
 
     def task_cancellable(self) -> bool:
         return self._task_active and self._task_kind in {
-            "opened_sources", "catalog", "analyze", "execute"
+            "catalog", "analyze", "execute"
         }
 
     def _source_overlaps_vault(self, vault: VaultInfo) -> bool:
@@ -878,7 +835,7 @@ class DistributionPage(FeaturePage):
         issues = list(opened.issues)
         vaults: tuple[VaultInfo, ...] = ()
         if validate and paths:
-            validated = discover_vaults(paths, cancel=cancel, progress=progress)
+            validated = discover_vaults(paths, recursive=False, cancel=cancel, progress=progress)
             vaults = tuple(
                 vault for vault in validated.vaults
                 if _physical_key(vault.path) in paths_by_key
@@ -944,55 +901,6 @@ class DistributionPage(FeaturePage):
             )
             self.occupancy_status.setToolTip("")
             self.occupancy_confirm.hide()
-
-    @Slot()
-    def _start_opened_sources(self) -> None:
-        if self.opened_source_button is None:
-            return
-
-        def operation(cancel, progress):
-            return self._read_open_state(cancel, progress, validate=True)
-
-        self.start_task("opened_sources", operation)
-
-    def _accept_opened_sources(self, state: OpenVaultState) -> None:
-        self.open_state = state
-        self._update_occupancy_display()
-        assert self.opened_source_menu is not None
-        self.opened_source_menu.clear()
-        for vault in state.vaults:
-            action = self.opened_source_menu.addAction(f"{vault.name}  ·  {vault.path}")
-            action.setToolTip(vault.path)
-            action.triggered.connect(
-                lambda checked=False, path=vault.path: self.source_picker.set_value(path)
-            )
-        if self.opened_source_status is not None:
-            if state.vaults:
-                self.opened_source_status.setText(
-                    f"已验证 {len(state.vaults)} 个当前打开仓库"
-                    + (f" · {len(state.issues)} 个问题" if state.issues else "")
-                )
-            else:
-                detail = state.issues[0].message if state.issues else "没有仓库被标记为打开。"
-                self.opened_source_status.setText(detail)
-            self.opened_source_status.setToolTip("\n".join(
-                f"{issue.message}{' · ' + issue.path if issue.path else ''}"
-                for issue in state.issues
-            ))
-        if not state.vaults:
-            self.set_status(
-                state.issues[0].message if state.issues
-                else "Obsidian 当前没有可选的已打开仓库。",
-                "warning",
-            )
-            return
-        self.set_status("请选择一个已验证的当前打开仓库作为来源。", "success")
-        if self.isVisible() and self.opened_source_button is not None:
-            self.opened_source_menu.popup(
-                self.opened_source_button.mapToGlobal(
-                    self.opened_source_button.rect().bottomLeft()
-                )
-            )
 
     @Slot()
     def _start_catalog(self) -> None:
@@ -1358,9 +1266,7 @@ class DistributionPage(FeaturePage):
             self._task_kind = ""
             self.refresh_actions()
             return
-        if kind == "opened_sources":
-            self._accept_opened_sources(payload)
-        elif kind == "catalog":
+        if kind == "catalog":
             self.open_state = payload.open_state
             self._accept_catalog(payload.catalog)
             self._update_occupancy_display(reset_confirmation=True)
@@ -1383,8 +1289,6 @@ class DistributionPage(FeaturePage):
         pending = bool(self._pending_batches)
         self.root_picker.set_controls_enabled(available)
         self.source_picker.set_controls_enabled(available)
-        if self.opened_source_button is not None:
-            self.opened_source_button.setEnabled(available)
         for box in self.component_boxes.values():
             box.setEnabled(available)
         self.target_table.setEnabled(available)
@@ -1513,7 +1417,6 @@ class ObsidianConfigPage(DistributionPage):
     page_key = "obsidian_config"
     source_label = "来源仓库 / 配置"
     source_hint = "选择来源仓库或 .obsidian 文件夹"
-    supports_opened_sources = True
     compact_sync = True
     component_options = (
         ComponentOption("obsidian", ".obsidian 完整配置", ".obsidian", True),
@@ -1523,7 +1426,6 @@ class ObsidianConfigPage(DistributionPage):
                  *, obsidian_config_path: str | Path | None = None,
                  opened_vault_reader: Callable[[str | Path | None], OpenedVaultCandidates]
                  | None = None) -> None:
-        self.source_dialog: VaultSourceDialog | None = None
         self._catalog_root = ""
         super().__init__(
             state_dir, settings, default_root,
@@ -1532,6 +1434,7 @@ class ObsidianConfigPage(DistributionPage):
             obsidian_config_path=obsidian_config_path,
             opened_vault_reader=opened_vault_reader,
         )
+        self.source_picker.selection.catalog_ready.connect(self._accept_catalog)
 
     def restore_settings(self, settings: dict[str, Any]) -> None:
         # The dedicated page has one fixed scope, including settings from older versions.
@@ -1548,65 +1451,6 @@ class ObsidianConfigPage(DistributionPage):
     def _accept_catalog(self, result: VaultCatalogResult) -> None:
         self._catalog_root = self.root_picker.value
         super()._accept_catalog(result)
-
-    def _start_opened_sources(self) -> None:
-        root = self.root_picker.value
-        config_path = self.obsidian_config_path
-
-        def operation(cancel, progress):
-            if cancel.is_set():
-                raise SyncCancelled("已取消读取来源仓库列表。")
-            registered = read_registered_vault_candidates(config_path)
-            validated = discover_vaults(
-                registered.paths, recursive=False, cancel=cancel, progress=progress,
-            )
-            collection = (discover_vaults(root, cancel=cancel, progress=progress)
-                          if root else VaultCatalogResult())
-            vaults = {_physical_key(v.path): v for v in (*validated.vaults, *collection.vaults)}
-            issues = [*registered.issues, *validated.issues, *collection.issues]
-            validated_keys = {_physical_key(v.path) for v in validated.vaults}
-            for path in registered.paths:
-                if _physical_key(path) not in validated_keys:
-                    issues.append(ManagementIssue(
-                        "registered_vault_invalid", "已跳过不可用或没有 .obsidian 的登记仓库。",
-                        path, "warning",
-                    ))
-            choices = VaultCatalogResult(
-                tuple(sorted(vaults.values(), key=lambda v: (v.name.casefold(), v.path.casefold()))),
-                tuple(issues),
-            )
-            if cancel.is_set():
-                raise SyncCancelled("已取消读取来源仓库列表。")
-            return SourceVaultResult(choices, collection)
-
-        self.start_task("source_vaults", operation)
-
-    def task_cancellable(self) -> bool:
-        return (self._task_active and self._task_kind == "source_vaults") or super().task_cancellable()
-
-    def task_finished(self, status: str, payload: Any) -> None:
-        if self._task_kind != "source_vaults":
-            super().task_finished(status, payload)
-            return
-        FeaturePage.task_finished(self, status, payload)
-        self._task_kind = ""
-        if status == "ok":
-            self._accept_catalog(payload.collection)
-            assert self.opened_source_status is not None
-            self.opened_source_status.setText(
-                f"可选 {len(payload.choices.vaults)} 个仓库 · 包含已关闭的仓库"
-            )
-            if self.source_dialog is not None:
-                self.source_dialog.close()
-                self.source_dialog.deleteLater()
-            self.source_dialog = VaultSourceDialog(payload.choices, self)
-            self.source_dialog.source_chosen.connect(self.source_picker.set_value)
-            self.source_dialog.browse_requested.connect(self.source_picker.browse.click)
-            self.source_dialog.setWindowModality(Qt.WindowModality.WindowModal)
-            if self.isVisible():
-                self.source_dialog.open()
-            self.set_status("请选择来源仓库；选好后在下方勾选目标。")
-        self.refresh_actions()
 
     def set_status(self, text: str, kind: str = "neutral") -> None:
         super().set_status(text.replace("部署", "同步"), kind)
@@ -1625,7 +1469,6 @@ class TemplaterPage(DistributionPage):
     page_key = "templater"
     source_label = "模板 Templater"
     source_hint = "选择模板仓库、File 目录或 File/Templater 目录"
-    supports_opened_sources = True
     component_options = (
         ComponentOption("templater", "File/Templater", "File/Templater", True),
     )

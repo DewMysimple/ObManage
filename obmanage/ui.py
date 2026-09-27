@@ -62,7 +62,9 @@ from .scheduler import Scheduler
 from .settings import SettingsStore
 from .tasking import FeatureWorker
 from .pages.backup import VaultBackupPage
-from .pages.common import FeaturePage
+from .pages.common import FeaturePage, PathPicker
+from .pages.vault_selection import VaultSelection
+from .pages.icons import action_icon
 from .pages.incremental import IncrementalPage
 from .pages.distribution import ObsidianConfigPage, TemplateSuitePage, TemplaterPage
 from .pages.registry import FEATURES
@@ -440,6 +442,7 @@ QPushButton#Primary:pressed { background: #203F55; }
 QPushButton#Primary:disabled { background: #C6D2D9; border-color: #C6D2D9; color: #F7F9FA; }
 QPushButton#TextButton { background: transparent; border-color: transparent; color: #5B7180; padding-left: 3px; }
 QPushButton#TextButton:hover { color: #274E69; background: #E9EEEF; }
+QPushButton[pathAction="true"] { min-height: 26px; padding: 1px 11px; }
 QPushButton#Cancel { color: #A04F44; }
 QPushButton#Recovery { color: #8B642D; border-color: #DEC9A7; background: #FFF9EE; }
 QPushButton#Recovery:hover { background: #F8EDD9; border-color: #CFB27E; }
@@ -667,6 +670,9 @@ class MainWindow(QMainWindow):
         self.source_browse = QPushButton("选择文件夹")
         self.source_browse.setObjectName("source_browse")
         source_row.addWidget(self.source_browse)
+        self.local_selection = self._vault_selection_buttons(
+            source_row, self.local_edit.setText, lambda: self._browse(True),
+            lambda: (self.local_edit.text().strip(),))
         paths_layout.addLayout(source_row)
 
         target_row = QHBoxLayout()
@@ -689,6 +695,12 @@ class MainWindow(QMainWindow):
         self.target_browse = QPushButton("选择文件夹")
         self.target_browse.setObjectName("target_browse")
         target_row.addWidget(self.target_browse)
+        self.portable_selection = self._vault_selection_buttons(
+            target_row, self.portable_combo.setCurrentText, lambda: self._browse(False),
+            lambda: (self.portable_combo.currentText().strip(),))
+        for button in (self.source_browse, self.target_browse):
+            button.setText("浏览…")
+            button.setIcon(action_icon("folder"))
         paths_layout.addLayout(target_row)
         self.direction_label = QLabel()
         self.direction_label.setObjectName("Direction")
@@ -952,6 +964,11 @@ class MainWindow(QMainWindow):
             page.cancel_requested.connect(self.cancel_operation)
             page.settings_changed.connect(self._queue_settings_save)
             page.message_logged.connect(self._log)
+            for picker in page.findChildren(PathPicker):
+                selection = picker.selection
+                selection.task_requested.connect(
+                    lambda operation, current=selection: self._start_feature_task(current, operation))
+                selection.status_changed.connect(page.set_status)
             self.pages[feature.key] = page
             page_scroll = QScrollArea()
             page_scroll.setObjectName(f"{feature.key}_scroll")
@@ -1017,7 +1034,24 @@ class MainWindow(QMainWindow):
             self._set_status(message, "error")
         return True
 
-    def _start_feature_task(self, page: FeaturePage, operation: Any) -> None:
+    def _vault_selection_buttons(self, layout, accept, browse, roots):
+        selection = VaultSelection(self, accept, browse, roots)
+        browse_button = layout.itemAt(layout.count() - 1).widget()
+        selection.buttons = []
+        for text, icon, running in (("从仓库列表选择…", "search", False),
+                                    ("识别当前运行仓库", "refresh", True)):
+            button = QPushButton(text)
+            button.setProperty("pathAction", True)
+            button.setIcon(action_icon(icon))
+            button.clicked.connect(lambda checked=False, mode=running: selection.start(mode))
+            layout.insertWidget(layout.count() - 1, button)
+            selection.buttons.append(button)
+        browse_button.setProperty("pathAction", True)
+        selection.task_requested.connect(lambda operation: self._start_feature_task(selection, operation))
+        selection.status_changed.connect(self._set_status)
+        return selection
+
+    def _start_feature_task(self, page: FeaturePage | VaultSelection, operation: Any) -> None:
         if self._reject_unsafe_state_location(page):
             self._refresh_actions()
             return
@@ -1372,6 +1406,8 @@ class MainWindow(QMainWindow):
             self.source_browse,
             self.target_combo,
             self.target_browse,
+            *self.local_selection.buttons,
+            *self.portable_selection.buttons,
             self.schedule_toggle,
             self.schedule_mode,
             self.interval_spin,

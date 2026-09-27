@@ -125,20 +125,20 @@ def _scope_issue(path: str) -> ManagementIssue | None:
         current = parent
 
 
-def _is_descendant(child: str, parent: str) -> bool:
-    child_key, parent_key = _path_key(child), _path_key(parent)
-    try:
-        return child_key != parent_key and os.path.commonpath((child_key, parent_key)) == parent_key
-    except ValueError:
-        return False
-
-
 def _with_parents(paths: Iterable[str]) -> tuple[VaultInfo, ...]:
     ordered = sorted(set(paths), key=_sort_key)
+    by_key = {_path_key(path): path for path in ordered}
     result: list[VaultInfo] = []
     for path in ordered:
-        ancestors = [candidate for candidate in ordered if _is_descendant(path, candidate)]
-        parent = max(ancestors, key=lambda item: len(Path(item).parts), default=None)
+        parent = None
+        ancestor = os.path.dirname(path)
+        while ancestor != os.path.dirname(ancestor):
+            if _path_key(ancestor) in by_key:
+                parent = by_key[_path_key(ancestor)]
+                break
+            ancestor = os.path.dirname(ancestor)
+        if parent is None:
+            parent = by_key.get(_path_key(ancestor)) if ancestor != path else None
         result.append(VaultInfo(path=path, name=Path(path).name or path, parent_path=parent))
     return tuple(result)
 
@@ -367,7 +367,7 @@ def discover_vaults(
 
         try:
             with os.scandir(native(physical)) as iterator:
-                entries = sorted(iterator, key=lambda entry: (entry.name.casefold(), entry.name))
+                entries = list(iterator)
         except OSError as exc:
             issues.append(ManagementIssue("directory_unreadable", f"无法读取目录：{exc}", physical))
             continue
@@ -408,7 +408,7 @@ def discover_vaults(
                 issues.append(ManagementIssue(
                     "unsafe_item", "已跳过链接、重解析点或特殊项。", child
                 ))
-        stack.extend(reversed(children))
+        stack.extend(reversed(sorted(children, key=_sort_key)))
 
     vaults = _with_parents(found.values())
     return VaultCatalogResult(vaults=vaults, issues=tuple(sorted(issues, key=_issue_sort_key)))

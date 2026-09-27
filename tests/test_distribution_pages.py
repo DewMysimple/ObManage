@@ -579,53 +579,6 @@ def test_source_changes_reuse_discovery_but_revoke_selection_plan_and_confirmati
         dispose(page)
 
 
-@pytest.mark.parametrize("page_type", [TemplaterPage])
-def test_opened_source_candidates_are_lazy_revalidated_and_user_selected(
-    application, tmp_path, page_type
-):
-    root = tmp_path / "目标集合"
-    target = root / "目标"
-    (target / ".obsidian").mkdir(parents=True)
-    opened = tmp_path / "已打开来源"
-    (opened / ".obsidian").mkdir(parents=True)
-    invalid = tmp_path / "不是仓库"
-    invalid.mkdir()
-    calls: list[object] = []
-
-    def reader(config_path):
-        calls.append(config_path)
-        return OpenedVaultCandidates(paths=(str(opened), str(invalid)))
-
-    sentinel_config = tmp_path / "obsidian.json"
-    page = page_type(
-        tmp_path / f"state-{page_type.page_key}",
-        {"root": str(root), "source": ""},
-        str(root),
-        obsidian_config_path=sentinel_config,
-        opened_vault_reader=reader,
-    )
-    operations: list = []
-    page.task_requested.connect(operations.append)
-    try:
-        assert calls == []
-        assert page.opened_source_button is not None
-        page._start_opened_sources()
-        assert calls == []  # Reading happens only when the emitted worker operation runs.
-        assert len(operations) == 1
-        state = operations[-1](threading.Event(), lambda _event: None)
-        page.task_finished("ok", state)
-
-        assert calls == [sentinel_config]
-        assert tuple(vault.path for vault in state.vaults) == (str(opened),)
-        assert state.issues
-        assert page.opened_source_menu is not None
-        assert len(page.opened_source_menu.actions()) == 1
-        page.opened_source_menu.actions()[0].trigger()
-        assert page.source_picker.value == str(opened)
-    finally:
-        dispose(page)
-
-
 def test_target_select_all_and_clear_are_explicit_and_revoke_plan(application, tmp_path):
     root = tmp_path / "集合"
     first = root / "一"
@@ -678,14 +631,18 @@ def test_source_list_includes_closed_registered_and_collection_vaults_without_au
     page.task_requested.connect(operations.append)
     before = snapshot_tree(root)
     try:
-        assert page.source_dialog is None
+        assert page.source_picker.selection.dialog is None
         assert page.source_picker.value == ""
-        result = run_last_operation(page, operations, page._start_opened_sources)
+        selection = page.source_picker.selection
+        selection.task_requested.connect(operations.append)
+        selection.start()
+        result = operations[-1](threading.Event(), lambda event: None)
+        selection.task_finished("ok", result)
         assert {v.path for v in result.choices.vaults} == {str(source), str(target), str(closed)}
         assert result.choices.issues
         assert page.source_picker.value == ""  # No first/last/current vault is silently chosen.
         assert page.open_state.paths == ()  # Registered candidates are never treated as occupancy.
-        dialog = page.source_dialog
+        dialog = page.source_picker.selection.dialog
         assert dialog is not None
         assert not dialog.choose_button.isEnabled()
         dialog.search.setText("其他集合")
@@ -714,11 +671,15 @@ def test_broken_registry_still_offers_collection_sources_and_manual_browse(appli
     operations = []
     page.task_requested.connect(operations.append)
     try:
-        result = run_last_operation(page, operations, page._start_opened_sources)
+        selection = page.source_picker.selection
+        selection.task_requested.connect(operations.append)
+        selection.start()
+        result = operations[-1](threading.Event(), lambda event: None)
+        selection.task_finished("ok", result)
         assert {v.path for v in result.choices.vaults} == {str(source), str(target)}
         assert any(i.code == "config_invalid_json" for i in result.choices.issues)
         assert not page.open_state.reliable
-        dialog = page.source_dialog
+        dialog = page.source_picker.selection.dialog
         dialog.search.setText("没有匹配")
         assert dialog.proxy.rowCount() == 0
         assert not dialog.choose_button.isEnabled()

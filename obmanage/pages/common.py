@@ -13,22 +13,31 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QProgressBar,
     QPushButton,
+    QSizePolicy,
     QVBoxLayout,
     QWidget,
 )
 
 from ..models import Progress
+from .icons import action_icon
+from .vault_selection import VaultSelection
 
 
 class PathPicker(QWidget):
-    """A labelled directory input with one consistent browse interaction."""
+    """Three shared vault-selection actions and a full-width path on small windows."""
 
     changed = Signal(str)
 
     def __init__(self, label: str, value: str = "", *, dialog_title: str = "选择文件夹") -> None:
         super().__init__()
         self.dialog_title = dialog_title
-        layout = QHBoxLayout(self)
+        outer = QVBoxLayout(self)
+        self.outer_layout = outer
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(6)
+        layout = QHBoxLayout()
+        self.input_layout = layout
+        outer.addLayout(layout)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(10)
         caption = QLabel(label)
@@ -38,9 +47,31 @@ class PathPicker(QWidget):
         self.edit.setClearButtonEnabled(True)
         caption.setBuddy(self.edit)
         layout.addWidget(self.edit, 1)
-        self.browse = QPushButton("选择文件夹")
-        layout.addWidget(self.browse)
+        self.browse = QPushButton("浏览…")
         self.browse.clicked.connect(self._browse)
+        self.browse.setIcon(action_icon("folder"))
+        self.vault_list = QPushButton("从仓库列表选择…")
+        self.vault_list.setIcon(action_icon("search"))
+        self.running_vault = QPushButton("识别当前运行仓库")
+        self.running_vault.setIcon(action_icon("refresh"))
+        for button in (self.vault_list, self.running_vault, self.browse):
+            button.setProperty("pathAction", True)
+        self.actions_widget = QWidget()
+        self.actions_widget.setSizePolicy(QSizePolicy.Policy.Maximum, QSizePolicy.Policy.Fixed)
+        actions = QHBoxLayout(self.actions_widget)
+        actions.setContentsMargins(0, 0, 0, 0)
+        actions.setSpacing(8)
+        actions.addSpacing(116)
+        self.action_indent = actions.itemAt(0).spacerItem()
+        actions.addWidget(self.vault_list)
+        actions.addWidget(self.running_vault)
+        actions.addWidget(self.browse)
+        actions.addStretch()
+        outer.addWidget(self.actions_widget)
+        self._inline_actions = False
+        self.selection = VaultSelection(self, self.set_value, self._browse, lambda: (self.value,))
+        self.vault_list.clicked.connect(lambda: self.selection.start(False))
+        self.running_vault.clicked.connect(lambda: self.selection.start(True))
         self.edit.textChanged.connect(self.changed)
         self.edit.textChanged.connect(self.edit.setToolTip)
         self.edit.setToolTip(value)
@@ -49,12 +80,27 @@ class PathPicker(QWidget):
     def value(self) -> str:
         return self.edit.text().strip()
 
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        inline = self.width() >= 860
+        if inline != self._inline_actions:
+            self._inline_actions = inline
+            self.action_indent.changeSize(0 if inline else 116, 0)
+            if inline:
+                self.input_layout.insertWidget(2, self.actions_widget)
+            else:
+                self.outer_layout.addWidget(self.actions_widget)
+            self.actions_widget.layout().invalidate()
+
     def set_value(self, value: str) -> None:
         self.edit.setText(value)
+        self.edit.setToolTip(value)
 
     def set_controls_enabled(self, enabled: bool) -> None:
         self.edit.setEnabled(enabled)
         self.browse.setEnabled(enabled)
+        self.vault_list.setEnabled(enabled)
+        self.running_vault.setEnabled(enabled)
 
     def _browse(self) -> None:
         chosen = QFileDialog.getExistingDirectory(self, self.dialog_title, self.value)

@@ -17,17 +17,18 @@ class VaultSourceDialog(QDialog):
     source_chosen = Signal(str)
     browse_requested = Signal()
 
-    def __init__(self, result: VaultCatalogResult, parent=None) -> None:
+    def __init__(self, result: VaultCatalogResult, parent=None, *, running=False) -> None:
         super().__init__(parent)
-        self.setWindowTitle("选择来源仓库")
+        self.setWindowTitle("当前运行的仓库" if running else "从仓库列表选择")
         self.resize(780, 480)
         self.setMinimumSize(540, 340)
         layout = QVBoxLayout(self)
         layout.setContentsMargins(20, 18, 20, 18)
-        heading = QLabel("选择要复制 .obsidian 的来源仓库")
+        heading = QLabel("选择当前运行的仓库" if running else "选择仓库")
         heading.setObjectName("SectionTitle")
         layout.addWidget(heading)
-        hint = QLabel("包含 Obsidian 已登记的仓库（含已关闭）和当前集合内的仓库。")
+        hint = QLabel("已核验 Obsidian 进程和当前仓库窗口；请核对完整位置。" if running else
+                      "包含 Obsidian 已登记的仓库（含已关闭）和当前选择范围内的仓库。")
         hint.setObjectName("Muted")
         hint.setWordWrap(True)
         layout.addWidget(hint)

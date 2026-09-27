@@ -20,6 +20,7 @@ from obmanage.management.models import (
 )
 from obmanage.pages.distribution import DeploymentPreviewRow
 from obmanage.pages.vault_chooser import VaultSourceDialog
+from obmanage.pages.common import PathPicker
 from obmanage.ui import FILTERS, MainWindow
 
 
@@ -244,6 +245,12 @@ def test_every_management_page_fits_width_and_bottom_actions_are_reachable(
             assert scroll.horizontalScrollBar().maximum() == 0, (
                 f"{key} must not require horizontal scrolling at {size}"
             )
+            for picker in window.pages[key].findChildren(PathPicker):
+                assert picker.edit.width() >= 160, f"{key} path must remain readable"
+                assert picker.edit.toolTip() == picker.edit.text()
+                for action in (picker.vault_list, picker.running_vault, picker.browse):
+                    position = action.mapTo(picker, QPoint())
+                    assert picker.rect().contains(QRect(position, action.size()))
             scroll.verticalScrollBar().setValue(scroll.verticalScrollBar().maximum())
             settle(application)
             viewport = scroll.viewport()

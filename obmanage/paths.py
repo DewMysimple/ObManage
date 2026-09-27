@@ -63,8 +63,15 @@ def identity(state: dict | None) -> tuple | None:
 
 def assert_plain_chain(path: str | Path) -> None:
     """Reject existing non-directory/reparse ancestors, including the root itself."""
-    value = Path(canonical(path))
-    for part in reversed((value, *value.parents)):
+    value = canonical(path)
+    parts = [value]
+    while True:
+        parent = os.path.dirname(value)
+        if parent == value:
+            break
+        parts.append(parent)
+        value = parent
+    for part in reversed(parts):
         state = snapshot(part)
         if state is None:
             continue
@@ -106,6 +113,16 @@ def checked_child_snapshot(root: str, relative: str) -> tuple[str, dict | None]:
     ancestor-chain and reparse-point checks remain identical to
     :func:`checked_child`.
     """
+    candidate = lexical_child_path(root, relative)
+    assert_plain_chain(os.path.dirname(candidate))
+    state = snapshot(candidate)
+    if state is not None and state["kind"] in ("link", "special"):
+        raise SyncError(f"路径已变成链接或特殊文件：{relative}")
+    return candidate, state
+
+
+def lexical_child_path(root: str, relative: str) -> str:
+    """Lexical containment only; callers must independently check the live chain."""
     parts = relative.replace("\\", "/").split("/")
     if not relative or any(part in ("", ".", "..") for part in parts):
         raise SyncError(f"无效的相对路径：{relative}")
@@ -114,11 +131,7 @@ def checked_child_snapshot(root: str, relative: str) -> tuple[str, dict | None]:
     candidate = canonical(os.path.join(root, *parts))
     if os.path.commonpath((os.path.normcase(root), os.path.normcase(candidate))) != os.path.normcase(root):
         raise SyncError(f"文件路径越出镜像范围：{relative}")
-    assert_plain_chain(os.path.dirname(candidate))
-    state = snapshot(candidate)
-    if state is not None and state["kind"] in ("link", "special"):
-        raise SyncError(f"路径已变成链接或特殊文件：{relative}")
-    return candidate, state
+    return candidate
 
 
 def checked_child(root: str, relative: str) -> str:

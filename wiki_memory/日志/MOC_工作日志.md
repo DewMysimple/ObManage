@@ -15,6 +15,7 @@ supersedes: null
 
 | 时间 | 类型 | 目标 | 状态 | 主题 | 日志 |
 | --- | --- | --- | --- | --- | --- |
+| 2026-09-27 | feature | - | archived | shared-vault-selection-io | [统一仓库选择与共享读取提速](./2026-09-27-统一仓库选择与共享读取提速.md) |
 | 2026-09-27 | maintenance | - | archived | obsidian-sync-delivery-merge | [同步工作台交付合并](./2026-09-27-同步工作台交付合并.md) |
 | 2026-09-27 | ui | - | archived | obsidian-sync-workbench | [.obsidian同步工作台简化](./2026-09-27-obsidian同步工作台简化.md) |
 | 2026-09-23 | maintenance | - | archived | local-build-entrypoint | [本地构建入口](./2026-09-23-本地构建入口.md) |

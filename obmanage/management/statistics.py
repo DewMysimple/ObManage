@@ -14,6 +14,7 @@ from threading import Event, Lock
 
 from ..file_types import VIDEO_EXTENSIONS
 from ..models import Progress, SyncCancelled, SyncError
+from ..reading import buffer_size
 from ..paths import assert_plain_chain, canonical, native, snapshot
 from .catalog import _marker_state, _physical_plain_directory, _same_name, _sort_key
 from .models import (
@@ -204,9 +205,10 @@ def _read_utf8_characters(
             raise OSError("文件在读取前已发生变化")
         decoder = codecs.getincrementaldecoder("utf-8")("strict")
         characters = 0
+        read_size = buffer_size(expected["size"], _READ_SIZE)
         while True:
             _cancelled(cancel)
-            block = os.read(descriptor, _READ_SIZE)
+            block = os.read(descriptor, read_size)
             if not block:
                 break
             characters += len(decoder.decode(block, final=False))

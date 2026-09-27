@@ -28,6 +28,9 @@ from obmanage.pages.statistics import StatisticsPage
 from obmanage.pages.trash_cleanup import TrashCleanupPage
 from obmanage.settings import SettingsStore
 from obmanage.ui import MainWindow
+from obmanage.pages.common import PathPicker
+from obmanage.pages.vault_selection import VaultSelection
+from obmanage.management.models import VaultCatalogResult, VaultInfo
 
 
 @pytest.fixture(scope="module")
@@ -76,6 +79,51 @@ def test_shell_registers_eight_pages_with_mirror_first(application, tmp_path):
         assert isinstance(window.pages["trash_cleanup"], TrashCleanupPage)
         assert "页面正在初始化…" not in {label.text() for label in window.findChildren(QLabel)}
     finally:
+        dispose(application, window)
+
+
+def test_all_path_selectors_share_three_choices_and_runtime_uses_single_task_slot(application, tmp_path, monkeypatch):
+    from obmanage.pages import vault_selection
+    vault = tmp_path / "Live"
+    (vault / ".obsidian").mkdir(parents=True)
+    entered, release = Event(), Event()
+    def runtime(_config, *, cancel):
+        entered.set()
+        while not release.wait(.01):
+            if cancel.is_set():
+                raise SyncCancelled()
+        return VaultCatalogResult((VaultInfo(str(vault), "Live"),))
+    monkeypatch.setattr(vault_selection, "read_running_vaults", runtime)
+    window = MainWindow(tmp_path / "state")
+    try:
+        for page in window.pages.values():
+            for picker in page.findChildren(PathPicker):
+                assert picker.vault_list.text() == "从仓库列表选择…"
+                assert picker.running_vault.text() == "识别当前运行仓库"
+                assert picker.browse.text() == "浏览…"
+        page = window.pages["obsidian_config"]
+        window._show_page("obsidian_config", persist=False)
+        page.source_picker.running_vault.click()
+        wait_until(application, entered.is_set)
+        assert window.busy
+        assert isinstance(window._feature_page, VaultSelection)
+        assert window._feature_page.task_cancellable()
+        assert not window.analyze_button.isEnabled()
+        assert not window.local_selection.buttons[0].isEnabled()
+        assert not page.source_picker.browse.isEnabled()
+        release.set()
+        wait_until(application, lambda: not window.busy)
+        assert page.source_picker.value == str(vault)
+        assert not page.confirm_checkbox.isChecked()
+        assert page.source_picker.vault_list.isEnabled()
+        # Mirror uses the same adapter and ordinary input invalidation.
+        window.plan = SyncPlan("old", "target", [PlanItem("add", "x")])
+        window.local_selection.start(True)
+        wait_until(application, lambda: not window.busy)
+        assert window.local_edit.text() == str(vault)
+        assert window.plan is None
+    finally:
+        release.set()
         dispose(application, window)
 
 

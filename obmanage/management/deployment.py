@@ -22,7 +22,8 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
-from ..copying import COPY_BUFFER_SIZE, copy_stream_and_hash
+from ..copying import copy_stream_and_hash
+from ..reading import ReadScope, hash_stream
 from ..models import SyncCancelled, SyncError
 from ..paths import (assert_plain_chain, canonical, checked_child, identity, native,
                      snapshot, volume_identity)
@@ -30,7 +31,6 @@ from .journal import (DeploymentJournal, JournalBatch, JournalError, JournalTarg
                       OwnedDirectory)
 
 
-CHUNK_SIZE = COPY_BUFFER_SIZE
 _DEPLOYMENT_TASK_LOCK = threading.Lock()
 _OWNED_PREFIX = ".obmanage-deploy-"
 _WINDOWS_ACCESS_DENIED = 5
@@ -596,7 +596,6 @@ def _hash_file(path: str, expected: EntrySnapshot,
     actual = _entry_state(path)
     if not _entry_matches(actual, expected):
         raise DeploymentError(f"文件在读取前发生变化：{path}")
-    digest = hashlib.sha256()
     try:
         with open(native(path), "rb") as stream:
             opened = os.fstat(stream.fileno())
@@ -608,21 +607,17 @@ def _hash_file(path: str, expected: EntrySnapshot,
             )
             if opened_tuple != expected_tuple or not stat.S_ISREG(opened.st_mode):
                 raise DeploymentError(f"打开文件时内容身份已改变：{path}")
-            while True:
-                _cancelled(cancel)
-                block = stream.read(CHUNK_SIZE)
-                if not block:
-                    break
-                digest.update(block)
+            read_bytes, digest = hash_stream(stream, expected.size,
+                                            check_cancel=lambda: _cancelled(cancel))
             finished = os.fstat(stream.fileno())
             if (finished.st_size, finished.st_mtime_ns,
-                    finished.st_ino, finished.st_dev) != opened_tuple:
+                    finished.st_ino, finished.st_dev) != opened_tuple or read_bytes != expected.size:
                 raise DeploymentError(f"文件在读取期间发生变化：{path}")
     except OSError as exc:
         raise DeploymentError(f"无法读取文件：{path}（{exc}）") from exc
     if not _entry_matches(_entry_state(path), expected):
         raise DeploymentError(f"文件在读取后发生变化：{path}")
-    return digest.hexdigest()
+    return digest
 
 
 def _scan_tree(root: str, cancel: threading.Event | None,
@@ -679,10 +674,11 @@ def _scan_tree(root: str, cancel: threading.Event | None,
     progress_values = progress_values or {}
     total_files = sum(state.kind == "file" for _, state in raw)
     completed = 0
+    reads = ReadScope(root)
     for relative, state in sorted(raw, key=lambda item: (_case_key(item[0]), item[0])):
         digest = None
         if state.kind == "file" and hash_files:
-            digest = _hash_file(checked_child(root, relative), state, cancel)
+            digest = _hash_file(reads.child(relative), state, cancel)
             completed += 1
             _emit(progress, "analyze", relative_path=relative, completed_files=completed,
                   total_files=total_files, message="正在生成完整内容摘要", **progress_values)
@@ -1227,6 +1223,7 @@ class DeploymentEngine:
                 raise DeploymentError(f"暂存目录出现意外项目：{destination}")
             os.mkdir(native(destination))
         completed_bytes = 0
+        total_bytes = item.source_tree.total_bytes
         for number, entry in enumerate(files, 1):
             _cancelled(cancel)
             source = checked_child(item.source_path, entry.relative_path)
@@ -1270,7 +1267,7 @@ class DeploymentEngine:
                   selection_id=item.selection_id, component_id=item.component_id,
                   target_id=item.target_id, relative_path=entry.relative_path,
                   completed_files=number, total_files=len(files),
-                  completed_bytes=completed_bytes, total_bytes=item.source_tree.total_bytes,
+                  completed_bytes=completed_bytes, total_bytes=total_bytes,
                   message="已暂存，正在准备整体验证")
         # One stable whole-tree pass verifies every staged byte and the final
         # directory manifest.  A second per-file target hash immediately before
@@ -1283,7 +1280,7 @@ class DeploymentEngine:
               selection_id=item.selection_id, component_id=item.component_id,
               target_id=item.target_id, completed_files=len(files),
               total_files=len(files), completed_bytes=completed_bytes,
-              total_bytes=item.source_tree.total_bytes,
+              total_bytes=total_bytes,
               message="暂存目录已完成 SHA-256 整体验证")
 
     def _cleanup_stage(self, batch_id: str, record: JournalTarget) -> None:

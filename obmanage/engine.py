@@ -21,7 +21,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from .copying import COPY_BUFFER_SIZE, copy_stream_and_hash
+from .copying import copy_stream_and_hash
+from .reading import ReadScope, hash_stream
 from .file_types import is_video_filename
 from .models import PlanItem, Progress, SyncCancelled, SyncError, SyncPlan, SyncResult
 from .paths import (assert_plain_chain, canonical, checked_child, checked_child_snapshot,
@@ -29,7 +30,6 @@ from .paths import (assert_plain_chain, canonical, checked_child, checked_child_
                     validate_state_separation)
 from .store import BaselineStore
 
-CHUNK_SIZE = COPY_BUFFER_SIZE
 HASH_PROGRESS_INTERVAL = 0.08
 ProgressCallback = Callable[[Progress], None] | None
 _WINDOWS_ACCESS_DENIED = 5
@@ -233,22 +233,16 @@ def _hash_file(path: str, expected: dict, cancel: threading.Event | None,
     """Hash only a stable version of the file, never silently adopt a new version."""
     _cancelled(cancel)
     _require_state(path, expected, "校验前文件已改变")
-    digest = hashlib.sha256()
-    read_bytes = 0
-    # A fixed 4 MiB read allocates multi-megabyte objects even for tiny JSON/MD
-    # files. Bound allocation by file size while still reading through EOF.
-    block_size = min(CHUNK_SIZE, max(1, expected["size"]))
     with open(native(path), "rb") as stream:
         opened = os.fstat(stream.fileno())
         if (opened.st_ino, opened.st_dev, opened.st_size, opened.st_mtime_ns) != (
                 expected["inode"], expected["device"], expected["size"], expected["mtime_ns"]):
             raise SyncError(f"打开文件时内容已改变：{relative_path}")
-        while chunk := stream.read(block_size):
-            _cancelled(cancel)
-            digest.update(chunk)
-            read_bytes += len(chunk)
+        def report(read_bytes):
             _emit(progress, "hash", relative_path=relative_path,
                   message="正在校验内容", completed_bytes=read_bytes, total_bytes=expected["size"])
+        read_bytes, digest = hash_stream(stream, expected["size"],
+                                        check_cancel=lambda: _cancelled(cancel), progress=report)
         closed = os.fstat(stream.fileno())
         if (closed.st_size, closed.st_mtime_ns, closed.st_ctime_ns) != (
                 opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns):
@@ -257,7 +251,7 @@ def _hash_file(path: str, expected: dict, cancel: threading.Event | None,
     _require_state(path, expected, "校验期间文件已改变")
     if read_bytes != expected["size"]:
         raise SyncError(f"校验时读取的大小不符：{relative_path}")
-    return digest.hexdigest()
+    return digest
 
 
 class _CombinedCancel:
@@ -562,6 +556,7 @@ class SyncEngine:
                 + sum(_key(path) not in source_names for path in target_entries)
                 + len(excluded_items)
             )
+            source_reads, target_reads = ReadScope(plan.source), ReadScope(plan.target)
             for relative, src in sorted(source_entries.items()):
                 _cancelled(cancel)
                 target_name = context["target_names"].get(_key(relative), relative)
@@ -596,8 +591,8 @@ class SyncEngine:
                 elif src["size"] != dst["size"]:
                     item = PlanItem("update", relative, src["size"], "文件大小不同，以源端为准")
                 else:
-                    src_path = checked_child(plan.source, relative)
-                    dst_path = checked_child(plan.target, target_name)
+                    src_path = source_reads.child(relative)
+                    dst_path = target_reads.child(target_name)
                     src_digest, dst_digest = _hash_pair(
                         src_path, src, dst_path, dst, cancel, progress, relative, hash_pool
                     )

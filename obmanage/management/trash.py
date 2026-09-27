@@ -26,10 +26,10 @@ from typing import Callable, Iterable, Literal
 
 from ..copying import copy_stream_and_hash
 from ..models import SyncCancelled, SyncError
-from ..paths import assert_plain_chain, canonical, identity, native, snapshot
+from ..paths import assert_plain_chain, canonical, checked_child, identity, native, snapshot
+from ..reading import hash_stream
 
 
-HASH_CHUNK_SIZE = 1024 * 1024
 JOURNAL_VERSION = 1
 AUTH_KEY_SIZE = 32
 _WINDOWS_READONLY = getattr(stat, "FILE_ATTRIBUTE_READONLY", 0x1)
@@ -270,23 +270,12 @@ def _same_identity(left: PathSnapshot, right: PathSnapshot) -> bool:
 
 
 def _safe_child(root: str, relative_path: str) -> str:
-    parts = relative_path.replace("\\", "/").split("/")
-    if not relative_path or any(part in ("", ".", "..") for part in parts):
-        raise TrashSafetyError(f"无效的回收站相对路径：{relative_path}")
-    if os.name == "nt" and any(":" in part for part in parts):
-        raise TrashSafetyError(f"无效的回收站相对路径：{relative_path}")
-    candidate = canonical(os.path.join(root, *parts))
+    # Roots have already been resolved. Full live ancestor checks reject links,
+    # so resolving each root/child again cannot add a containment guarantee.
     try:
-        common = os.path.commonpath((_path_key(root), _path_key(candidate)))
-    except ValueError as exc:
-        raise TrashSafetyError(f"回收站路径越界：{relative_path}") from exc
-    if common != _path_key(root):
-        raise TrashSafetyError(f"回收站路径越界：{relative_path}")
-    assert_plain_chain(os.path.dirname(candidate))
-    state = snapshot(candidate)
-    if state is not None and state["kind"] in ("link", "special"):
-        raise TrashSafetyError(f"拒绝链接或特殊文件：{candidate}")
-    return candidate
+        return checked_child(root, relative_path)
+    except (ValueError, SyncError) as exc:
+        raise TrashSafetyError(f"回收站路径无法安全访问：{relative_path}（{exc}）") from exc
 
 
 def _validate_relative(relative_path: str) -> tuple[str, ...]:
@@ -303,26 +292,29 @@ def _hash_file(path: str, expected: PathSnapshot, cancel: Event | None,
     before = _read_snapshot(path, "file")
     if before != expected:
         raise TrashSafetyError(f"文件在读取前发生变化：{path}")
-    digest = hashlib.sha256()
-    completed = 0
     try:
         with open(native(path), "rb", buffering=0) as stream:
-            while True:
-                _check_cancel(cancel)
-                block = stream.read(HASH_CHUNK_SIZE)
-                if not block:
-                    break
-                digest.update(block)
-                completed += len(block)
+            opened = os.fstat(stream.fileno())
+            if (not stat.S_ISREG(opened.st_mode) or
+                    (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns) !=
+                    (expected.device, expected.inode, expected.size, expected.mtime_ns)):
+                raise TrashSafetyError(f"打开文件时内容身份已改变：{path}")
+            def report(completed):
                 _emit(progress, TrashProgress(
                     "hash", vault_root, relative_path, completed, expected.size
                 ))
+            completed, digest = hash_stream(stream, expected.size,
+                                           check_cancel=lambda: _check_cancel(cancel), progress=report)
+            finished = os.fstat(stream.fileno())
+            if (finished.st_size, finished.st_mtime_ns, finished.st_ctime_ns) != (
+                    opened.st_size, opened.st_mtime_ns, opened.st_ctime_ns):
+                raise TrashSafetyError(f"文件在读取期间发生变化：{path}")
     except OSError as exc:
         raise TrashSafetyError(f"无法读取回收站文件：{path}（{exc}）") from exc
     after = _read_snapshot(path, "file")
     if after != expected or completed != expected.size:
         raise TrashSafetyError(f"文件在读取期间发生变化：{path}")
-    return digest.hexdigest()
+    return digest
 
 
 def _directory_digest(children: list[tuple[str, str, int, str]]) -> str:
