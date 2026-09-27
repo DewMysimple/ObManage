@@ -237,6 +237,7 @@ def test_every_management_page_fits_width_and_bottom_actions_are_reachable(
                 window.pages["templater"].execute_button,
             ),
             "trash_cleanup": (window.pages["trash_cleanup"].clear_button,),
+            "archive": (window.pages["archive"].execute_button,),
         }
         for key, controls in bottom_controls.items():
             window._show_page(key, persist=False)

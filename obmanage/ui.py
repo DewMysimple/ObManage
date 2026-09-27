@@ -5,6 +5,7 @@ import ntpath
 import os
 import threading
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -62,7 +63,9 @@ from .scheduler import Scheduler
 from .settings import SettingsStore
 from .tasking import FeatureWorker
 from .pages.backup import VaultBackupPage
+from .pages.archive import ArchivePage
 from .pages.common import FeaturePage, PathPicker
+from .pages.controls import DropDownCombo
 from .pages.vault_selection import VaultSelection
 from .pages.icons import action_icon
 from .pages.incremental import IncrementalPage
@@ -70,6 +73,8 @@ from .pages.distribution import ObsidianConfigPage, TemplateSuitePage, Templater
 from .pages.registry import FEATURES
 from .pages.statistics import StatisticsPage
 from .pages.trash_cleanup import TrashCleanupPage
+from .pages.logs import OperationLogDialog
+from .operation_log import append_entry, new_entry, read_entries
 
 
 ACTION_NAMES = {
@@ -300,20 +305,6 @@ class ResponsivePlanTableView(QTableView):
             self.horizontalHeader().resizeSection(column, column_width)
 
 
-class DropDownCombo(QComboBox):
-    """Keep the drop-down affordance visible with editable, styled combo boxes."""
-
-    def paintEvent(self, event: Any) -> None:
-        super().paintEvent(event)
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
-        painter.setPen(QPen(QColor("#7B8D96" if self.isEnabled() else "#B6C1C6"), 1.4))
-        x, y = self.width() - 14, self.height() // 2
-        painter.drawLine(x - 3, y - 2, x, y + 1)
-        painter.drawLine(x, y + 1, x + 3, y - 2)
-        painter.end()
-
-
 class SyncWorker(QThread):
     progress = Signal(object)
     completed = Signal(object)
@@ -504,6 +495,9 @@ class MainWindow(QMainWindow):
         self._tray_close_notified = False
         self._log_dialog: QDialog | None = None
         self._log_lines: list[str] = []
+        self._log_context = None
+        self._log_entries = []
+        self._log_issues = []
         self._load_log()
 
         self.setWindowTitle("ObManage · Obsidian 仓库管理")
@@ -528,7 +522,7 @@ class MainWindow(QMainWindow):
         self._save_timer.setInterval(400)
         self._save_timer.timeout.connect(self._persist)
         if self.store.last_error:
-            self._log(self.store.last_error)
+            self._log(self.store.last_error, feature="system", event="设置", level="warning")
             self._set_status("设置已重置，请检查同步位置。", "warning")
 
     @property
@@ -939,6 +933,9 @@ class MainWindow(QMainWindow):
                     str(Path.home() / "Desktop" / "ObsidianTest"),
                     self.settings.portable_path,
                 )
+            elif feature.key == "archive":
+                page = ArchivePage(self.state_dir,
+                    self.settings_document.features.get(feature.key, {}), self.settings.local_path)
             elif feature.key == "statistics":
                 page = StatisticsPage(
                     self.settings_document.features.get(feature.key, {}),
@@ -963,7 +960,7 @@ class MainWindow(QMainWindow):
             )
             page.cancel_requested.connect(self.cancel_operation)
             page.settings_changed.connect(self._queue_settings_save)
-            page.message_logged.connect(self._log)
+            page.message_logged.connect(lambda message, key=feature.key: self._log(message, feature=key))
             for picker in page.findChildren(PathPicker):
                 selection = picker.selection
                 selection.task_requested.connect(
@@ -1038,11 +1035,12 @@ class MainWindow(QMainWindow):
         selection = VaultSelection(self, accept, browse, roots)
         browse_button = layout.itemAt(layout.count() - 1).widget()
         selection.buttons = []
-        for text, icon, running in (("从仓库列表选择…", "search", False),
-                                    ("识别当前运行仓库", "refresh", True)):
+        for text, icon, running in (("仓库列表", "search", False),
+                                    ("当前运行", "refresh", True)):
             button = QPushButton(text)
             button.setProperty("pathAction", True)
             button.setIcon(action_icon(icon))
+            button.setToolTip("识别当前正在 Obsidian 中运行的仓库" if running else "从仓库列表中选择")
             button.clicked.connect(lambda checked=False, mode=running: selection.start(mode))
             layout.insertWidget(layout.count() - 1, button)
             selection.buttons.append(button)
@@ -1068,6 +1066,9 @@ class MainWindow(QMainWindow):
         self._feature_worker = worker
         self._feature_page = page
         self._feature_outcome = None
+        feature = next((key for key, value in self.pages.items() if value is page), self._current_page_key)
+        kind = "选择仓库" if isinstance(page, VaultSelection) else page._task_kind
+        self._begin_log_task(feature, kind)
         self._refresh_actions()
         worker.start()
 
@@ -1093,6 +1094,7 @@ class MainWindow(QMainWindow):
         worker = self._feature_worker
         page = self._feature_page
         outcome = self._feature_outcome or ("error", "后台任务结束，但未返回结果。")
+        log_context = self._log_context
         self._feature_worker = None
         self._feature_page = None
         self._feature_outcome = None
@@ -1100,9 +1102,10 @@ class MainWindow(QMainWindow):
             status, payload = outcome
             page.task_finished(status, payload)
             if status == "error":
-                self._log(str(payload))
+                self._log(str(payload), level="error")
             elif status == "cancelled":
-                self._log("管理任务已取消。")
+                self._log("管理任务已取消。", level="cancelled")
+        self._end_log_task(log_context, outcome)
         self._refresh_actions()
         if self._exit_requested:
             self._finish_exit()
@@ -1207,7 +1210,7 @@ class MainWindow(QMainWindow):
         self.paths_panel.setToolTip("方向已切换，旧预览与确认已清除，定时已暂停。请重新分析差异。")
         self.current_file.setText(f"{source_name}只读取；新增、更新与删除仅发生在{target_name}。")
         self._set_status(f"已切换为 {source_name} → {target_name}，请重新分析。")
-        self._log(f"已切换方向：{source_name} {self._paths()[0]} → {target_name} {self._paths()[1]}；定时已暂停。")
+        self._log(f"已切换方向：{source_name} {self._paths()[0]} → {target_name} {self._paths()[1]}；定时已暂停。", feature="mirror", event="切换方向", task="")
         self._refresh_actions()
         self._persist()
 
@@ -1303,7 +1306,7 @@ class MainWindow(QMainWindow):
         try:
             self.store.save_document(self.settings_document)
         except (OSError, ValueError) as exc:
-            self._log(f"无法保存设置：{exc}")
+            self._log(f"无法保存设置：{exc}", feature="system", event="设置", level="error", task="")
             self._set_status("无法保存设置，详情见日志。", "warning")
             return False
         return True
@@ -1340,7 +1343,7 @@ class MainWindow(QMainWindow):
         if self.settings.schedule_enabled:
             source_name, target_name = self._endpoint_names()
             self.paths_panel.setToolTip(f"定时已绑定 {source_name} → {target_name}，仅自动更新{target_name}（含删除）；切换方向后自动暂停。")
-            self._log(f"已启用定时同步：只读取 {source_name} {self.settings.source} → 仅更新 {target_name} {self.settings.target}（含删除）")
+            self._log(f"已启用定时同步：只读取 {source_name} {self.settings.source} → 仅更新 {target_name} {self.settings.target}（含删除）", feature="mirror", event="定时设置", task="")
 
     @Slot()
     def pause_schedule(self) -> None:
@@ -1356,7 +1359,7 @@ class MainWindow(QMainWindow):
         self._refresh_schedule_controls()
         self._refresh_actions()
         if was_enabled:
-            self._log("定时同步已暂停。")
+            self._log("定时同步已暂停。", feature="mirror", event="定时设置", task="")
             self.paths_panel.setToolTip("定时已暂停。请按上方方向分析差异，所有修改与删除仅发生在接收更新的仓库。")
 
     def _refresh_schedule_controls(self) -> None:
@@ -1383,9 +1386,9 @@ class MainWindow(QMainWindow):
         occupied = self.busy or self._confirming_empty or recovery_pending
         due = self.scheduler.tick(occupied)
         if was_due and recovery_pending:
-            self._log("到达定时时间，但存在待恢复事务；本轮镜像已跳过，不累计任务。")
+            self._log("到达定时时间，但存在待恢复事务；本轮镜像已跳过，不累计任务。", feature="mirror", event="定时跳过", task="", level="warning")
         elif was_due and occupied:
-            self._log("到达定时时间，本轮已有任务运行；已跳过，不累计任务。")
+            self._log("到达定时时间，本轮已有任务运行；已跳过，不累计任务。", feature="mirror", event="定时跳过", task="", level="warning")
         if due:
             if self._paths() != (self.settings.bound_source, self.settings.bound_target):
                 self.pause_schedule()
@@ -1475,7 +1478,7 @@ class MainWindow(QMainWindow):
         )
         source_name, target_name = self._endpoint_names()
         self._set_status(f"正在{'完整校验内容' if deep else '分析差异'}：{source_name} → {target_name}（分析不修改文件）", "busy")
-        self._log(f"{'定时' if scheduled else '手动'}{'完整内容校验' if deep else '分析差异'}：以 {source_name} {source} 为准 → 仅修改 {target_name} {target}；分析阶段不修改仓库。")
+        self._log(f"{'定时' if scheduled else '手动'}{'完整内容校验' if deep else '分析差异'}：以 {source_name} {source} 为准 → 仅修改 {target_name} {target}；分析阶段不修改仓库。", feature="mirror", event="分析差异")
         self._start_worker("analyze", deep=deep, scheduled=scheduled)
 
     @Slot()
@@ -1535,13 +1538,14 @@ class MainWindow(QMainWindow):
         if self._recovery_page_keys():
             message = "存在待恢复事务，本轮镜像已阻止；请先完成撤销、恢复或确认清理。"
             self._set_status(message, "warning")
-            self._log(message)
+            self._log(message, feature="mirror", event="执行", level="warning")
             return
         source_name, target_name = self._endpoint_names()
         self._set_status(f"正在更新{target_name}，完成新增与更新后再删除此处多余内容；{source_name}只读取。", "busy")
         self._log(
             f"开始同步：以 {source_name} {self.plan.source} 为准，仅更新 {target_name} {self.plan.target}，"
-            f"包括删除；{source_name}不覆盖或删除。预计复制 {format_bytes(self.plan.bytes_to_copy)}。"
+            f"包括删除；{source_name}不覆盖或删除。预计复制 {format_bytes(self.plan.bytes_to_copy)}。",
+            feature="mirror", event="执行",
         )
         self._start_worker("execute", scheduled=scheduled, allow_empty=allow_empty)
 
@@ -1559,6 +1563,7 @@ class MainWindow(QMainWindow):
         self._operation = operation
         self._scheduled = scheduled
         self._job_started = time.monotonic()
+        self._begin_log_task("mirror", operation)
         self._progress_key = None
         self._copy_started = 0.0
         self.progress_bar.setRange(0, 0)
@@ -1589,6 +1594,7 @@ class MainWindow(QMainWindow):
         # stopped, so callbacks and close requests cannot overlap two operations.
         operation, scheduled = self._operation, self._scheduled
         outcome = self._pending_outcome or ("error", "后台任务结束，但未返回结果。")
+        log_context = self._log_context
         if operation == "analyze" and self._cancel_event.is_set():
             outcome = ("cancelled", None)
         self._worker = None
@@ -1599,6 +1605,7 @@ class MainWindow(QMainWindow):
         self.speed_label.setText("")
         self._refresh_actions()
         if self._exit_requested:
+            self._end_log_task(log_context, outcome)
             self._finish_exit()
             return
 
@@ -1609,7 +1616,7 @@ class MainWindow(QMainWindow):
             self.current_file.setText("已停止后续操作。")
             self.empty_title.setText("分析已取消")
             self.empty_detail.setText("已完成的内容校验记录已保留，点击「分析差异」即可继续。")
-            self._log("任务已取消。")
+            self._log("任务已取消。", level="cancelled")
         elif status == "error":
             self.plan = None
             self._set_status("本轮未完成，请查看日志并重新分析差异。", "error")
@@ -1617,12 +1624,13 @@ class MainWindow(QMainWindow):
             self.current_file.setToolTip(str(payload))
             self.empty_title.setText("未能完成分析" if operation == "analyze" else "本轮同步未完成")
             self.empty_detail.setText(str(payload))
-            self._log(str(payload))
+            self._log(str(payload), level="error")
             self._notify("本轮同步未完成", str(payload), warning=True)
         elif operation == "analyze":
             self._accept_plan(payload, scheduled)
         else:
             self._accept_result(payload)
+        self._end_log_task(log_context, outcome)
         self._refresh_actions()
 
     def _accept_plan(self, plan: SyncPlan, scheduled: bool) -> None:
@@ -1647,7 +1655,7 @@ class MainWindow(QMainWindow):
             self.empty_title.setText("本轮无法同步")
             self.empty_detail.setText(errors[0] if errors else "请查看异常列表及日志。")
             for error in errors:
-                self._log(error)
+                self._log(error, level="error")
             if scheduled:
                 self._log("定时任务本轮跳过；下次到点重新检查。")
             self._notify("本轮无法同步", errors[0] if errors else "请查看日志。", warning=True)
@@ -1725,7 +1733,7 @@ class MainWindow(QMainWindow):
             self._log(f"同步未完成：{summary}")
             self._notify(f"{target_name}更新未完成", result.errors[0] if result.errors else "请查看日志。", warning=True)
         for error in result.errors:
-            self._log(error)
+            self._log(error, level="error")
         self.preview_title.setText(f"本轮执行前记录 · 操作位置：{target_name}")
         self.paths_panel.setToolTip(f"上方为本轮执行前的记录，操作仅针对{target_name}。再次同步前请重新分析。")
 
@@ -1853,62 +1861,65 @@ class MainWindow(QMainWindow):
         QApplication.clipboard().setText("\n".join(paths))
 
     def _load_log(self) -> None:
-        path = self.state_dir / "ui.log"
-        try:
-            if path.exists():
-                with path.open("rb") as stream:
-                    stream.seek(max(0, path.stat().st_size - 256_000))
-                    self._log_lines = stream.read().decode("utf-8", errors="replace").splitlines()[-3000:]
-        except OSError:
-            self._log_lines = []
+        self._log_entries, self._log_issues = read_entries(self.state_dir)
+        self._log_lines = [f"[{entry.timestamp}] {entry.message}" for entry in self._log_entries][-3000:]
 
-    def _log(self, message: str) -> None:
-        line = f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {message}"
+    def _begin_log_task(self, feature, kind):
+        events = {"analyze": "分析差异", "preview": "预览", "execute": "执行", "archive": "打包",
+                  "scan": "扫描", "rollback": "撤销", "finalize": "确认保留", "clear": "清理",
+                  "restore": "恢复", "statistics": "统计", "catalog": "读取仓库列表", "analyze_deep": "完整内容校验"}
+        event = events.get(kind, kind or "任务")
+        self._log_context = (feature, event, uuid.uuid4().hex)
+        self._log("任务开始。")
+
+    def _end_log_task(self, context, outcome):
+        if context is None:
+            return
+        status, payload = outcome
+        result_status = getattr(payload, "status", status)
+        errors = getattr(payload, "errors", ()) or getattr(payload, "failures", ())
+        issues = getattr(payload, "issues", ()) or getattr(getattr(payload, "choices", None), "issues", ())
+        level = ("cancelled" if result_status == "cancelled" else
+                 "error" if status == "error" or errors or result_status in ("failed", "error", "partial") else
+                 "warning" if issues else "success")
+        label = {"success": "任务完成。", "error": "任务未完成，请查看本次任务记录。",
+                 "cancelled": "任务已取消。", "warning": "任务返回了提示或不完整结果，请查看本次任务记录。"}[level]
+        self._log(label, feature=context[0], event=context[1], task=context[2], level=level)
+        if self._log_context == context:
+            self._log_context = None
+
+    def _log(self, message: str, *, feature=None, event=None, task=None, level="info") -> None:
+        context = self._log_context
+        if context and (feature is None or feature == context[0]):
+            feature, default_event, default_task = context
+        else:
+            feature, default_event, default_task = feature or "system", "记录", ""
+        entry = new_entry(message, feature, event or default_event, task if task is not None else default_task, level)
+        line = f"[{entry.timestamp}] {message}"
         self._log_lines.append(line)
         self._log_lines = self._log_lines[-3000:]
+        self._log_entries.append(entry)
         if self._log_dialog is not None:
-            self.log_view.setPlainText("\n".join(reversed(self._log_lines)))
-            self.log_view.verticalScrollBar().setValue(0)
+            self._log_dialog.set_entries(self._log_entries, self._log_issues)
         if self._state_location_error():
             return
         logging.getLogger(__name__).info(message)
         try:
-            self.state_dir.mkdir(parents=True, exist_ok=True)
+            append_entry(self.state_dir, entry)
             path = self.state_dir / "ui.log"
             if path.exists() and path.stat().st_size > 2_000_000:
                 path.replace(self.state_dir / "ui.previous.log")
             with path.open("a", encoding="utf-8") as stream:
                 stream.write(line + "\n")
-        except OSError:
-            pass
+        except OSError as exc:
+            self._log_issues.append(f"操作日志无法保存：{exc}")
 
     @Slot()
     def show_logs(self) -> None:
         if self._log_dialog is None:
-            self._log_dialog = QDialog(self)
-            self._log_dialog.setWindowTitle("ObManage · 操作日志")
-            self._log_dialog.resize(920, 540)
-            log_layout = QVBoxLayout(self._log_dialog)
-            log_layout.setContentsMargins(20, 20, 20, 20)
-            label = QLabel("操作记录与失败原因")
-            label.setObjectName("SectionTitle")
-            log_layout.addWidget(label)
-            self.log_view = QPlainTextEdit()
-            self.log_view.setObjectName("log_view")
-            self.log_view.setReadOnly(True)
-            self.log_view.setMaximumBlockCount(3000)
-            self.log_view.setPlainText("\n".join(reversed(self._log_lines)))
-            self.log_view.verticalScrollBar().setValue(0)
-            log_layout.addWidget(self.log_view)
-            bottom = QHBoxLayout()
-            hint = QLabel(str(self.state_dir / "ui.log"))
-            hint.setObjectName("Muted")
-            hint.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
-            bottom.addWidget(hint, 1)
-            close = QPushButton("关闭")
-            close.clicked.connect(self._log_dialog.hide)
-            bottom.addWidget(close)
-            log_layout.addLayout(bottom)
+            self._log_dialog = OperationLogDialog(self)
+            self.log_view = self._log_dialog.view
+        self._log_dialog.set_entries(self._log_entries, self._log_issues)
         self._log_dialog.show()
         self._log_dialog.raise_()
         self._log_dialog.activateWindow()

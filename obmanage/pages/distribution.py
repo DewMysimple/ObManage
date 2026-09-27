@@ -1479,7 +1479,7 @@ class TemplaterPage(DistributionPage):
                  | None = None) -> None:
         super().__init__(
             state_dir, settings, default_root,
-            title="Templater 分发",
+            title=".Templater",
             description=("只完整克隆 File/Templater 子树，不触碰 File 下的其他内容；"
                          "支持持久撤销与确认保留。"),
             obsidian_config_path=obsidian_config_path,

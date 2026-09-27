@@ -62,7 +62,7 @@ def dispose(app, window):
     QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
 
 
-def test_shell_registers_eight_pages_with_mirror_first(application, tmp_path):
+def test_shell_registers_nine_pages_with_mirror_first(application, tmp_path):
     window = MainWindow(tmp_path / "state")
     try:
         assert tuple(window.pages) == tuple(feature.key for feature in FEATURES)
@@ -98,8 +98,8 @@ def test_all_path_selectors_share_three_choices_and_runtime_uses_single_task_slo
     try:
         for page in window.pages.values():
             for picker in page.findChildren(PathPicker):
-                assert picker.vault_list.text() == "从仓库列表选择…"
-                assert picker.running_vault.text() == "识别当前运行仓库"
+                assert picker.vault_list.text() == "仓库列表"
+                assert picker.running_vault.text() == "当前运行"
                 assert picker.browse.text() == "浏览…"
         page = window.pages["obsidian_config"]
         window._show_page("obsidian_config", persist=False)

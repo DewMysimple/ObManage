@@ -50,9 +50,11 @@ class PathPicker(QWidget):
         self.browse = QPushButton("浏览…")
         self.browse.clicked.connect(self._browse)
         self.browse.setIcon(action_icon("folder"))
-        self.vault_list = QPushButton("从仓库列表选择…")
+        self.vault_list = QPushButton("仓库列表")
+        self.vault_list.setToolTip("从已登记及当前范围内的仓库中选择")
         self.vault_list.setIcon(action_icon("search"))
-        self.running_vault = QPushButton("识别当前运行仓库")
+        self.running_vault = QPushButton("当前运行")
+        self.running_vault.setToolTip("识别当前正在 Obsidian 中运行的仓库")
         self.running_vault.setIcon(action_icon("refresh"))
         for button in (self.vault_list, self.running_vault, self.browse):
             button.setProperty("pathAction", True)
@@ -82,7 +84,7 @@ class PathPicker(QWidget):
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        inline = self.width() >= 860
+        inline = self.width() >= 700
         if inline != self._inline_actions:
             self._inline_actions = inline
             self.action_indent.changeSize(0 if inline else 116, 0)

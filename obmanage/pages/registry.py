@@ -19,6 +19,7 @@ FEATURES = (
     FeatureDescriptor("statistics", "仓库统计", "仓库统计", "统计容量、文件类型、Markdown 和字符"),
     FeatureDescriptor("template_suite", "模板套件部署", "模板套件", "把选定模板组件安全部署到仓库"),
     FeatureDescriptor("obsidian_config", ".obsidian同步", ".obsidian同步", "将来源 .obsidian 单向同步到所选仓库"),
-    FeatureDescriptor("templater", "Templater 分发", "Templater", "将 File/Templater 分发到多个仓库"),
-    FeatureDescriptor("trash_cleanup", "回收站清理", "回收站", "预览并直接清理仓库的 .trash 内容"),
+    FeatureDescriptor("templater", ".Templater", ".Templater", "将 File/Templater 分发到多个仓库"),
+    FeatureDescriptor("trash_cleanup", ".Trash", ".Trash", "预览并直接清理仓库的 .trash 内容"),
+    FeatureDescriptor("archive", ".Archive", ".Archive", "打包仓库为 ZIP，可排除视频并选择压缩级别"),
 )

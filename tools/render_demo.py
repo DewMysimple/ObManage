@@ -20,6 +20,8 @@ from obmanage.models import PlanItem, SyncPlan
 from obmanage.management.incremental import IncrementalAnalysis, VaultPair
 from obmanage.management.deployment import FileChange
 from obmanage.management.models import VaultCatalogResult, VaultInfo
+from obmanage.management.archive import ArchiveEntry, ArchivePlan
+from obmanage.operation_log import LogEntry
 from obmanage.pages.distribution import OpenVaultState
 from obmanage.pages.vault_chooser import VaultSourceDialog
 from obmanage.pages.registry import FEATURES
@@ -34,6 +36,7 @@ def main() -> None:
     parser.add_argument("--height", type=int, default=880)
     parser.add_argument("--maximized", action="store_true")
     parser.add_argument("--source-chooser", action="store_true", help="render the demo source chooser")
+    parser.add_argument("--logs", action="store_true", help="render synthetic operation log filters")
     parser.add_argument(
         "--page", choices=[feature.key for feature in FEATURES], default="mirror",
         help="page to render (default: mirror)",
@@ -149,6 +152,24 @@ def main() -> None:
                 chooser = VaultSourceDialog(catalog, page)
                 chooser.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
                 chooser.show()
+        elif args.page == "archive":
+            page = window.pages[args.page]
+            page.source_picker.set_value(r"C:\Obsidian\知识仓库")
+            page.destination_mode.setCurrentIndex(1)
+            page.output_edit.setText(r"H:\BaiduSyncdisk\仓库归档")
+            page.launch_baidu.setChecked(True)
+            page.client_edit.setText(r"C:\Apps\BaiduNetdisk\BaiduNetdisk.exe")
+            page.exclude_videos.setChecked(True)
+            page.level.setValue(6)
+            rows = tuple(ArchiveEntry(path, {"kind": kind, "size": size}, reason) for path, kind, size, reason in (
+                (".obsidian", "dir", 0, ""), (".obsidian/app.json", "file", 2860, ""),
+                ("笔记/项目记录.md", "file", 16840, ""), ("笔记/读书摘要.md", "file", 8210, ""),
+                ("附件/阅读资料.pdf", "file", 1820000, ""), ("附件/封面.png", "file", 480000, ""),
+                ("归档/空目录", "dir", 0, ""), ("视频/课程.mp4", "file", 2800000000, "视频"),
+            ))
+            page.task_finished("ok", ArchivePlan(page.source_picker.value,
+                r"H:\BaiduSyncdisk\仓库归档\知识仓库_20260927_180000.zip", 6, True, rows, {}, {}, "", ""))
+            window._show_page(args.page, persist=False)
         else:
             window._show_page(args.page, persist=False)
         # Only presentation is exercised: no analyze/execute worker is started.
@@ -166,6 +187,22 @@ def main() -> None:
         assert not window.busy and not window.confirm_direction_checkbox.isChecked()
         args.output.parent.mkdir(parents=True, exist_ok=True)
         capture = chooser if args.source_chooser and args.page == "obsidian_config" else window
+        if args.logs:
+            window.show_logs()
+            dialog = window._log_dialog
+            dialog.set_entries([
+                LogEntry("2026-09-27 14:30:00", "任务开始。", "archive", "打包", "a10001"),
+                LogEntry("2026-09-27 14:30:18", r"打包完成并校验通过：H:\归档\知识仓库.zip；428 个文件，18.6 MB。", "archive", "打包", "a10001", "success"),
+                LogEntry("2026-09-27 15:10:00", "任务开始。", "mirror", "分析差异", "b10002"),
+                LogEntry("2026-09-27 15:10:06", "新增 12 项，更新 3 项，删除 0 项。", "mirror", "分析差异", "b10002", "success"),
+                LogEntry("2026-09-27 16:05:00", "任务开始。", "archive", "打包", "c10003"),
+                LogEntry("2026-09-27 16:05:08", "来源清单已改变，请重新预览。压缩包未发布。", "archive", "打包", "c10003", "error"),
+            ])
+            dialog.feature.setCurrentIndex(dialog.feature.findData("archive"))
+            dialog.resize(min(args.width, 980), min(args.height, 640))
+            for _ in range(5):
+                app.processEvents()
+            capture = dialog
         assert capture.grab().save(str(args.output)), "Could not save demo screenshot"
         table = (
             window.table

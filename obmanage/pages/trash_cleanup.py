@@ -236,7 +236,7 @@ class TrashCleanupPage(FeaturePage):
 
     def __init__(self, state_dir: Path, settings: dict[str, Any], default_root: str) -> None:
         super().__init__(
-            "回收站清理",
+            ".Trash",
             "只处理真实仓库根目录下的 .trash；确认后直接清理所选预览内容，无法恢复。",
         )
         self.state_dir = Path(state_dir)
