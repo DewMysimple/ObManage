@@ -9,6 +9,7 @@ from threading import Event
 import pytest
 
 from obmanage.management import discover_vaults, read_opened_vault_candidates
+from obmanage.management.catalog import read_registered_vault_candidates
 from obmanage.management import catalog as catalog_module
 from obmanage.models import Progress, SyncCancelled
 from obmanage.paths import canonical
@@ -250,6 +251,50 @@ def test_obsidian_config_parse_errors_are_explicit(tmp_path, contents, code):
     assert len(result.issues) == 1
     assert result.issues[0].code == code
     assert result.issues[0].path == canonical(config)
+
+
+def test_registered_candidates_include_closed_and_unmarked_without_changing_occupancy(tmp_path):
+    config = tmp_path / "obsidian.json"
+    paths = [tmp_path / name for name in ("Opened", "Closed", "Unmarked")]
+    config.write_text(json.dumps({"vaults": {
+        "open": {"path": str(paths[0]), "open": True},
+        "closed": {"path": str(paths[1]), "open": False},
+        "unmarked": {"path": str(paths[2])},
+        "duplicate": {"path": str(paths[1])},
+        "bad": {"path": "relative"},
+    }}), encoding="utf-8")
+    before = tree_contents(tmp_path)
+    registered = read_registered_vault_candidates(config)
+    assert set(registered.paths) == {canonical(path) for path in paths}
+    assert len(registered.paths) == 3
+    assert registered.issues[0].code == "config_relative_path"
+    assert read_opened_vault_candidates(config).paths == (canonical(paths[0]),)
+    assert tree_contents(tmp_path) == before
+
+
+def test_nonrecursive_discovery_validates_exact_registered_roots(tmp_path, monkeypatch):
+    vault = make_vault(tmp_path / "Vault")
+    child = make_vault(vault / "Child")
+    real_scandir = catalog_module.os.scandir
+    visited = []
+
+    def scandir(path):
+        visited.append(canonical(path))
+        return real_scandir(path)
+
+    monkeypatch.setattr(catalog_module.os, "scandir", scandir)
+    result = discover_vaults((vault,), recursive=False)
+    assert [item.path for item in result.vaults] == [canonical(vault)]
+    assert canonical(child) not in visited
+    assert canonical(vault) not in visited  # Only validate its marker, never scan notes.
+
+
+@pytest.mark.parametrize("recursive", [True, False])
+def test_explicit_registered_recovery_directory_is_never_a_vault(tmp_path, recursive):
+    vault = make_vault(tmp_path / ".obmanage-deploy-example.backup" / "Hidden")
+    result = discover_vaults((vault,), recursive=recursive)
+    assert result.vaults == ()
+    assert result.issues[0].code == "recovery_scope_excluded"
 
 
 def test_opened_config_change_during_read_is_reported_as_unreliable(tmp_path, monkeypatch):

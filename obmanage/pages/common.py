@@ -42,6 +42,8 @@ class PathPicker(QWidget):
         layout.addWidget(self.browse)
         self.browse.clicked.connect(self._browse)
         self.edit.textChanged.connect(self.changed)
+        self.edit.textChanged.connect(self.edit.setToolTip)
+        self.edit.setToolTip(value)
 
     @property
     def value(self) -> str:

@@ -101,10 +101,15 @@ def _marker_state(directory: str) -> tuple[str, ManagementIssue | None]:
     return "valid", None
 
 
-def _trash_scope_issue(path: str) -> ManagementIssue | None:
-    """Reject an explicit scope inside a real vault's root-level trash."""
+def _scope_issue(path: str) -> ManagementIssue | None:
+    """Reject explicit discovery roots inside trash or app recovery directories."""
     current = path
     while True:
+        if any(os.path.basename(current).casefold().startswith(prefix)
+               for prefix in _RESERVED_DIRECTORY_PREFIXES):
+            return ManagementIssue(
+                "recovery_scope_excluded", "应用恢复目录不能作为仓库候选。", path, "warning",
+            )
         parent = os.path.dirname(current)
         if parent == current:
             return None
@@ -195,7 +200,24 @@ def read_opened_vault_candidates(
     *,
     environ: Mapping[str, str] | None = None,
 ) -> OpenedVaultCandidates:
-    """Parse paths whose Obsidian configuration entry has ``open: true``.
+    """Read only ``open: true`` entries for the independent occupancy check."""
+    return _read_vault_candidates(config_path, environ=environ, opened_only=True)
+
+
+def read_registered_vault_candidates(
+    config_path: str | Path | None = None,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> OpenedVaultCandidates:
+    """Read all registered vaults, including closed ones, for source selection."""
+    return _read_vault_candidates(config_path, environ=environ, opened_only=False)
+
+
+def _read_vault_candidates(
+    config_path: str | Path | None, *, environ: Mapping[str, str] | None,
+    opened_only: bool,
+) -> OpenedVaultCandidates:
+    """Parse Obsidian's registry without granting filesystem write access.
 
     The configuration and every candidate are only read.  Candidate paths are
     intentionally not accepted as vaults until :func:`discover_vaults` validates
@@ -254,18 +276,18 @@ def read_opened_vault_candidates(
                 "config_invalid_entry", f"仓库记录 {entry_id!s} 不是对象。", config
             ))
             continue
-        if entry.get("open") is not True:
+        if opened_only and entry.get("open") is not True:
             continue
         value = entry.get("path")
         if not isinstance(value, str) or not value.strip():
             issues.append(ManagementIssue(
-                "config_invalid_entry", f"已打开仓库记录 {entry_id!s} 缺少有效路径。", config
+                "config_invalid_entry", f"仓库记录 {entry_id!s} 缺少有效路径。", config
             ))
             continue
         expanded = os.path.expandvars(os.path.expanduser(value))
         if not os.path.isabs(expanded):
             issues.append(ManagementIssue(
-                "config_relative_path", f"已打开仓库记录 {entry_id!s} 使用了相对路径。", value
+                "config_relative_path", f"仓库记录 {entry_id!s} 使用了相对路径。", value
             ))
             continue
         candidate = canonical(expanded)
@@ -283,6 +305,7 @@ def discover_vaults(
     environ: Mapping[str, str] | None = None,
     cancel: Event | None = None,
     progress: ProgressCallback | None = None,
+    recursive: bool = True,
 ) -> VaultCatalogResult:
     """Discover unique physical vaults beneath one or more search roots."""
     root_values = _coerce_roots(roots)
@@ -300,9 +323,9 @@ def discover_vaults(
             issues.append(issue)
             continue
         assert physical is not None
-        trash_issue = _trash_scope_issue(physical)
-        if trash_issue is not None:
-            issues.append(trash_issue)
+        scope_issue = _scope_issue(physical)
+        if scope_issue is not None:
+            issues.append(scope_issue)
             continue
         prepared.setdefault(_path_key(physical), physical)
 
@@ -338,6 +361,9 @@ def discover_vaults(
                 relative_path=physical,
                 completed_files=completed_dirs,
             ))
+
+        if not recursive:
+            continue
 
         try:
             with os.scandir(native(physical)) as iterator:

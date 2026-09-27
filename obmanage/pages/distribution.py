@@ -11,6 +11,7 @@ from PySide6.QtCore import (
     QAbstractTableModel,
     QModelIndex,
     QSignalBlocker,
+    QSortFilterProxyModel,
     Qt,
     Signal,
     Slot,
@@ -23,6 +24,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
     QLabel,
+    QLineEdit,
     QMenu,
     QPushButton,
     QTableView,
@@ -30,6 +32,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..management import discover_vaults, read_opened_vault_candidates
+from ..management.catalog import read_registered_vault_candidates
 from ..management.deployment import (
     DeploymentComponent,
     DeploymentEngine,
@@ -50,6 +53,8 @@ from ..management.models import (
 from ..models import Progress, SyncCancelled
 from ..paths import canonical, native
 from .common import FeaturePage, PathPicker, format_bytes, panel
+from .icons import action_icon
+from .vault_chooser import VaultSourceDialog
 
 
 _ACTION_TEXT = {
@@ -189,6 +194,12 @@ class ExecuteTaskResult:
     open_state: OpenVaultState
 
 
+@dataclass(frozen=True)
+class SourceVaultResult:
+    choices: VaultCatalogResult
+    collection: VaultCatalogResult
+
+
 class VaultTargetTableModel(QAbstractTableModel):
     """Catalog-backed targets; rows are deliberately unchecked after every scan."""
 
@@ -212,6 +223,12 @@ class VaultTargetTableModel(QAbstractTableModel):
 
     def set_all_checked(self, checked: bool) -> None:
         wanted = {_physical_key(item.path) for item in self.rows} if checked else set()
+        self._set_checked(wanted)
+
+    def check_rows(self, rows: Iterable[int]) -> None:
+        self._set_checked(self._checked | {_physical_key(self.rows[row].path) for row in rows})
+
+    def _set_checked(self, wanted: set[str]) -> None:
         if wanted == self._checked:
             return
         self._checked = wanted
@@ -344,6 +361,7 @@ class DistributionPage(FeaturePage):
     source_label = "模板来源"
     source_hint = "选择包含待部署组件的目录"
     supports_opened_sources = False
+    compact_sync = False
 
     def __init__(self, state_dir: Path, settings: dict[str, Any], default_root: str,
                  *, title: str, description: str,
@@ -371,12 +389,17 @@ class DistributionPage(FeaturePage):
         )
         self._restoring = False
 
-        _, config = panel(self.body)
+        self.source_frame, config = panel(self.body)
+        if self.compact_sync:
+            title = QLabel("1  选择来源")
+            title.setObjectName("SectionTitle")
+            config.addWidget(title)
         self.root_picker = PathPicker(
             "仓库集合根目录", "", dialog_title="选择要发现目标仓库的集合根目录"
         )
         self.root_picker.edit.setObjectName(f"{self.page_key}_root")
-        config.addWidget(self.root_picker)
+        if not self.compact_sync:
+            config.addWidget(self.root_picker)
         self.source_picker = PathPicker(
             self.source_label, "", dialog_title=self.source_hint
         )
@@ -389,20 +412,36 @@ class DistributionPage(FeaturePage):
         if self.supports_opened_sources:
             opened_row = QHBoxLayout()
             opened_row.addSpacing(116)
-            self.opened_source_button = QPushButton("从 Obsidian 当前打开仓库选择…")
+            self.opened_source_button = QPushButton(
+                "从仓库列表选择…" if self.compact_sync else "从 Obsidian 当前打开仓库选择…"
+            )
             self.opened_source_button.setObjectName(f"{self.page_key}_opened_source")
             self.opened_source_button.setToolTip(
+                "查看 Obsidian 已登记的所有仓库（含已关闭）和当前集合中的仓库；支持搜索。"
+                if self.compact_sync else
                 "仅在点击后读取 Obsidian 的本机配置；候选仍会经过真实仓库校验。"
             )
-            opened_row.addWidget(self.opened_source_button)
-            self.opened_source_status = QLabel("不会自动读取 Obsidian 配置")
+            if self.compact_sync:
+                self.opened_source_button.setIcon(action_icon("search"))
+            if self.compact_sync:
+                self.source_picker.layout().insertWidget(2, self.opened_source_button)
+            else:
+                opened_row.addWidget(self.opened_source_button)
+            self.opened_source_status = QLabel(
+                "可选择已关闭的仓库，也可直接浏览文件夹。"
+                if self.compact_sync else "不会自动读取 Obsidian 配置"
+            )
             self.opened_source_status.setObjectName("Muted")
             self.opened_source_status.setWordWrap(True)
-            opened_row.addWidget(self.opened_source_status, 1)
-            config.addLayout(opened_row)
+            if self.compact_sync:
+                self.opened_source_status.setParent(self)
+                self.opened_source_status.hide()
+            else:
+                opened_row.addWidget(self.opened_source_status, 1)
+                config.addLayout(opened_row)
             self.opened_source_menu = QMenu(self)
 
-        _, component_layout = panel(self.body)
+        self.component_frame, component_layout = panel(self.body)
         component_grid = QGridLayout()
         component_grid.setHorizontalSpacing(12)
         component_grid.setVerticalSpacing(5)
@@ -424,49 +463,78 @@ class DistributionPage(FeaturePage):
         self.component_scope.setObjectName("Muted")
         self.component_scope.setWordWrap(True)
         component_layout.addWidget(self.component_scope)
+        self.component_frame.setVisible(not self.compact_sync)
 
         target_frame, target_layout = panel(self.body)
         target_header = QHBoxLayout()
-        target_title = QLabel("目标仓库")
+        target_title = QLabel("2  勾选目标仓库" if self.compact_sync else "目标仓库")
         target_title.setObjectName("SectionTitle")
         target_header.addWidget(target_title)
         self.target_summary = QLabel("尚未发现仓库 · 默认不选择任何目标")
         self.target_summary.setObjectName("Muted")
         target_header.addWidget(self.target_summary, 1)
         target_layout.addLayout(target_header)
+        if self.compact_sync:
+            target_layout.addWidget(self.root_picker)
         target_controls = QHBoxLayout()
-        target_controls.addStretch()
-        self.copy_target_button = QPushButton("复制所选路径")
+        self.target_filter: QLineEdit | None = None
+        if self.compact_sync:
+            self.target_filter = QLineEdit()
+            self.target_filter.setPlaceholderText("搜索目标仓库…")
+            self.target_filter.setAccessibleName("搜索目标仓库")
+            self.target_filter.setClearButtonEnabled(True)
+            self.target_filter.addAction(action_icon("search"), QLineEdit.ActionPosition.LeadingPosition)
+            target_controls.addWidget(self.target_filter, 1)
+        else:
+            target_controls.addStretch()
+        self.copy_target_button = QPushButton("复制所选路径", self)
         self.copy_target_button.setObjectName("TextButton")
-        target_controls.addWidget(self.copy_target_button)
-        self.select_all_targets_button = QPushButton("全选目标")
+        if not self.compact_sync:
+            target_controls.addWidget(self.copy_target_button)
+        else:
+            self.copy_target_button.hide()
+        self.select_all_targets_button = QPushButton("全选列表" if self.compact_sync else "全选目标")
         self.select_all_targets_button.setObjectName("TextButton")
+        self.select_all_targets_button.setToolTip("只勾选当前搜索结果；已有选择会保留。")
         target_controls.addWidget(self.select_all_targets_button)
         self.clear_targets_button = QPushButton("清空选择")
         self.clear_targets_button.setObjectName("TextButton")
         target_controls.addWidget(self.clear_targets_button)
-        self.catalog_button = QPushButton("发现仓库")
-        target_controls.addWidget(self.catalog_button)
+        self.catalog_button = QPushButton("扫描仓库" if self.compact_sync else "发现仓库")
+        if self.compact_sync:
+            self.root_picker.layout().addWidget(self.catalog_button)
+        else:
+            target_controls.addWidget(self.catalog_button)
         target_layout.addLayout(target_controls)
         self.target_table = QTableView()
         self.target_table.setObjectName(f"{self.page_key}_targets")
         self.target_model = VaultTargetTableModel(self)
-        self.target_table.setModel(self.target_model)
+        self.target_proxy = QSortFilterProxyModel(self)
+        self.target_proxy.setSourceModel(self.target_model)
+        self.target_proxy.setFilterKeyColumn(-1)
+        self.target_proxy.setFilterCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        self.target_table.setModel(self.target_proxy)
+        if self.target_filter is not None:
+            self.target_filter.textChanged.connect(self._filter_targets)
         self.target_table.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
         self.target_table.setEditTriggers(QTableView.EditTrigger.NoEditTriggers)
         self.target_table.verticalHeader().hide()
-        self.target_table.setMinimumHeight(100)
-        self.target_table.setMaximumHeight(150)
+        self.target_table.setMinimumHeight(150 if self.compact_sync else 100)
+        self.target_table.setMaximumHeight(180 if self.compact_sync else 150)
+        self.target_table.setWordWrap(False)
         target_header_view = self.target_table.horizontalHeader()
         target_header_view.setSectionResizeMode(0, QHeaderView.ResizeMode.ResizeToContents)
-        target_header_view.setSectionResizeMode(1, QHeaderView.ResizeMode.ResizeToContents)
+        target_header_view.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+        self.target_table.setColumnWidth(1, 165)
         target_header_view.setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        target_header_view.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
         target_layout.addWidget(self.target_table)
         self.catalog_issues = QLabel("")
         self.catalog_issues.setObjectName("Muted")
         self.catalog_issues.setWordWrap(True)
         self.catalog_issues.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         target_layout.addWidget(self.catalog_issues)
+        self.catalog_issues.hide()
 
         self.occupancy_status = QLabel("占用状态：尚未检查")
         self.occupancy_status.setObjectName("Muted")
@@ -482,16 +550,25 @@ class DistributionPage(FeaturePage):
 
         preview_frame, preview_layout = panel(self.body)
         preview_header = QHBoxLayout()
-        preview_title = QLabel("文件与目录预览")
+        preview_title = QLabel("3  预览变更" if self.compact_sync else "文件与目录预览")
         preview_title.setObjectName("SectionTitle")
         preview_header.addWidget(preview_title)
         self.preview_summary = QLabel("新增 — · 更新 — · 删除：尚未分析 · 跳过 —")
         self.preview_summary.setObjectName("Muted")
-        preview_header.addWidget(self.preview_summary, 1)
-        self.copy_preview_button = QPushButton("复制所选完整路径")
+        if self.compact_sync:
+            preview_header.addStretch()
+        else:
+            preview_header.addWidget(self.preview_summary, 1)
+        self.copy_preview_button = QPushButton("复制所选完整路径", self)
         self.copy_preview_button.setObjectName("TextButton")
-        preview_header.addWidget(self.copy_preview_button)
+        if self.compact_sync:
+            self.copy_preview_button.hide()
+        else:
+            preview_header.addWidget(self.copy_preview_button)
         preview_layout.addLayout(preview_header)
+        if self.compact_sync:
+            self.preview_summary.setWordWrap(True)
+            preview_layout.addWidget(self.preview_summary)
         self.preview_table = QTableView()
         self.preview_table.setObjectName(f"{self.page_key}_preview")
         self.preview_model = DeploymentPreviewTableModel(self)
@@ -505,13 +582,25 @@ class DistributionPage(FeaturePage):
         for column in (0, 1, 2, 4):
             preview_header_view.setSectionResizeMode(column, QHeaderView.ResizeMode.ResizeToContents)
         preview_header_view.setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        preview_header_view.setDefaultAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+        self.preview_table.setMinimumHeight(155)
+        if self.compact_sync:
+            self.preview_table.setColumnHidden(1, True)
+            preview_header_view.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
+            self.preview_table.setColumnWidth(2, 150)
         preview_layout.addWidget(self.preview_table, 1)
+        self.preview_empty = QLabel("勾选目标仓库后，点击「预览变更」。\n这里会列出新增、更新和删除的具体位置。", self.preview_table)
+        self.preview_empty.setObjectName("Muted")
+        self.preview_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.preview_empty.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        empty_layout = QVBoxLayout(self.preview_table.viewport())
+        empty_layout.addWidget(self.preview_empty)
+        self.preview_empty.setVisible(self.compact_sync)
         self.body.setStretch(self.body.count() - 1, 1)
 
-        recovery_frame, recovery_layout = panel(self.body)
-        recovery_frame.setObjectName("Panel")
+        self.recovery_frame, recovery_layout = panel(self.body)
         recovery_row = QHBoxLayout()
-        recovery_title = QLabel("持久部署批次")
+        recovery_title = QLabel("同步备份 · 保留或撤销" if self.compact_sync else "持久部署批次")
         recovery_title.setObjectName("SectionTitle")
         recovery_row.addWidget(recovery_title)
         self.batch_selector = QComboBox()
@@ -557,12 +646,30 @@ class DistributionPage(FeaturePage):
         self.cancel_button.setObjectName("Cancel")
         self.cancel_button.hide()
         actions.addWidget(self.cancel_button)
-        self.analyze_button = QPushButton("分析文件与目录差异")
+        self.analyze_button = QPushButton("预览变更" if self.compact_sync else "分析文件与目录差异")
         actions.addWidget(self.analyze_button)
-        self.execute_button = QPushButton("开始部署")
+        self.execute_button = QPushButton("开始同步" if self.compact_sync else "开始部署")
         self.execute_button.setObjectName("Primary")
         actions.addWidget(self.execute_button)
         self.root_layout.addLayout(actions)
+        if self.compact_sync:
+            self.safety_hint.setText("仅同步 .obsidian；目标独有配置会删除，笔记与附件不受影响。")
+            for button, icon in (
+                (self.source_picker.browse, "folder"), (self.root_picker.browse, "folder"),
+                (self.catalog_button, "refresh"), (self.analyze_button, "search"),
+                (self.select_all_targets_button, "check"), (self.clear_targets_button, "clear"),
+                (self.rollback_button, "undo"),
+            ):
+                button.setIcon(action_icon(icon))
+            self.execute_button.setIcon(action_icon("arrow", "#FFFFFF"))
+            self.root_picker.browse.setText("浏览…")
+            self.source_picker.browse.setText("浏览…")
+            for table, copier in ((self.target_table, self.copy_selected_target_paths),
+                                  (self.preview_table, self.copy_selected_preview_paths)):
+                table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+                table.customContextMenuRequested.connect(
+                    lambda point, table=table, copier=copier: self._path_menu(table, point, copier)
+                )
 
         self.restore_settings(settings)
         self.root_picker.changed.connect(lambda *_: self._inputs_changed(clear_catalog=True))
@@ -590,7 +697,7 @@ class DistributionPage(FeaturePage):
         self.occupancy_confirm.toggled.connect(lambda *_: self.refresh_actions())
         self.copy_target_button.clicked.connect(self.copy_selected_target_paths)
         self.select_all_targets_button.clicked.connect(
-            lambda: self.target_model.set_all_checked(True)
+            self._select_visible_targets
         )
         self.clear_targets_button.clicked.connect(
             lambda: self.target_model.set_all_checked(False)
@@ -685,12 +792,41 @@ class DistributionPage(FeaturePage):
         self.target_summary.setText(
             f"已发现 {len(self.target_model.rows):,} 个真实仓库 · 已选 {selected:,} 个"
         )
+        if self.compact_sync:
+            self._update_target_summary()
         self._update_occupancy_display(reset_confirmation=True)
         self.refresh_actions()
+
+    def _filter_targets(self, text: str) -> None:
+        self.target_proxy.setFilterFixedString(text.strip())
+        self._update_target_summary()
+        self.refresh_actions()
+
+    def _update_target_summary(self) -> None:
+        excluded = len(self.catalog.vaults) - len(self.target_model.rows) if self.catalog else 0
+        self.target_summary.setText(
+            f"{self.target_proxy.rowCount()} / {len(self.target_model.rows)} 个仓库 · "
+            f"已选 {len(self.target_model.checked_vaults())} 个"
+            + (f" · 已排除 {excluded} 个来源仓库" if excluded else "")
+        )
+
+    def _select_visible_targets(self) -> None:
+        self.target_model.check_rows(
+            self.target_proxy.mapToSource(self.target_proxy.index(row, 0)).row()
+            for row in range(self.target_proxy.rowCount())
+        )
+
+    def _path_menu(self, table, point, copier) -> None:
+        if not table.selectionModel().selectedRows():
+            return
+        menu = QMenu(table)
+        menu.addAction("复制所选完整路径", copier)
+        menu.exec(table.viewport().mapToGlobal(point))
 
     def _invalidate_plan(self, message: str = "计划已失效，请重新分析。") -> None:
         self.plan = None
         self.preview_model.set_rows(())
+        self.preview_empty.setVisible(self.compact_sync)
         self.preview_summary.setText("新增 — · 更新 — · 删除：尚未分析 · 跳过 —")
         blocker = QSignalBlocker(self.confirm_checkbox)
         self.confirm_checkbox.setChecked(False)
@@ -860,7 +996,7 @@ class DistributionPage(FeaturePage):
 
     @Slot()
     def _start_catalog(self) -> None:
-        if not self.root_picker.value or not self.source_picker.value:
+        if not self.root_picker.value or (not self.compact_sync and not self.source_picker.value):
             return
         root = self.root_picker.value
         self.catalog = None
@@ -964,6 +1100,8 @@ class DistributionPage(FeaturePage):
             f"已发现 {len(usable):,} 个真实仓库 · 已选 0 个"
             + (f" · 已排除 {excluded} 个来源仓库" if excluded else "")
         )
+        if self.compact_sync:
+            self._update_target_summary()
         if result.issues:
             first = result.issues[0]
             self.catalog_issues.setText(
@@ -976,6 +1114,7 @@ class DistributionPage(FeaturePage):
         else:
             self.catalog_issues.setText("")
             self.catalog_issues.setToolTip("")
+        self.catalog_issues.setVisible(bool(result.issues))
         if not usable:
             self.set_status("没有找到可作为目标的真实仓库；来源仓库不会列为目标。", "warning")
         elif result.issues:
@@ -1019,6 +1158,7 @@ class DistributionPage(FeaturePage):
             item.component_id.casefold(), item.absolute_path.casefold(), item.absolute_path,
         ))
         self.preview_model.set_rows(rows)
+        self.preview_empty.hide()
         self.preview_summary.setText(
             f"新增 {counts['add']:,} · 更新 {counts['update']:,} · "
             f"删除 {counts['delete']:,}（{delete_files:,} 文件 · {delete_dirs:,} 文件夹） · "
@@ -1031,6 +1171,11 @@ class DistributionPage(FeaturePage):
             f"我确认：来源只读；仅修改 {len(plan.targets):,} 个组件/目标组合；"
             f"将删除目标内 {delete_files:,} 个文件、{delete_dirs:,} 个文件夹。"
         )
+        if self.compact_sync:
+            self.confirm_checkbox.setText(
+                f"确认同步到 {len(plan.targets)} 个仓库的 .obsidian；"
+                f"将删除目标内 {delete_files} 个文件、{delete_dirs} 个文件夹。"
+            )
         self.confirm_checkbox.setEnabled(plan.needs_deploy)
         if plan.needs_deploy:
             self.set_status(
@@ -1244,7 +1389,8 @@ class DistributionPage(FeaturePage):
             box.setEnabled(available)
         self.target_table.setEnabled(available)
         self.catalog_button.setEnabled(
-            available and bool(self.root_picker.value and self.source_picker.value)
+            available and bool(self.root_picker.value)
+            and (self.compact_sync or bool(self.source_picker.value))
         )
         selected_targets = bool(self.target_model.checked_vaults())
         selected_components = bool(self.selected_component_ids())
@@ -1260,7 +1406,7 @@ class DistributionPage(FeaturePage):
         self.analyze_button.setEnabled(
             available and not pending and not self._external_recovery_pending
             and not self._recovery_blocked and self.catalog is not None
-            and selected_targets and selected_components
+            and selected_targets and selected_components and bool(self.source_picker.value)
         )
         self.confirm_checkbox.setEnabled(
             available and not pending and not self._external_recovery_pending
@@ -1287,8 +1433,10 @@ class DistributionPage(FeaturePage):
             available and bool(self.target_table.selectionModel().selectedRows())
         )
         self.select_all_targets_button.setEnabled(
-            available and bool(self.target_model.rows)
-            and len(self.target_model.checked_vaults()) < len(self.target_model.rows)
+            available and any(
+                self.target_proxy.index(row, 0).data(Qt.ItemDataRole.CheckStateRole)
+                != Qt.CheckState.Checked for row in range(self.target_proxy.rowCount())
+            )
         )
         self.clear_targets_button.setEnabled(
             available and bool(self.target_model.checked_vaults())
@@ -1296,10 +1444,23 @@ class DistributionPage(FeaturePage):
         self.copy_preview_button.setEnabled(
             available and bool(self.preview_table.selectionModel().selectedRows())
         )
+        if self.compact_sync:
+            self.recovery_frame.setVisible(
+                pending or self._recovery_blocked or batch_status == "rolled_back_with_residuals"
+            )
+            self.confirm_checkbox.setVisible(self.plan is not None and self.plan.needs_deploy)
+            self.occupancy_status.setVisible(bool(target_paths))
+            self.progress_bar.setVisible(self._task_active)
+            if self.target_filter is not None:
+                self.target_filter.setEnabled(available)
+            self.analyze_button.setObjectName("Primary" if self.plan is None else "")
+            self.analyze_button.style().unpolish(self.analyze_button)
+            self.analyze_button.style().polish(self.analyze_button)
+            self.analyze_button.setIcon(action_icon("search", "#FFFFFF" if self.plan is None else "#476C82"))
 
     def copy_selected_target_paths(self) -> None:
         paths = [
-            self.target_model.rows[index.row()].path
+            self.target_model.rows[self.target_proxy.mapToSource(index).row()].path
             for index in self.target_table.selectionModel().selectedRows()
         ]
         if paths:
@@ -1350,9 +1511,10 @@ class TemplateSuitePage(DistributionPage):
 
 class ObsidianConfigPage(DistributionPage):
     page_key = "obsidian_config"
-    source_label = "模板仓库或配置"
-    source_hint = "选择模板仓库根目录或 .obsidian 目录"
+    source_label = "来源仓库 / 配置"
+    source_hint = "选择来源仓库或 .obsidian 文件夹"
     supports_opened_sources = True
+    compact_sync = True
     component_options = (
         ComponentOption("obsidian", ".obsidian 完整配置", ".obsidian", True),
     )
@@ -1361,14 +1523,97 @@ class ObsidianConfigPage(DistributionPage):
                  *, obsidian_config_path: str | Path | None = None,
                  opened_vault_reader: Callable[[str | Path | None], OpenedVaultCandidates]
                  | None = None) -> None:
+        self.source_dialog: VaultSourceDialog | None = None
+        self._catalog_root = ""
         super().__init__(
             state_dir, settings, default_root,
-            title="Obsidian 配置分发",
-            description=("把一个来源 .obsidian 完整克隆到多个所选仓库；"
-                         "来源仓库自动排除，目标均默认不勾选。"),
+            title=".obsidian同步",
+            description="把一个仓库的 .obsidian 单向同步到其他仓库，包含插件、主题和设置。",
             obsidian_config_path=obsidian_config_path,
             opened_vault_reader=opened_vault_reader,
         )
+
+    def restore_settings(self, settings: dict[str, Any]) -> None:
+        # The dedicated page has one fixed scope, including settings from older versions.
+        super().restore_settings({**settings, "components": ["obsidian"]})
+
+    def _inputs_changed(self, *_: Any, clear_catalog: bool = False) -> None:
+        retained = self.catalog if self.root_picker.value == self._catalog_root else None
+        super()._inputs_changed(clear_catalog=clear_catalog)
+        if retained is not None and clear_catalog and not self._restoring:
+            # Reuse only the discovery list. Choices, preview and confirmation are revoked;
+            # analysis and execution independently revalidate the actual filesystem.
+            self._accept_catalog(retained)
+
+    def _accept_catalog(self, result: VaultCatalogResult) -> None:
+        self._catalog_root = self.root_picker.value
+        super()._accept_catalog(result)
+
+    def _start_opened_sources(self) -> None:
+        root = self.root_picker.value
+        config_path = self.obsidian_config_path
+
+        def operation(cancel, progress):
+            if cancel.is_set():
+                raise SyncCancelled("已取消读取来源仓库列表。")
+            registered = read_registered_vault_candidates(config_path)
+            validated = discover_vaults(
+                registered.paths, recursive=False, cancel=cancel, progress=progress,
+            )
+            collection = (discover_vaults(root, cancel=cancel, progress=progress)
+                          if root else VaultCatalogResult())
+            vaults = {_physical_key(v.path): v for v in (*validated.vaults, *collection.vaults)}
+            issues = [*registered.issues, *validated.issues, *collection.issues]
+            validated_keys = {_physical_key(v.path) for v in validated.vaults}
+            for path in registered.paths:
+                if _physical_key(path) not in validated_keys:
+                    issues.append(ManagementIssue(
+                        "registered_vault_invalid", "已跳过不可用或没有 .obsidian 的登记仓库。",
+                        path, "warning",
+                    ))
+            choices = VaultCatalogResult(
+                tuple(sorted(vaults.values(), key=lambda v: (v.name.casefold(), v.path.casefold()))),
+                tuple(issues),
+            )
+            if cancel.is_set():
+                raise SyncCancelled("已取消读取来源仓库列表。")
+            return SourceVaultResult(choices, collection)
+
+        self.start_task("source_vaults", operation)
+
+    def task_cancellable(self) -> bool:
+        return (self._task_active and self._task_kind == "source_vaults") or super().task_cancellable()
+
+    def task_finished(self, status: str, payload: Any) -> None:
+        if self._task_kind != "source_vaults":
+            super().task_finished(status, payload)
+            return
+        FeaturePage.task_finished(self, status, payload)
+        self._task_kind = ""
+        if status == "ok":
+            self._accept_catalog(payload.collection)
+            assert self.opened_source_status is not None
+            self.opened_source_status.setText(
+                f"可选 {len(payload.choices.vaults)} 个仓库 · 包含已关闭的仓库"
+            )
+            if self.source_dialog is not None:
+                self.source_dialog.close()
+                self.source_dialog.deleteLater()
+            self.source_dialog = VaultSourceDialog(payload.choices, self)
+            self.source_dialog.source_chosen.connect(self.source_picker.set_value)
+            self.source_dialog.browse_requested.connect(self.source_picker.browse.click)
+            self.source_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+            if self.isVisible():
+                self.source_dialog.open()
+            self.set_status("请选择来源仓库；选好后在下方勾选目标。")
+        self.refresh_actions()
+
+    def set_status(self, text: str, kind: str = "neutral") -> None:
+        super().set_status(text.replace("部署", "同步"), kind)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self.target_table.setMaximumHeight(280 if self.height() > 1100 else 180)
 
     def _components(self) -> tuple[DeploymentComponent, ...]:
         if "obsidian" not in self.selected_component_ids():

@@ -424,7 +424,6 @@ QLineEdit, QComboBox, QSpinBox, QTimeEdit { min-height: 32px; border: 1px solid 
 QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QTimeEdit:focus { border-color: #7195AA; background: #FFFFFF; }
 QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled, QTimeEdit:disabled { color: #929CA2; background: #F2F4F4; }
 QComboBox::drop-down { width: 22px; border: none; }
-QComboBox::down-arrow { image: none; }
 QSpinBox::up-button, QTimeEdit::up-button { subcontrol-origin: border; subcontrol-position: top right; width: 20px; height: 17px; border-left: 1px solid #DAE1E3; }
 QSpinBox::down-button, QTimeEdit::down-button { subcontrol-origin: border; subcontrol-position: bottom right; width: 20px; height: 17px; border-left: 1px solid #DAE1E3; }
 QComboBox QAbstractItemView { background: #FFFFFF; border: 1px solid #DDE4E5; selection-background-color: #E9F0F3; selection-color: #23353F; padding: 4px; }
@@ -445,9 +444,6 @@ QPushButton#Cancel { color: #A04F44; }
 QPushButton#Recovery { color: #8B642D; border-color: #DEC9A7; background: #FFF9EE; }
 QPushButton#Recovery:hover { background: #F8EDD9; border-color: #CFB27E; }
 QCheckBox { spacing: 8px; }
-QCheckBox::indicator { width: 17px; height: 17px; border: 1px solid #B9C7CD; border-radius: 5px; background: #FFFFFF; }
-QCheckBox::indicator:checked { background: #315F7B; border: 4px solid #315F7B; image: none; }
-QCheckBox::indicator:disabled { border-color: #D9E0E3; background: #E6ECEF; }
 QTabBar { background: transparent; }
 QTabBar::tab { color: #78868D; background: transparent; padding: 9px 13px 8px; border-bottom: 2px solid transparent; font-size: 12px; }
 QTabBar::tab:selected { color: #315F7B; border-bottom: 2px solid #315F7B; }

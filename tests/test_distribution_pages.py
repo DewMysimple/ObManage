@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import threading
 from pathlib import Path
 
@@ -210,6 +211,7 @@ def test_execute_and_new_page_can_rollback_persistent_batch(application, tmp_pat
     page.task_requested.connect(operations.append)
     recovered = None
     try:
+        assert page.recovery_frame.isHidden()
         prepare_config_plan(page, operations)
         page.confirm_checkbox.setChecked(True)
         result = run_last_operation(page, operations, page._start_execute)
@@ -218,6 +220,7 @@ def test_execute_and_new_page_can_rollback_persistent_batch(application, tmp_pat
         assert snapshot_tree(target / ".obsidian") == snapshot_tree(source / ".obsidian")
         assert page.current_batch is not None
         assert page.current_batch.status == "committed"
+        assert not page.recovery_frame.isHidden()
         assert page.rollback_button.isEnabled()
         assert page.finalize_confirm.isEnabled()
         assert not page.finalize_button.isEnabled()
@@ -240,6 +243,7 @@ def test_execute_and_new_page_can_rollback_persistent_batch(application, tmp_pat
         assert recovered.current_batch.status == "rolled_back"
         assert not recovered.rollback_button.isEnabled()
         assert not recovered.finalize_button.isEnabled()
+        assert recovered.recovery_frame.isHidden()
     finally:
         if recovered is not None:
             dispose(recovered)
@@ -549,7 +553,7 @@ def test_suite_and_templater_build_explicit_bounded_requests_and_restore_setting
         dispose(suite)
 
 
-def test_input_changes_clear_catalog_plan_and_confirmation(application, tmp_path):
+def test_source_changes_reuse_discovery_but_revoke_selection_plan_and_confirmation(application, tmp_path):
     root, source, _target, _fake = create_config_fixture(tmp_path)
     page = ObsidianConfigPage(
         tmp_path / "state", {"root": str(root), "source": str(source)}, str(root),
@@ -562,16 +566,20 @@ def test_input_changes_clear_catalog_plan_and_confirmation(application, tmp_path
         page.confirm_checkbox.setChecked(True)
         page.source_picker.set_value(str(source / ".obsidian"))
 
-        assert page.catalog is None
-        assert page.target_model.rowCount() == 0
+        assert page.catalog is not None
+        assert page.target_model.rowCount() == 1
+        assert not page.target_model.checked_vaults()
         assert page.plan is None
         assert not page.confirm_checkbox.isChecked()
         assert not page.execute_button.isEnabled()
+        page.root_picker.set_value(str(root / "新范围"))
+        assert page.catalog is None
+        assert page.target_model.rowCount() == 0
     finally:
         dispose(page)
 
 
-@pytest.mark.parametrize("page_type", [ObsidianConfigPage, TemplaterPage])
+@pytest.mark.parametrize("page_type", [TemplaterPage])
 def test_opened_source_candidates_are_lazy_revalidated_and_user_selected(
     application, tmp_path, page_type
 ):
@@ -648,6 +656,111 @@ def test_target_select_all_and_clear_are_explicit_and_revoke_plan(application, t
         assert page.target_model.checked_vaults() == ()
         assert page.plan is None
         assert not page.confirm_checkbox.isChecked()
+    finally:
+        dispose(page)
+
+
+def test_source_list_includes_closed_registered_and_collection_vaults_without_auto_choice(
+    application, tmp_path
+):
+    root, source, target, fake = create_config_fixture(tmp_path)
+    closed = tmp_path / "其他集合" / "目标仓库"  # Duplicate name must remain distinguishable.
+    (closed / ".obsidian").mkdir(parents=True)
+    config = tmp_path / "obsidian.json"
+    config.write_text(json.dumps({"vaults": {
+        "open": {"path": str(source), "open": True},
+        "closed": {"path": str(closed), "open": False},
+        "invalid": {"path": str(fake)},
+    }}), encoding="utf-8")
+    page = ObsidianConfigPage(tmp_path / "state", {"root": str(root)}, str(root),
+                              obsidian_config_path=config)
+    operations = []
+    page.task_requested.connect(operations.append)
+    before = snapshot_tree(root)
+    try:
+        assert page.source_dialog is None
+        assert page.source_picker.value == ""
+        result = run_last_operation(page, operations, page._start_opened_sources)
+        assert {v.path for v in result.choices.vaults} == {str(source), str(target), str(closed)}
+        assert result.choices.issues
+        assert page.source_picker.value == ""  # No first/last/current vault is silently chosen.
+        assert page.open_state.paths == ()  # Registered candidates are never treated as occupancy.
+        dialog = page.source_dialog
+        assert dialog is not None
+        assert not dialog.choose_button.isEnabled()
+        dialog.search.setText("其他集合")
+        assert dialog.proxy.rowCount() == 1
+        path_index = dialog.proxy.index(0, 1)
+        assert path_index.data(Qt.ItemDataRole.ToolTipRole) == str(closed)
+        dialog.table.selectRow(0)
+        dialog.choose_button.click()
+        assert page.source_picker.value == str(closed)
+        assert page.catalog is not None  # The collection has already been discovered.
+        assert not page.target_model.checked_vaults()
+        assert {v.path for v in page.target_model.rows} == {str(source), str(target)}
+        state = page._read_open_state(threading.Event(), None, validate=False)
+        assert state.paths == (str(source),)
+        assert snapshot_tree(root) == before
+    finally:
+        dispose(page)
+
+
+def test_broken_registry_still_offers_collection_sources_and_manual_browse(application, tmp_path):
+    root, source, target, _fake = create_config_fixture(tmp_path)
+    config = tmp_path / "obsidian.json"
+    config.write_text("broken", encoding="utf-8")
+    page = ObsidianConfigPage(tmp_path / "state", {"root": str(root)}, str(root),
+                              obsidian_config_path=config)
+    operations = []
+    page.task_requested.connect(operations.append)
+    try:
+        result = run_last_operation(page, operations, page._start_opened_sources)
+        assert {v.path for v in result.choices.vaults} == {str(source), str(target)}
+        assert any(i.code == "config_invalid_json" for i in result.choices.issues)
+        assert not page.open_state.reliable
+        dialog = page.source_dialog
+        dialog.search.setText("没有匹配")
+        assert dialog.proxy.rowCount() == 0
+        assert not dialog.choose_button.isEnabled()
+        assert "浏览文件夹" in dialog.summary.text()
+        browsed = []
+        dialog.browse_requested.disconnect()
+        dialog.browse_requested.connect(lambda: browsed.append(True))
+        dialog._browse()
+        assert browsed == [True]
+        assert not page.source_picker.value
+    finally:
+        dispose(page)
+
+
+def test_filtered_target_selection_and_copy_use_visible_rows(application, tmp_path):
+    root, source, target, _fake = create_config_fixture(tmp_path)
+    second = root / "另一仓库"
+    (second / ".obsidian").mkdir(parents=True)
+    page = ObsidianConfigPage(tmp_path / "state", {"root": str(root), "source": str(source)},
+                              str(root), opened_vault_reader=closed_vault_reader)
+    operations = []
+    page.task_requested.connect(operations.append)
+    try:
+        run_last_operation(page, operations, page._start_catalog)
+        page.target_filter.setText("目标仓库")
+        page.select_all_targets_button.click()
+        assert [v.path for v in page.target_model.checked_vaults()] == [str(target)]
+        assert not page.select_all_targets_button.isEnabled()
+        page.target_table.selectRow(0)
+        page.copy_selected_target_paths()
+        assert QApplication.clipboard().text() == str(target)
+        run_last_operation(page, operations, page._start_analyze)
+        page.confirm_checkbox.setChecked(True)
+        page.target_filter.setText("另一仓库")
+        assert page.plan is not None  # Filtering alone doesn't change the selected targets.
+        assert "已选 1" in page.target_summary.text()
+        page.select_all_targets_button.click()
+        assert {v.path for v in page.target_model.checked_vaults()} == {str(target), str(second)}
+        assert page.plan is None
+        assert not page.confirm_checkbox.isChecked()
+        page.clear_targets_button.click()
+        assert not page.target_model.checked_vaults()  # Clear includes hidden selections.
     finally:
         dispose(page)
 

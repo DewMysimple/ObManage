@@ -15,7 +15,11 @@ from obmanage.management.models import (
     FileTypeStatistics,
     VaultStatistics,
     VaultStatisticsResult,
+    VaultCatalogResult,
+    VaultInfo,
 )
+from obmanage.pages.distribution import DeploymentPreviewRow
+from obmanage.pages.vault_chooser import VaultSourceDialog
 from obmanage.ui import FILTERS, MainWindow
 
 
@@ -225,7 +229,6 @@ def test_every_management_page_fits_width_and_bottom_actions_are_reachable(
                 window.pages["template_suite"].execute_button,
             ),
             "obsidian_config": (
-                window.pages["obsidian_config"].rollback_button,
                 window.pages["obsidian_config"].execute_button,
             ),
             "templater": (
@@ -256,6 +259,45 @@ def test_every_management_page_fits_width_and_bottom_actions_are_reachable(
                 assert window.page_containers[key].verticalScrollBar().maximum() > 0
     finally:
         assert not window.busy
+        window._timer.stop()
+        window._save_timer.stop()
+        window.tray.hide()
+        window.hide()
+        window.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+
+
+@pytest.mark.parametrize("size", [(980, 620), (1140, 920), (2560, 1440)])
+def test_obsidian_tables_and_source_chooser_keep_long_paths_accessible(application, tmp_path, size):
+    window = MainWindow(tmp_path / "state")
+    page = window.pages["obsidian_config"]
+    prefix = "C:\\Obsidian\\" + "很长的分类目录\\" * 24
+    vault = VaultInfo(prefix + "知识仓库", "知识仓库" * 20)
+    catalog = VaultCatalogResult((vault,))
+    page._accept_catalog(catalog)
+    page.preview_model.set_rows((DeploymentPreviewRow(
+        "delete", "obsidian", vault.name, vault.path,
+        vault.path + "\\.obsidian\\snippets\\old.css", 150, "来源不存在",
+    ),))
+    page.preview_empty.hide()
+    window.resize(*size)
+    window._show_page("obsidian_config", persist=False)
+    window.show()
+    dialog = VaultSourceDialog(catalog, page)
+    dialog.resize(600, 400)
+    dialog.show()
+    try:
+        settle(application)
+        for table in (page.target_table, page.preview_table, dialog.table):
+            assert table.horizontalScrollBar().maximum() == 0
+            assert table.horizontalHeader().length() == table.viewport().width()
+        assert vault.path in page.target_proxy.index(0, 2).data(Qt.ItemDataRole.ToolTipRole)
+        assert vault.path in page.preview_model.index(0, 3).data(Qt.ItemDataRole.ToolTipRole)
+        assert dialog.proxy.index(0, 1).data(Qt.ItemDataRole.ToolTipRole) == vault.path
+        assert window.page_containers["obsidian_config"].horizontalScrollBar().maximum() == 0
+        assert page.recovery_frame.isHidden()
+    finally:
+        dialog.close()
         window._timer.stop()
         window._save_timer.stop()
         window.tray.hide()

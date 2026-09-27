@@ -6,6 +6,7 @@ from pathlib import Path
 import sys
 import tempfile
 import time
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -17,6 +18,10 @@ from PySide6.QtWidgets import QApplication
 from obmanage.engine import SYNC_MODE_NO_VIDEO
 from obmanage.models import PlanItem, SyncPlan
 from obmanage.management.incremental import IncrementalAnalysis, VaultPair
+from obmanage.management.deployment import FileChange
+from obmanage.management.models import VaultCatalogResult, VaultInfo
+from obmanage.pages.distribution import OpenVaultState
+from obmanage.pages.vault_chooser import VaultSourceDialog
 from obmanage.pages.registry import FEATURES
 from obmanage.settings import AppSettings, SettingsStore
 from obmanage.ui import MainWindow
@@ -28,6 +33,7 @@ def main() -> None:
     parser.add_argument("--width", type=int, default=1320)
     parser.add_argument("--height", type=int, default=880)
     parser.add_argument("--maximized", action="store_true")
+    parser.add_argument("--source-chooser", action="store_true", help="render the demo source chooser")
     parser.add_argument(
         "--page", choices=[feature.key for feature in FEATURES], default="mirror",
         help="page to render (default: mirror)",
@@ -112,6 +118,37 @@ def main() -> None:
                 excluded_target_bytes=2_800_000_000,
             ))
             window._show_page(args.page, persist=False)
+        elif args.page == "obsidian_config":
+            page = window.pages[args.page]
+            root = r"C:\Obsidian\仓库集合"
+            source = str(Path(root) / "配置范本")
+            page.root_picker.set_value(root)
+            page.source_picker.set_value(source)
+            vaults = tuple(VaultInfo(str(Path(root) / name), name) for name in (
+                "配置范本", "工作笔记", "学习笔记", "读书笔记", "项目资料", "旅行记录", "生活手册",
+            ))
+            catalog = VaultCatalogResult(vaults)
+            page._accept_catalog(catalog)
+            page.target_model.check_rows((0, 1))
+            page.open_state = OpenVaultState()
+            # Presentation-only values: no executable engine plan or filesystem scan.
+            targets = tuple(SimpleNamespace(
+                target_root=vault.path, component_id="obsidian",
+                target_path=str(Path(vault.path) / ".obsidian"),
+                changes=(
+                    FileChange("add", "snippets/reading.css", 2860, "新增样式"),
+                    FileChange("update", "appearance.json", 480, "设置不同，以来源为准"),
+                    FileChange("delete", "snippets/old-theme.css", 1200, "来源不存在"),
+                    FileChange("skip", "hotkeys.json", 320, "内容一致"),
+                ),
+            ) for vault in page.target_model.checked_vaults())
+            page._accept_plan(SimpleNamespace(targets=targets, needs_deploy=True))
+            page.refresh_actions()
+            window._show_page(args.page, persist=False)
+            if args.source_chooser:
+                chooser = VaultSourceDialog(catalog, page)
+                chooser.setAttribute(Qt.WidgetAttribute.WA_DontShowOnScreen, True)
+                chooser.show()
         else:
             window._show_page(args.page, persist=False)
         # Only presentation is exercised: no analyze/execute worker is started.
@@ -128,7 +165,8 @@ def main() -> None:
             time.sleep(.01)
         assert not window.busy and not window.confirm_direction_checkbox.isChecked()
         args.output.parent.mkdir(parents=True, exist_ok=True)
-        assert window.grab().save(str(args.output)), "Could not save demo screenshot"
+        capture = chooser if args.source_chooser and args.page == "obsidian_config" else window
+        assert capture.grab().save(str(args.output)), "Could not save demo screenshot"
         table = (
             window.table
             if args.page == "mirror"
