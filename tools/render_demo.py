@@ -19,6 +19,7 @@ from obmanage.engine import SYNC_MODE_NO_VIDEO
 from obmanage.models import PlanItem, SyncPlan
 from obmanage.management.incremental import IncrementalAnalysis, VaultPair
 from obmanage.management.deployment import FileChange
+from obmanage.management.comsync import DatedVault
 from obmanage.management.models import VaultCatalogResult, VaultInfo
 from obmanage.management.archive import ArchiveEntry, ArchivePlan
 from obmanage.operation_log import LogEntry
@@ -121,18 +122,21 @@ def main() -> None:
                 excluded_target_bytes=2_800_000_000,
             ))
             window._show_page(args.page, persist=False)
-        elif args.page == "obsidian_config":
+        elif args.page == "comsync":
             page = window.pages[args.page]
             root = r"C:\Obsidian\仓库集合"
             source = str(Path(root) / "配置范本")
             page.root_picker.set_value(root)
             page.source_picker.set_value(source)
-            vaults = tuple(VaultInfo(str(Path(root) / name), name) for name in (
-                "配置范本", "工作笔记", "学习笔记", "读书笔记", "项目资料", "旅行记录", "生活手册",
-            ))
+            vaults = tuple(DatedVault(str(Path(root) / name), name, created_ns=1790478000000000000 - (6 - i) * 86400000000000) for i, name in enumerate((
+                "配置范本", "工作笔记", "学习笔记", "读书笔记", "项目资料", "旅行记录", "新建知识库",
+            )))
             catalog = VaultCatalogResult(vaults)
             page._accept_catalog(catalog)
-            page.target_model.check_rows((0, 1))
+            page.component_boxes["file"].setChecked(True)
+            page.component_boxes["claude"].setChecked(True)
+            page.component_boxes["claudian"].setChecked(True)
+            page._select_newest()
             page.open_state = OpenVaultState()
             # Presentation-only values: no executable engine plan or filesystem scan.
             targets = tuple(SimpleNamespace(
@@ -145,6 +149,16 @@ def main() -> None:
                     FileChange("skip", "hotkeys.json", 320, "内容一致"),
                 ),
             ) for vault in page.target_model.checked_vaults())
+            target = page.target_model.checked_vaults()[0]
+            targets += tuple(SimpleNamespace(target_root=target.path, component_id=component,
+                target_path=str(Path(target.path) / path), changes=changes)
+                for component, path, changes in (
+                    ("claude", ".claude", (FileChange("add", "rules.md", 450, "新增规则"),)),
+                    ("claudian", ".claudian", (FileChange("add", "settings.json", 320, "新增配置"),)),
+                    ("templater", "File/Templater", (FileChange("add", "日记.md", 820, "新增模板"),)),
+                    ("file_note", "File/Note", (FileChange("add", "", 0, "仅创建空目录", kind="dir"),)),
+                    ("file_attachment", "File/Attachment", (FileChange("add", "", 0, "仅创建空目录", kind="dir"),)),
+                ))
             page._accept_plan(SimpleNamespace(targets=targets, needs_deploy=True))
             page.refresh_actions()
             window._show_page(args.page, persist=False)
@@ -184,9 +198,12 @@ def main() -> None:
         for _ in range(15):
             app.processEvents()
             time.sleep(.01)
+        if args.page == "comsync":
+            page.target_table.scrollToBottom()
+            app.processEvents()
         assert not window.busy and not window.confirm_direction_checkbox.isChecked()
         args.output.parent.mkdir(parents=True, exist_ok=True)
-        capture = chooser if args.source_chooser and args.page == "obsidian_config" else window
+        capture = chooser if args.source_chooser and args.page == "comsync" else window
         if args.logs:
             window.show_logs()
             dialog = window._log_dialog

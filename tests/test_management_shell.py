@@ -22,7 +22,7 @@ from obmanage.management.trash import TrashCleanupEngine
 from obmanage.models import PlanItem, SyncCancelled, SyncPlan
 from obmanage.pages.backup import VaultBackupPage
 from obmanage.pages.incremental import IncrementalPage
-from obmanage.pages.distribution import ObsidianConfigPage, TemplateSuitePage, TemplaterPage
+from obmanage.pages.distribution import ComSyncPage
 from obmanage.pages.registry import FEATURES
 from obmanage.pages.statistics import StatisticsPage
 from obmanage.pages.trash_cleanup import TrashCleanupPage
@@ -62,20 +62,19 @@ def dispose(app, window):
     QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
 
 
-def test_shell_registers_nine_pages_with_mirror_first(application, tmp_path):
+def test_shell_registers_seven_pages_with_mirror_first(application, tmp_path):
     window = MainWindow(tmp_path / "state")
     try:
         assert tuple(window.pages) == tuple(feature.key for feature in FEATURES)
         assert tuple(window.pages)[0] == "mirror"
+        assert len(window.pages) == 7
         assert window.page_stack.currentWidget() is window.mirror_page
         assert window.navigation_buttons["mirror"].isChecked()
         assert "仓库镜像" in window.windowTitle()
         assert isinstance(window.pages["vault_backup"], VaultBackupPage)
         assert isinstance(window.pages["incremental"], IncrementalPage)
         assert isinstance(window.pages["statistics"], StatisticsPage)
-        assert isinstance(window.pages["template_suite"], TemplateSuitePage)
-        assert isinstance(window.pages["obsidian_config"], ObsidianConfigPage)
-        assert isinstance(window.pages["templater"], TemplaterPage)
+        assert isinstance(window.pages["comsync"], ComSyncPage)
         assert isinstance(window.pages["trash_cleanup"], TrashCleanupPage)
         assert "页面正在初始化…" not in {label.text() for label in window.findChildren(QLabel)}
     finally:
@@ -101,8 +100,8 @@ def test_all_path_selectors_share_three_choices_and_runtime_uses_single_task_slo
                 assert picker.vault_list.text() == "仓库列表"
                 assert picker.running_vault.text() == "当前运行"
                 assert picker.browse.text() == "浏览…"
-        page = window.pages["obsidian_config"]
-        window._show_page("obsidian_config", persist=False)
+        page = window.pages["comsync"]
+        window._show_page("comsync", persist=False)
         page.source_picker.running_vault.click()
         wait_until(application, entered.is_set)
         assert window.busy
@@ -162,7 +161,7 @@ def test_feature_worker_owns_global_slot_and_cancels_without_residual_thread(app
         page.start_task("probe", operation)
         assert window.busy
         assert not window.analyze_button.isEnabled()
-        window._show_page("templater")
+        window._show_page("comsync")
         assert not window.nav_cancel_button.isHidden()
         window.scheduler.next_run = datetime.now() - timedelta(seconds=1)
         window._timer_tick()
@@ -276,7 +275,7 @@ def test_direct_trash_cleanup_creates_no_recovery_gate(application, tmp_path):
         assert window.nav_recovery_button.isHidden()
         assert window.sync_button.isEnabled()
         assert not window.pages["trash_cleanup"].has_pending_recovery()
-        for key in ("vault_backup", "template_suite", "obsidian_config", "templater"):
+        for key in ("vault_backup", "comsync"):
             assert not window.pages[key]._external_recovery_pending
     finally:
         dispose(application, window)
@@ -312,7 +311,7 @@ def test_legacy_trash_quarantine_still_blocks_writes_until_finalized(
         assert not window.sync_button.isEnabled()
         assert window.pages["trash_cleanup"].has_pending_recovery()
         assert window.pages["vault_backup"]._external_recovery_pending
-        for key in ("template_suite", "obsidian_config", "templater"):
+        for key in ("comsync",):
             assert window.pages[key]._external_recovery_pending
         window._execute_plan()
         assert not window.busy
@@ -348,7 +347,7 @@ def test_unreadable_deployment_journal_fails_closed_across_pages(application, tm
     window = MainWindow(state)
     try:
         blocked_pages = tuple(
-            window.pages[key] for key in ("template_suite", "obsidian_config", "templater")
+            window.pages[key] for key in ("comsync",)
         )
         assert all(page._recovery_blocked for page in blocked_pages)
         assert all(page.has_pending_recovery() for page in blocked_pages)
@@ -380,17 +379,17 @@ def test_unknown_legacy_deployment_is_globally_blocked_and_reachable(
 
     window = MainWindow(state)
     try:
-        assert "obsidian_config" in window._recovery_page_keys()
+        assert "comsync" in window._recovery_page_keys()
         assert not window.nav_recovery_button.isHidden()
-        assert window.pages["obsidian_config"].has_pending_recovery()
-        assert window.pages["template_suite"]._external_recovery_pending
+        assert window.pages["comsync"].has_pending_recovery()
+        assert window.pages["archive"]._external_recovery_pending
         assert window.pages["vault_backup"]._external_recovery_pending
         assert window.pages["trash_cleanup"]._external_recovery_pending
 
         window.nav_recovery_button.click()
 
-        assert window._current_page_key == "obsidian_config"
-        page = window.pages["obsidian_config"]
+        assert window._current_page_key == "comsync"
+        page = window.pages["comsync"]
         assert page.current_batch is not None
         assert page.current_batch.batch_id == plan.batch_id
         assert "旧版/未知入口" in page.batch_selector.currentText()
@@ -400,7 +399,7 @@ def test_unknown_legacy_deployment_is_globally_blocked_and_reachable(
 
 def test_global_cancel_is_hidden_for_non_cancellable_recovery_task(application, tmp_path):
     window = MainWindow(tmp_path / "state")
-    page = window.pages["obsidian_config"]
+    page = window.pages["comsync"]
     release = Event()
     try:
         def operation(_cancel, _progress):
@@ -467,5 +466,51 @@ def test_management_page_root_cannot_enclose_state_directory(application, tmp_pa
         assert not window.busy
         assert not state.exists()
         assert "程序数据目录" in page.status_label.text()
+    finally:
+        dispose(application, window)
+
+
+
+def test_comsync_new_vault_full_worker_flow_and_rollback(application, tmp_path):
+    from obmanage.management.models import OpenedVaultCandidates
+    source, target = tmp_path / "source", tmp_path / "collection" / "new"
+    (source / ".obsidian").mkdir(parents=True)
+    (source / ".obsidian/app.json").write_text("new")
+    (source / "File/Templater").mkdir(parents=True)
+    (source / "File/Templater/template.md").write_text("template")
+    (source / "File/Note").mkdir()
+    (source / "File/Note/private.md").write_text("private")
+    (target / ".obsidian").mkdir(parents=True)
+    window = MainWindow(tmp_path / "state")
+    page = window.pages["comsync"]
+    try:
+        page.opened_vault_reader = lambda _: OpenedVaultCandidates()
+        page.source_picker.set_value(str(source))
+        page.root_picker.set_value(str(target.parent))
+        page.component_boxes["file"].setChecked(True)
+        window._show_page("comsync", persist=False)
+        page.catalog_button.click()
+        wait_until(application, lambda: not window.busy)
+        assert page.latest_button.isEnabled()
+        page.latest_button.click()
+        assert len(page.target_model.checked_vaults()) == 1
+        page.analyze_button.click()
+        wait_until(application, lambda: not window.busy)
+        assert page.plan and "1 个仓库" in page.confirm_checkbox.text()
+        page.confirm_checkbox.setChecked(True)
+        page.execute_button.click()
+        wait_until(application, lambda: not window.busy)
+        assert page.has_pending_recovery()
+        assert (target / ".obsidian/app.json").read_text() == "new"
+        assert (target / "File/Templater/template.md").read_text() == "template"
+        assert list((target / "File/Note").iterdir()) == []
+        assert list((target / "File/Attachment").iterdir()) == []
+        assert (source / "File/Note/private.md").read_text() == "private"
+        page.rollback_button.click()
+        wait_until(application, lambda: not window.busy)
+        assert not page.has_pending_recovery()
+        assert not (target / "File").exists()
+        assert not (target / ".obsidian/app.json").exists()
+        assert any(row.feature == "comsync" and row.level == "success" for row in window._log_entries)
     finally:
         dispose(application, window)

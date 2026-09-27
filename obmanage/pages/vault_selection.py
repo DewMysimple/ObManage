@@ -29,6 +29,7 @@ class VaultSelection(QObject):
         self.browse = browse
         self.roots = roots
         self.config_path = None
+        self.catalog_transform = None
         self.dialog = None
         self._task_active = False
         self.running = False
@@ -39,6 +40,7 @@ class VaultSelection(QObject):
         self.running = running
         roots = tuple(root for root in self.roots() if root)
         config = self.config_path
+        transform = self.catalog_transform
 
         def operation(cancel, progress):
             if cancel.is_set():
@@ -48,6 +50,8 @@ class VaultSelection(QObject):
             registered = read_registered_vault_candidates(config)
             exact = discover_vaults(registered.paths, recursive=False, cancel=cancel, progress=progress)
             collection = discover_vaults(roots, cancel=cancel, progress=progress) if roots else VaultCatalogResult()
+            if transform is not None:
+                collection = transform(collection, cancel)
             vaults = {vault.path: vault for vault in (*exact.vaults, *collection.vaults)}
             valid_paths = {vault.path for vault in exact.vaults}
             invalid = tuple(ManagementIssue("registered_vault_invalid",

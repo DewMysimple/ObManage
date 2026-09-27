@@ -121,3 +121,21 @@ def test_unknown_schema_fails_closed_to_defaults(tmp_path):
     document = store.load_document()
     assert document.mirror == AppSettings()
     assert "不支持" in store.last_error
+
+
+
+def test_distribution_settings_migrate_current_legacy_page_and_preserve_namespaces(tmp_path):
+    for legacy, selected in (("obsidian_config", ["obsidian"]), ("templater", ["templater"]),
+                             ("template_suite", ["claude", "file"])):
+        features = {"obsidian_config": {"source": "old-source"},
+                    legacy: {"source": "chosen-source", "root": "collection", "components": ["claude", "file"]}}
+        store = SettingsStore(tmp_path)
+        store.path.write_text(json.dumps({"schema_version": 2, "ui": {"selected_page": legacy},
+                                          "features": features}), encoding="utf-8")
+        document = store.load_document()
+        assert document.selected_page == "comsync"
+        assert document.features["comsync"] == {"source": "chosen-source", "root": "collection", "components": selected}
+        assert document.features[legacy] == features[legacy]
+        document.features["comsync"]["source"] = "new-source"
+        store.save_document(document)
+        assert SettingsStore(tmp_path).load_document().features["comsync"]["source"] == "new-source"

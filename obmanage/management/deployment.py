@@ -191,6 +191,13 @@ class DeploymentComponent:
     source: str
     destination: str
     source_subtree: str = ""
+    ensure_directory: bool = False
+
+    @classmethod
+    def directory(cls, component_id: str, source: str | Path,
+                  destination: str) -> "DeploymentComponent":
+        """Ensure a directory exists without reading or replacing its contents."""
+        return cls(component_id, os.fspath(source), destination, ensure_directory=True)
 
     @classmethod
     def direct(cls, component_id: str, source: str | Path,
@@ -342,6 +349,7 @@ class DeploymentTargetPlan:
     target_volume: str = field(repr=False)
     target_root_snapshot: EntrySnapshot = field(repr=False)
     parent_guards: tuple[ParentGuard, ...] = field(repr=False)
+    ensure_directory: bool = False
 
     @property
     def counts(self) -> dict[str, int]:
@@ -721,6 +729,15 @@ def _scan_tree(root: str, cancel: threading.Event | None,
     return FrozenTree(root, volume, root_state, tuple(items))
 
 
+def _directory_tree(root: str) -> FrozenTree:
+    """Observe only the directory identity; its contents are outside this scope."""
+    assert_plain_chain(root)
+    state = _entry_state(root)
+    if state is None or state.kind != "dir":
+        raise DeploymentError(f"目录不存在或不是普通目录：{root}")
+    return FrozenTree(root, volume_identity(root), state, ())
+
+
 def _portable_equal(first: FrozenTree | None, second: FrozenTree | None) -> bool:
     if first is None or second is None:
         return first is second
@@ -799,6 +816,7 @@ def _plan_payload(batch_id: str, label: str,
             "existing_target_path": item.existing_target_path,
             "changes": [change.__dict__ for change in item.changes],
             "needs_deploy": item.needs_deploy,
+            "ensure_directory": item.ensure_directory,
             "source_tree": _tree_payload(item.source_tree),
             "target_tree": _tree_payload(item.target_tree),
             "target_volume": item.target_volume,
@@ -1094,16 +1112,18 @@ class DeploymentEngine:
                     selection, source_path, source_authorization_root,
                     target_root, existing, parent_guards) in enumerate(resolved):
                 _cancelled(cancel)
-                source_key = _case_key(source_path)
+                directory_only = selection.component.ensure_directory
+                source_key = ("directory:" if directory_only else "tree:") + _case_key(source_path)
                 if source_key not in source_cache:
-                    source_cache[source_key] = _scan_tree(
+                    source_cache[source_key] = _directory_tree(source_path) if directory_only else _scan_tree(
                         source_path, cancel, progress,
                         progress_values={"batch_id": batch_id,
                                          "component_id": selection.component.component_id,
                                          "target_id": selection.target.target_id},
                     )
                 source_tree = source_cache[source_key]
-                target_tree = (_scan_tree(existing, cancel, progress,
+                target_tree = (_directory_tree(existing) if existing and directory_only else
+                              _scan_tree(existing, cancel, progress,
                                           progress_values={"batch_id": batch_id,
                                                            "component_id": selection.component.component_id,
                                                            "target_id": selection.target.target_id})
@@ -1114,7 +1134,11 @@ class DeploymentEngine:
                 selection_id = str(uuid.uuid5(uuid.UUID(batch_id), f"{index}:{selection.component.component_id}:"
                                                                    f"{selection.target.target_id}"))
                 desired_target = logical_targets[index]
-                changes = _compare_entries(source_tree, target_tree)
+                changes = ((FileChange(
+                    "skip" if existing else "add", "", 0,
+                    "目录已存在，保留其全部内容" if existing else "仅创建空目录，不复制来源内容",
+                    kind="dir",
+                ),) if directory_only else _compare_entries(source_tree, target_tree))
                 target_plans.append(DeploymentTargetPlan(
                     selection_id=selection_id,
                     component_id=selection.component.component_id,
@@ -1131,6 +1155,7 @@ class DeploymentEngine:
                     target_volume=volume_identity(target_root),
                     target_root_snapshot=target_root_state,
                     parent_guards=parent_guards,
+                    ensure_directory=directory_only,
                 ))
                 _emit(progress, "analyzed-target", batch_id=batch_id,
                       selection_id=selection_id, component_id=selection.component.component_id,
@@ -1164,6 +1189,17 @@ class DeploymentEngine:
         current = _scan_tree(tree.root, cancel, None)
         if not _tree_matches(current, tree):
             raise DeploymentError(f"组件来源在预览后发生变化：{tree.root}")
+
+    def _revalidate_component_source(self, item: DeploymentTargetPlan,
+                                     cancel: threading.Event | None) -> None:
+        if not item.ensure_directory:
+            self._revalidate_source(item.source_tree, cancel)
+            return
+        _cancelled(cancel)
+        current = _directory_tree(item.source_path)
+        if (current.volume != item.source_tree.volume
+                or current.root_snapshot.identity != item.source_tree.root_snapshot.identity):
+            raise DeploymentError(f"来源目录身份在预览后发生变化：{item.source_path}")
 
     def _current_target_path(self, item: DeploymentTargetPlan,
                              created: dict[str, OwnedDirectory] | None = None) -> str | None:
@@ -1200,6 +1236,11 @@ class DeploymentEngine:
         else:
             if current_path is None:
                 raise DeploymentError(f"目标子树在预览后消失：{item.target_path}")
+            if item.ensure_directory:
+                current = _directory_tree(current_path)
+                if current.root_snapshot.identity != item.target_tree.root_snapshot.identity:
+                    raise DeploymentError(f"目标目录身份在预览后发生变化：{current_path}")
+                return
             current = _scan_tree(current_path, None, None)
             if not _tree_matches(current, replace(item.target_tree, root=current_path)):
                 raise DeploymentError(f"目标子树在预览后发生变化：{current_path}")
@@ -1306,7 +1347,7 @@ class DeploymentEngine:
         prepared = 0
         for item in changed:
             _cancelled(cancel)
-            self._revalidate_source(item.source_tree, cancel)
+            self._revalidate_component_source(item, cancel)
             self._revalidate_target(item)
             stage = self._stage_name(plan, item, "stage")
             if snapshot(stage) is not None:
@@ -1329,17 +1370,17 @@ class DeploymentEngine:
                                    stage_state.identity, "未登记的暂存目录")
                 raise
             self._copy_to_stage(plan, item, stage, cancel, progress)
-            self._revalidate_source(item.source_tree, cancel)
+            self._revalidate_component_source(item, cancel)
             self._revalidate_target(item)
             self.journal.set_target(plan.batch_id, item.selection_id, phase="prepared")
             prepared += 1
         # A single final barrier ensures every source and target still matches
         # the one preview shared by all staged copies before any commit starts.
-        seen_sources: set[str] = set()
+        seen_sources: set[tuple[bool, str]] = set()
         for item in plan.targets:
-            source_key = _case_key(item.source_path)
+            source_key = (item.ensure_directory, _case_key(item.source_path))
             if source_key not in seen_sources:
-                self._revalidate_source(item.source_tree, cancel)
+                self._revalidate_component_source(item, cancel)
                 seen_sources.add(source_key)
             self._revalidate_target(item)
         return prepared
@@ -1384,7 +1425,7 @@ class DeploymentEngine:
 
     def _commit_one(self, plan: DeploymentPlan, item: DeploymentTargetPlan,
                     created: dict[str, OwnedDirectory], progress: ProgressCallback) -> None:
-        self._revalidate_source(item.source_tree, None)
+        self._revalidate_component_source(item, None)
         self._revalidate_target(item, created)
         record = next(target for target in self.journal.get(plan.batch_id).targets
                       if target.selection_id == item.selection_id)
@@ -1451,7 +1492,7 @@ class DeploymentEngine:
             )
             process_locks.acquire()
             for item in plan.targets:
-                self._revalidate_source(item.source_tree, cancel)
+                self._revalidate_component_source(item, cancel)
                 self._revalidate_target(item)
             # Establish/repair a key only under the strict journal rule that no
             # existing authority may depend on invalid bytes, then use the
@@ -1468,7 +1509,10 @@ class DeploymentEngine:
                 )
             record = JournalBatch(
                 batch_id=plan.batch_id, label=plan.label, status="preparing",
-                targets=tuple(_journal_target(item) for item in plan.targets),
+                # Existing directory-only targets are outside our write/recovery
+                # authority. Do not give a synthetic empty manifest to recovery.
+                targets=tuple(_journal_target(item) for item in plan.targets
+                              if not item.ensure_directory or item.needs_deploy),
                 created_at=plan.created_at, updated_at=time.time(),
             )
             self.journal.create(record)

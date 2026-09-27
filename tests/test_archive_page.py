@@ -100,7 +100,7 @@ def test_controls_invalidate_preview_and_profiles_remember_separate_locations(wi
     assert page.plan is None
     page.set_global_busy(True)
     assert not page.level.isEnabled() and not page.source_picker.vault_list.isEnabled()
-    assert widget.navigation_buttons["templater"].text() == ".Templater"
+    assert widget.navigation_buttons["comsync"].text() == ".comSync"
     assert widget.navigation_buttons["trash_cleanup"].text() == ".Trash"
 
 

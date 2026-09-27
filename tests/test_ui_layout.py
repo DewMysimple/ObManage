@@ -225,16 +225,8 @@ def test_every_management_page_fits_width_and_bottom_actions_are_reachable(
                 window.pages["vault_backup"].execute_button,
             ),
             "statistics": (window.pages["statistics"].scan_button,),
-            "template_suite": (
-                window.pages["template_suite"].rollback_button,
-                window.pages["template_suite"].execute_button,
-            ),
-            "obsidian_config": (
-                window.pages["obsidian_config"].execute_button,
-            ),
-            "templater": (
-                window.pages["templater"].rollback_button,
-                window.pages["templater"].execute_button,
+            "comsync": (
+                window.pages["comsync"].execute_button,
             ),
             "trash_cleanup": (window.pages["trash_cleanup"].clear_button,),
             "archive": (window.pages["archive"].execute_button,),
@@ -263,7 +255,7 @@ def test_every_management_page_fits_width_and_bottom_actions_are_reachable(
                     f"is unreachable at {size}"
                 )
         if size == (980, 620):
-            for key in ("template_suite", "obsidian_config", "templater"):
+            for key in ("comsync",):
                 assert window.page_containers[key].verticalScrollBar().maximum() > 0
     finally:
         assert not window.busy
@@ -278,7 +270,7 @@ def test_every_management_page_fits_width_and_bottom_actions_are_reachable(
 @pytest.mark.parametrize("size", [(980, 620), (1140, 920), (2560, 1440)])
 def test_obsidian_tables_and_source_chooser_keep_long_paths_accessible(application, tmp_path, size):
     window = MainWindow(tmp_path / "state")
-    page = window.pages["obsidian_config"]
+    page = window.pages["comsync"]
     prefix = "C:\\Obsidian\\" + "很长的分类目录\\" * 24
     vault = VaultInfo(prefix + "知识仓库", "知识仓库" * 20)
     catalog = VaultCatalogResult((vault,))
@@ -289,7 +281,7 @@ def test_obsidian_tables_and_source_chooser_keep_long_paths_accessible(applicati
     ),))
     page.preview_empty.hide()
     window.resize(*size)
-    window._show_page("obsidian_config", persist=False)
+    window._show_page("comsync", persist=False)
     window.show()
     dialog = VaultSourceDialog(catalog, page)
     dialog.resize(600, 400)
@@ -302,7 +294,7 @@ def test_obsidian_tables_and_source_chooser_keep_long_paths_accessible(applicati
         assert vault.path in page.target_proxy.index(0, 2).data(Qt.ItemDataRole.ToolTipRole)
         assert vault.path in page.preview_model.index(0, 3).data(Qt.ItemDataRole.ToolTipRole)
         assert dialog.proxy.index(0, 1).data(Qt.ItemDataRole.ToolTipRole) == vault.path
-        assert window.page_containers["obsidian_config"].horizontalScrollBar().maximum() == 0
+        assert window.page_containers["comsync"].horizontalScrollBar().maximum() == 0
         assert page.recovery_frame.isHidden()
     finally:
         dialog.close()

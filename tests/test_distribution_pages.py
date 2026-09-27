@@ -20,11 +20,11 @@ from obmanage.management.deployment import (
     DeploymentTarget,
 )
 from obmanage.management.models import ManagementIssue, OpenedVaultCandidates, VaultInfo
+from obmanage.management.models import VaultCatalogResult
+from obmanage.management.comsync import DatedVault
 from obmanage.pages.distribution import (
     DeploymentPreviewRow,
-    ObsidianConfigPage,
-    TemplateSuitePage,
-    TemplaterPage,
+    ComSyncPage,
 )
 
 
@@ -127,7 +127,7 @@ def test_catalog_lists_only_real_vaults_excludes_source_and_analyze_is_read_only
 ):
     root, source, target, fake = create_config_fixture(tmp_path)
     state = tmp_path / "state"
-    page = ObsidianConfigPage(
+    page = ComSyncPage(
         state, {"root": str(root), "source": str(source)}, str(root),
         opened_vault_reader=closed_vault_reader,
     )
@@ -161,7 +161,7 @@ def test_file_preview_complete_clone_confirmation_copy_and_target_invalidation(
     application, tmp_path
 ):
     root, source, _target, _fake = create_config_fixture(tmp_path)
-    page = ObsidianConfigPage(
+    page = ComSyncPage(
         tmp_path / "state", {"root": str(root), "source": str(source)}, str(root),
         opened_vault_reader=closed_vault_reader,
     )
@@ -204,7 +204,7 @@ def test_execute_and_new_page_can_rollback_persistent_batch(application, tmp_pat
     original = snapshot_tree(target / ".obsidian")
     settings = {"root": str(root), "source": str(source)}
     state = tmp_path / "state"
-    page = ObsidianConfigPage(
+    page = ComSyncPage(
         state, settings, str(root), opened_vault_reader=closed_vault_reader
     )
     operations: list = []
@@ -225,7 +225,7 @@ def test_execute_and_new_page_can_rollback_persistent_batch(application, tmp_pat
         assert page.finalize_confirm.isEnabled()
         assert not page.finalize_button.isEnabled()
 
-        recovered = ObsidianConfigPage(
+        recovered = ComSyncPage(
             state, settings, str(root), opened_vault_reader=closed_vault_reader
         )
         recovered_operations: list = []
@@ -254,7 +254,7 @@ def test_execute_and_new_page_can_finalize_persistent_batch(application, tmp_pat
     root, source, target, _fake = create_config_fixture(tmp_path)
     settings = {"root": str(root), "source": str(source)}
     state = tmp_path / "state"
-    page = ObsidianConfigPage(
+    page = ComSyncPage(
         state, settings, str(root), opened_vault_reader=closed_vault_reader
     )
     operations: list = []
@@ -267,7 +267,7 @@ def test_execute_and_new_page_can_finalize_persistent_batch(application, tmp_pat
         assert result.success
         assert tuple(target.glob(".obmanage-deploy-*.backup"))
 
-        recovered = ObsidianConfigPage(
+        recovered = ComSyncPage(
             state, settings, str(root), opened_vault_reader=closed_vault_reader
         )
         recovered_operations: list = []
@@ -323,7 +323,7 @@ def test_all_pending_deployment_batches_remain_selectable_and_actions_use_select
     journal.set_batch(first.batch_id, status="finalizing")
     journal.set_target(first.batch_id, first_target_record.selection_id, phase="committed")
     journal.set_batch(first.batch_id, status="committed")
-    page = ObsidianConfigPage(
+    page = ComSyncPage(
         state, {"root": str(root), "source": str(tmp_path / "最新来源")}, str(root),
         opened_vault_reader=closed_vault_reader,
     )
@@ -371,7 +371,7 @@ def test_unreadable_persistent_authority_blocks_recovery_ui(application, tmp_pat
     state.mkdir()
     (state / "deployment-journal.key").write_bytes(b"partial")
 
-    page = ObsidianConfigPage(
+    page = ComSyncPage(
         state, {"root": str(root), "source": str(source)}, str(root),
         opened_vault_reader=closed_vault_reader,
     )
@@ -404,18 +404,18 @@ def test_unknown_legacy_batch_is_reachable_from_config_recovery_page(
     plan = engine.analyze(request)
     assert engine.execute(plan).success
 
-    suite = TemplateSuitePage(
+    suite = ComSyncPage(
         state, {"root": str(root), "source": ""}, str(root),
         opened_vault_reader=closed_vault_reader,
     )
-    config = ObsidianConfigPage(
+    config = ComSyncPage(
         state, {"root": str(root), "source": str(source)}, str(root),
         opened_vault_reader=closed_vault_reader,
     )
     operations: list = []
     config.task_requested.connect(operations.append)
     try:
-        assert not suite.has_pending_recovery()
+        assert suite.has_pending_recovery()  # All old batch labels share the merged recovery entry.
         assert config.has_pending_recovery()
         assert config.batch_selector.count() == 1
         assert config.batch_selector.currentData() == plan.batch_id
@@ -459,7 +459,7 @@ def test_completed_rollback_with_residuals_remains_visible(application, tmp_path
     )
     assert engine.rollback(plan.batch_id).journal_status == "rolled_back_with_residuals"
 
-    page = ObsidianConfigPage(
+    page = ComSyncPage(
         state, {"root": str(root), "source": str(source)}, str(root),
         opened_vault_reader=closed_vault_reader,
     )
@@ -485,7 +485,7 @@ def test_suite_and_templater_build_explicit_bounded_requests_and_restore_setting
     suite_source = tmp_path / "模板套件"
     (suite_source / ".claude").mkdir(parents=True)
     (suite_source / ".claude" / "rules.md").write_text("rule", encoding="utf-8")
-    suite = TemplateSuitePage(
+    suite = ComSyncPage(
         tmp_path / "suite-state",
         {"root": str(root), "source": str(suite_source), "components": []},
         str(root),
@@ -494,9 +494,9 @@ def test_suite_and_templater_build_explicit_bounded_requests_and_restore_setting
     templater_source = tmp_path / "来源" / "File" / "Templater"
     templater_source.mkdir(parents=True)
     (templater_source / "note.md").write_text("template", encoding="utf-8")
-    templater = TemplaterPage(
+    templater = ComSyncPage(
         tmp_path / "templater-state",
-        {"root": str(root), "source": str(templater_source)},
+        {"root": str(root), "source": str(templater_source), "components": ["templater"]},
         str(root),
         opened_vault_reader=closed_vault_reader,
     )
@@ -533,7 +533,7 @@ def test_suite_and_templater_build_explicit_bounded_requests_and_restore_setting
             "source": str(suite_source),
             "components": ["file", "obsidian"],
         })
-        assert suite.selected_component_ids() == ("obsidian", "file")
+        assert suite.selected_component_ids() == ("obsidian", "templater", "file")
         assert suite.target_model.checked_vaults() == ()
 
         suite.preview_model.set_rows((DeploymentPreviewRow(
@@ -555,7 +555,7 @@ def test_suite_and_templater_build_explicit_bounded_requests_and_restore_setting
 
 def test_source_changes_reuse_discovery_but_revoke_selection_plan_and_confirmation(application, tmp_path):
     root, source, _target, _fake = create_config_fixture(tmp_path)
-    page = ObsidianConfigPage(
+    page = ComSyncPage(
         tmp_path / "state", {"root": str(root), "source": str(source)}, str(root),
         opened_vault_reader=closed_vault_reader,
     )
@@ -588,7 +588,7 @@ def test_target_select_all_and_clear_are_explicit_and_revoke_plan(application, t
     source = tmp_path / "来源"
     (source / ".obsidian").mkdir(parents=True)
     (source / ".obsidian" / "config.json").write_text("new", encoding="utf-8")
-    page = ObsidianConfigPage(
+    page = ComSyncPage(
         tmp_path / "state", {"root": str(root), "source": str(source)}, str(root),
         opened_vault_reader=closed_vault_reader,
     )
@@ -625,7 +625,7 @@ def test_source_list_includes_closed_registered_and_collection_vaults_without_au
         "closed": {"path": str(closed), "open": False},
         "invalid": {"path": str(fake)},
     }}), encoding="utf-8")
-    page = ObsidianConfigPage(tmp_path / "state", {"root": str(root)}, str(root),
+    page = ComSyncPage(tmp_path / "state", {"root": str(root)}, str(root),
                               obsidian_config_path=config)
     operations = []
     page.task_requested.connect(operations.append)
@@ -666,7 +666,7 @@ def test_broken_registry_still_offers_collection_sources_and_manual_browse(appli
     root, source, target, _fake = create_config_fixture(tmp_path)
     config = tmp_path / "obsidian.json"
     config.write_text("broken", encoding="utf-8")
-    page = ObsidianConfigPage(tmp_path / "state", {"root": str(root)}, str(root),
+    page = ComSyncPage(tmp_path / "state", {"root": str(root)}, str(root),
                               obsidian_config_path=config)
     operations = []
     page.task_requested.connect(operations.append)
@@ -698,7 +698,7 @@ def test_filtered_target_selection_and_copy_use_visible_rows(application, tmp_pa
     root, source, target, _fake = create_config_fixture(tmp_path)
     second = root / "另一仓库"
     (second / ".obsidian").mkdir(parents=True)
-    page = ObsidianConfigPage(tmp_path / "state", {"root": str(root), "source": str(source)},
+    page = ComSyncPage(tmp_path / "state", {"root": str(root), "source": str(source)},
                               str(root), opened_vault_reader=closed_vault_reader)
     operations = []
     page.task_requested.connect(operations.append)
@@ -739,7 +739,7 @@ def test_open_target_is_blocked_again_in_worker_immediately_before_execute(
         reads.append(paths)
         return OpenedVaultCandidates(paths=paths)
 
-    page = ObsidianConfigPage(
+    page = ComSyncPage(
         state_dir, {"root": str(root), "source": str(source)}, str(root),
         opened_vault_reader=reader,
     )
@@ -788,7 +788,7 @@ def test_unreadable_open_registry_requires_explicit_closed_target_confirmation(
     def reader(_config_path):
         return unavailable
 
-    page = ObsidianConfigPage(
+    page = ComSyncPage(
         tmp_path / "state", {"root": str(root), "source": str(source)}, str(root),
         opened_vault_reader=reader,
     )
@@ -808,5 +808,79 @@ def test_unreadable_open_registry_requires_explicit_closed_target_confirmation(
 
         assert result.success
         assert snapshot_tree(target / ".obsidian") == snapshot_tree(source / ".obsidian")
+    finally:
+        dispose(page)
+
+
+
+def test_newest_selection_uses_creation_time_excludes_source_and_replaces_hidden_choices(application, tmp_path):
+    root = tmp_path / "collection"
+    source = root / "source"
+    rows = tuple(DatedVault(str(root / name), name, created_ns=date)
+                 for name, date in (("old", 10), ("new", 20), ("tie", 20), ("source", 30)))
+    page = ComSyncPage(tmp_path / "state", {"source": str(source)}, str(root))
+    try:
+        assert not page.latest_button.isEnabled()
+        page._accept_catalog(VaultCatalogResult(rows))
+        assert not page.target_model.checked_vaults()
+        assert page.latest_button.isEnabled()
+        check_target(page)
+        page.target_filter.setText("old")
+        page.plan = object()
+        page.confirm_checkbox.setChecked(True)
+        page.latest_button.click()
+        assert {v.name for v in page.target_model.checked_vaults()} == {"new", "tie"}
+        assert page.target_filter.text() == ""
+        assert page.plan is None and not page.confirm_checkbox.isChecked()
+        assert page.target_model.index(1, 3).data()
+        page.set_global_busy(True)
+        assert not page.latest_button.isEnabled()
+        page.set_global_busy(False)
+        page.root_picker.set_value(str(root / "other"))
+        assert not page.latest_button.isEnabled()
+        page._accept_catalog(VaultCatalogResult((rows[0], VaultInfo(str(root / "unknown"), "unknown"))))
+        assert not page.latest_button.isEnabled()
+    finally:
+        dispose(page)
+
+
+def test_file_checkbox_includes_one_templater_plan_and_changes_revoke_preview(application, tmp_path):
+    page = ComSyncPage(tmp_path / "state", {"source": str(tmp_path / "source")}, str(tmp_path / "targets"))
+    try:
+        page.component_boxes["file"].setChecked(True)
+        assert page.component_boxes["templater"].isChecked()
+        assert not page.component_boxes["templater"].isEnabled()
+        assert sum(c.destination == "File/Templater" for c in page._components()) == 1
+        page.plan = object()
+        page.component_boxes["claude"].setChecked(True)
+        assert page.plan is None
+        page.component_boxes["file"].setChecked(False)
+        assert page.component_boxes["templater"].isEnabled()
+        assert not any(c.ensure_directory for c in page._components())
+        restored = page.settings_payload()
+        page.restore_settings(restored)
+        assert page.settings_payload() == restored
+    finally:
+        dispose(page)
+
+
+@pytest.mark.parametrize("label", ["obmanage-ui:template_suite", "obmanage-ui:templater", "obmanage-ui:obsidian_config"])
+def test_old_distribution_batches_are_recoverable_in_merged_page(application, tmp_path, label):
+    root, source, target, _ = create_config_fixture(tmp_path)
+    state = tmp_path / "state"
+    request = DeploymentRequest((DeploymentSelection(DeploymentComponent.obsidian(source),
+        DeploymentTarget("target", str(target))),), label=label)
+    engine = DeploymentEngine(state)
+    plan = engine.analyze(request)
+    assert engine.execute(plan).success
+    page = ComSyncPage(state, {}, str(root), opened_vault_reader=closed_vault_reader)
+    operations = []
+    page.task_requested.connect(operations.append)
+    try:
+        assert page.has_pending_recovery() and page.current_batch.batch_id == plan.batch_id
+        assert page.rollback_button.isEnabled()
+        run_last_operation(page, operations, page._start_rollback)
+        assert not page.has_pending_recovery()
+        assert (target / ".obsidian/changed.json").read_text() == "old"
     finally:
         dispose(page)

@@ -69,7 +69,7 @@ from .pages.controls import DropDownCombo
 from .pages.vault_selection import VaultSelection
 from .pages.icons import action_icon
 from .pages.incremental import IncrementalPage
-from .pages.distribution import ObsidianConfigPage, TemplateSuitePage, TemplaterPage
+from .pages.distribution import ComSyncPage
 from .pages.registry import FEATURES
 from .pages.statistics import StatisticsPage
 from .pages.trash_cleanup import TrashCleanupPage
@@ -914,9 +914,7 @@ class MainWindow(QMainWindow):
         outer.addWidget(footer)
 
         distribution_pages = {
-            "template_suite": TemplateSuitePage,
-            "obsidian_config": ObsidianConfigPage,
-            "templater": TemplaterPage,
+            "comsync": ComSyncPage,
         }
         for feature in FEATURES[1:]:
             if feature.key == "incremental":

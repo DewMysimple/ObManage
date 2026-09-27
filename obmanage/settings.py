@@ -148,6 +148,17 @@ class SettingsStore:
                 features[key] = {}
         if errors:
             self.last_error = " ".join(errors)
+        legacy_distribution = ("obsidian_config", "template_suite", "templater")
+        if "comsync" not in features:
+            candidates = (selected_page, *legacy_distribution)
+            prior = next((key for key in candidates if key in legacy_distribution and features.get(key)), None)
+            if prior:
+                migrated = dict(features[prior])
+                if prior != "template_suite":
+                    migrated["components"] = ["templater" if prior == "templater" else "obsidian"]
+                features["comsync"] = migrated
+        if selected_page in legacy_distribution:
+            selected_page = "comsync"
         return SettingsDocument(
             mirror=mirror,
             selected_page=selected_page,

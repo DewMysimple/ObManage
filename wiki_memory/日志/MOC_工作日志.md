@@ -19,6 +19,7 @@ supersedes: null
 | 2026-09-27 | feature | - | archived | archive-log-filtering | [归档工作台与日志筛选](./2026-09-27-归档工作台与日志筛选.md) |
 | 2026-09-27 | maintenance | - | archived | obsidian-sync-delivery-merge | [同步工作台交付合并](./2026-09-27-同步工作台交付合并.md) |
 | 2026-09-27 | ui | - | archived | obsidian-sync-workbench | [.obsidian同步工作台简化](./2026-09-27-obsidian同步工作台简化.md) |
+| 2026-09-27 | feature | - | archived | unified-component-sync | [comSync 组件同步整合](./2026-09-27-comSync组件同步整合.md) |
 | 2026-09-23 | maintenance | - | archived | local-build-entrypoint | [本地构建入口](./2026-09-23-本地构建入口.md) |
 | 2026-09-21 | bug | - | archived | stale-preview-diagnostics | [同步陈旧预览诊断](./2026-09-21-同步陈旧预览诊断.md) |
 | 2026-09-21 | bug | - | archived | exfat-case-and-incremental-scan-performance | [2026-09-21｜exFAT 大小写修复与扫描提速](./2026-09-21-exFAT大小写修复与扫描提速.md) |

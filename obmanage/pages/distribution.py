@@ -43,6 +43,7 @@ from ..management.deployment import (
     DeploymentTarget,
 )
 from ..management.journal import JournalBatch, JournalError
+from ..management.comsync import components, newest_vaults, source_root, with_creation_times
 from ..management.models import (
     ManagementIssue,
     OpenedVaultCandidates,
@@ -53,6 +54,7 @@ from ..models import Progress, SyncCancelled
 from ..paths import canonical, native
 from .common import FeaturePage, PathPicker, format_bytes, panel
 from .icons import action_icon
+from .controls import DropDownCombo
 
 
 _ACTION_TEXT = {
@@ -68,6 +70,9 @@ _ACTION_COLORS = {
     "delete": "#AD5748",
     "skip": "#79848B",
 }
+
+_COMPONENT_TITLES = {"claude": ".claude", "claudian": ".claudian", "obsidian": ".obsidian",
+                     "templater": ".Templater", "file_note": ".File", "file_attachment": ".File"}
 
 _FINALIZE_STATUSES = frozenset({"committed", "finalizing", "finalize_required"})
 _ROLLBACK_STATUSES = frozenset({
@@ -85,12 +90,6 @@ _ROLLBACK_STATUSES = frozenset({
     "finalize_required",
 })
 _PENDING_STATUSES = _FINALIZE_STATUSES | _ROLLBACK_STATUSES
-_KNOWN_BATCH_LABELS = frozenset({
-    "obmanage-ui:template_suite",
-    "obmanage-ui:obsidian_config",
-    "obmanage-ui:templater",
-})
-_LEGACY_RECOVERY_PAGE = "obsidian_config"
 
 _STATUS_TEXT = {
     "preparing": "准备中断，建议撤销恢复",
@@ -198,8 +197,9 @@ class VaultTargetTableModel(QAbstractTableModel):
     checked_changed = Signal()
     HEADERS = ("选择", "仓库", "完整位置")
 
-    def __init__(self, parent=None) -> None:
+    def __init__(self, parent=None, *, creation_time=False) -> None:
         super().__init__(parent)
+        self.creation_time = creation_time
         self.rows: list[VaultInfo] = []
         self._checked: set[str] = set()
 
@@ -235,12 +235,12 @@ class VaultTargetTableModel(QAbstractTableModel):
         return 0 if parent.isValid() else len(self.rows)
 
     def columnCount(self, parent: QModelIndex = QModelIndex()) -> int:
-        return 0 if parent.isValid() else len(self.HEADERS)
+        return 0 if parent.isValid() else len(self.HEADERS) + int(self.creation_time)
 
     def headerData(self, section: int, orientation: Qt.Orientation,
                    role: int = Qt.ItemDataRole.DisplayRole) -> Any:
         if orientation == Qt.Orientation.Horizontal and role == Qt.ItemDataRole.DisplayRole:
-            return self.HEADERS[section]
+            return "创建时间" if section == 3 else self.HEADERS[section]
         return None
 
     def data(self, index: QModelIndex, role: int = Qt.ItemDataRole.DisplayRole) -> Any:
@@ -251,12 +251,16 @@ class VaultTargetTableModel(QAbstractTableModel):
             return (Qt.CheckState.Checked if _physical_key(item.path) in self._checked
                     else Qt.CheckState.Unchecked)
         if role == Qt.ItemDataRole.DisplayRole:
-            return ("", item.name, item.path)[index.column()]
+            created = getattr(item, "created_ns", None)
+            return ("", item.name, item.path,
+                    datetime.fromtimestamp(created / 1e9).strftime("%Y-%m-%d %H:%M:%S")
+                    if created is not None else "无法读取")[index.column()]
         if role == Qt.ItemDataRole.ToolTipRole:
             nested = f"\n嵌套于：{item.parent_path}" if item.parent_path else ""
             return f"{item.path}{nested}"
         if role == Qt.ItemDataRole.UserRole:
-            return ("", item.name.casefold(), item.path.casefold())[index.column()]
+            return ("", item.name.casefold(), item.path.casefold(),
+                    getattr(item, "created_ns", None) or 0)[index.column()]
         return None
 
     def flags(self, index: QModelIndex) -> Qt.ItemFlag:
@@ -317,7 +321,7 @@ class DeploymentPreviewTableModel(QAbstractTableModel):
             action_text += "文件夹"
         values = (
             action_text,
-            item.component_id,
+            _COMPONENT_TITLES.get(item.component_id, item.component_id),
             item.target_name,
             item.absolute_path,
             format_bytes(item.size),
@@ -467,7 +471,7 @@ class DistributionPage(FeaturePage):
         target_layout.addLayout(target_controls)
         self.target_table = QTableView()
         self.target_table.setObjectName(f"{self.page_key}_targets")
-        self.target_model = VaultTargetTableModel(self)
+        self.target_model = VaultTargetTableModel(self, creation_time=self.page_key == "comsync")
         self.target_proxy = QSortFilterProxyModel(self)
         self.target_proxy.setSourceModel(self.target_model)
         self.target_proxy.setFilterKeyColumn(-1)
@@ -562,7 +566,7 @@ class DistributionPage(FeaturePage):
         recovery_title = QLabel("同步备份 · 保留或撤销" if self.compact_sync else "持久部署批次")
         recovery_title.setObjectName("SectionTitle")
         recovery_row.addWidget(recovery_title)
-        self.batch_selector = QComboBox()
+        self.batch_selector = DropDownCombo()
         self.batch_selector.setObjectName(f"{self.page_key}_batch_selector")
         self.batch_selector.setSizeAdjustPolicy(
             QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
@@ -914,6 +918,8 @@ class DistributionPage(FeaturePage):
         def operation(cancel, progress):
             open_state = self._read_open_state(cancel, progress, validate=False)
             catalog = discover_vaults(root, cancel=cancel, progress=progress)
+            if self.page_key == "comsync":
+                catalog = with_creation_times(catalog, cancel)
             return CatalogTaskResult(catalog, open_state)
 
         self.start_task("catalog", operation)
@@ -1081,7 +1087,7 @@ class DistributionPage(FeaturePage):
         )
         if self.compact_sync:
             self.confirm_checkbox.setText(
-                f"确认同步到 {len(plan.targets)} 个仓库的 .obsidian；"
+                f"确认同步所选组件到 {len({item.target_root for item in plan.targets})} 个仓库；"
                 f"将删除目标内 {delete_files} 个文件、{delete_dirs} 个文件夹。"
             )
         self.confirm_checkbox.setEnabled(plan.needs_deploy)
@@ -1173,13 +1179,7 @@ class DistributionPage(FeaturePage):
         self._reset_finalize_confirmation()
         try:
             all_batches = DeploymentEngine(self.state_dir).list_batches()
-            batches = tuple(batch for batch in all_batches if (
-                batch.label == self.batch_label
-                or (
-                    self.page_key == _LEGACY_RECOVERY_PAGE
-                    and batch.label not in _KNOWN_BATCH_LABELS
-                )
-            ))
+            batches = all_batches
         except (OSError, JournalError) as exc:
             self._batches = ()
             self._pending_batches = ()
@@ -1379,125 +1379,144 @@ class DistributionPage(FeaturePage):
             QApplication.clipboard().setText("\n".join(paths))
 
 
-class TemplateSuitePage(DistributionPage):
-    page_key = "template_suite"
-    source_label = "模板套件根目录"
-    source_hint = "选择直接包含 .claude、.claudian、.obsidian、File 的模板目录"
+class ComSyncPage(DistributionPage):
+    page_key = "comsync"
+    source_label = "配置来源"
+    source_hint = "选择来源仓库或模板套件根目录"
+    compact_sync = True
     component_options = (
         ComponentOption("claude", ".claude", ".claude"),
         ComponentOption("claudian", ".claudian", ".claudian"),
-        ComponentOption("obsidian", ".obsidian", ".obsidian"),
-        ComponentOption("file", "File", "File"),
+        ComponentOption("obsidian", ".obsidian", ".obsidian", True),
+        ComponentOption("templater", ".Templater", "File/Templater"),
+        ComponentOption("file", ".File", "File"),
     )
 
     def __init__(self, state_dir: Path, settings: dict[str, Any], default_root: str,
                  *, obsidian_config_path: str | Path | None = None,
-                 opened_vault_reader: Callable[[str | Path | None], OpenedVaultCandidates]
-                 | None = None) -> None:
-        super().__init__(
-            state_dir, settings, default_root,
-            title="模板套件部署",
-            description=("从一个明确的模板目录选择组件，按文件与目录预览完整部署到所选仓库；"
-                         "目标独有内容会列为删除。"),
-            obsidian_config_path=obsidian_config_path,
-            opened_vault_reader=opened_vault_reader,
-        )
-
-    def _components(self) -> tuple[DeploymentComponent, ...]:
-        source = Path(self.source_picker.value)
-        options = {item.component_id: item for item in self.component_options}
-        return tuple(
-            DeploymentComponent.direct(key, source / options[key].relative_path,
-                                       options[key].relative_path)
-            for key in self.selected_component_ids()
-        )
-
-
-class ObsidianConfigPage(DistributionPage):
-    page_key = "obsidian_config"
-    source_label = "来源仓库 / 配置"
-    source_hint = "选择来源仓库或 .obsidian 文件夹"
-    compact_sync = True
-    component_options = (
-        ComponentOption("obsidian", ".obsidian 完整配置", ".obsidian", True),
-    )
-
-    def __init__(self, state_dir: Path, settings: dict[str, Any], default_root: str,
-                 *, obsidian_config_path: str | Path | None = None,
-                 opened_vault_reader: Callable[[str | Path | None], OpenedVaultCandidates]
-                 | None = None) -> None:
+                 opened_vault_reader=None) -> None:
         self._catalog_root = ""
-        super().__init__(
-            state_dir, settings, default_root,
-            title=".obsidian同步",
-            description="把一个仓库的 .obsidian 单向同步到其他仓库，包含插件、主题和设置。",
-            obsidian_config_path=obsidian_config_path,
-            opened_vault_reader=opened_vault_reader,
-        )
+        super().__init__(state_dir, settings, default_root,
+            title=".comSync",
+            description="统一同步配置和模板；为新仓库补齐 File 目录结构。",
+            obsidian_config_path=obsidian_config_path, opened_vault_reader=opened_vault_reader)
+        self.source_picker.selection.catalog_transform = with_creation_times
         self.source_picker.selection.catalog_ready.connect(self._accept_catalog)
+        # Keep component controls together with the source, without another card.
+        self.component_frame.setVisible(True)
+        self.source_frame.layout().addWidget(self.component_frame)
+        self.component_frame.setObjectName("ComponentOptions")
+        self.component_frame.layout().setContentsMargins(0, 0, 0, 0)
+        grid = self.component_frame.layout().itemAt(0).layout()
+        caption = grid.itemAtPosition(0, 0).widget()
+        grid.removeWidget(caption)
+        caption.setText("同步组件")
+        grid.addWidget(caption, 0, 0, 2, 1)
+        for index, box in enumerate(self.component_boxes.values()):
+            grid.removeWidget(box)
+        for index, box in enumerate(self.component_boxes.values()):
+            grid.addWidget(box, index // 3, index % 3 + 1)
+        grid.setColumnStretch(3, 0)
+        grid.setColumnStretch(4, 1)
+        self._component_grid, self._component_caption = grid, caption
+        self.component_boxes["file"].setToolTip(
+            "补齐 File/Note、File/Attachment 空目录，保留已有内容；同时完整同步 File/Templater。")
+        self.component_boxes["templater"].setToolTip(
+            "完整同步 File/Templater 内容；选择 .File 时已包含，不会重复同步。")
+        self.component_scope.setText(
+            ".File 包含 .Templater 内容；Note、Attachment 只补齐目录，已有笔记和附件保留。")
+        self.safety_hint.setText("选中配置和模板按来源完整同步，目标独有内容会进入删除预览。")
+        self.preview_table.setColumnHidden(1, False)
+        self.preview_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+        self.preview_table.setColumnWidth(1, 95)
+        self.target_table.setMinimumHeight(115)
+        self.target_table.setMaximumHeight(145)
+        self.preview_table.setMinimumHeight(125)
+        self.target_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
+        self.target_table.setColumnWidth(3, 164)
+        self.latest_button = QPushButton("最新仓库")
+        self.latest_button.setObjectName("TextButton")
+        self.latest_button.setIcon(action_icon("clock"))
+        self.latest_button.setToolTip("按整个扫描列表的文件夹创建时间选择最新目标，替换当前勾选；同一时间的仓库一起选择。")
+        controls = self.clear_targets_button.parentWidget().layout()
+        # The controls row lives inside the target card.
+        for index in range(controls.count()):
+            row = controls.itemAt(index).layout()
+            if row is not None and row.indexOf(self.clear_targets_button) >= 0:
+                row.insertWidget(row.indexOf(self.select_all_targets_button), self.latest_button)
+                break
+        self.latest_button.clicked.connect(self._select_newest)
+        self.refresh_actions()
 
     def restore_settings(self, settings: dict[str, Any]) -> None:
-        # The dedicated page has one fixed scope, including settings from older versions.
-        super().restore_settings({**settings, "components": ["obsidian"]})
+        super().restore_settings(settings)
+        self._include_templater()
+
+    def _include_templater(self) -> None:
+        if self.component_boxes["file"].isChecked():
+            blocker = QSignalBlocker(self.component_boxes["templater"])
+            self.component_boxes["templater"].setChecked(True)
+            del blocker
 
     def _inputs_changed(self, *_: Any, clear_catalog: bool = False) -> None:
+        self._include_templater()
         retained = self.catalog if self.root_picker.value == self._catalog_root else None
         super()._inputs_changed(clear_catalog=clear_catalog)
         if retained is not None and clear_catalog and not self._restoring:
-            # Reuse only the discovery list. Choices, preview and confirmation are revoked;
-            # analysis and execution independently revalidate the actual filesystem.
             self._accept_catalog(retained)
 
     def _accept_catalog(self, result: VaultCatalogResult) -> None:
         self._catalog_root = self.root_picker.value
         super()._accept_catalog(result)
 
+    def _source_overlaps_vault(self, vault: VaultInfo) -> bool:
+        return bool(self.source_picker.value) and _paths_overlap(str(source_root(self.source_picker.value)), vault.path)
+
+    def _select_newest(self) -> None:
+        latest = newest_vaults(self.target_model.rows)
+        if not latest:
+            self.set_status("无法确定最新仓库：请重新扫描，确认所有候选的创建时间均可读取。", "warning")
+            return
+        self.target_filter.clear()
+        self.target_model._set_checked({_physical_key(vault.path) for vault in latest})
+        first = next(i for i, vault in enumerate(self.target_model.rows) if vault == latest[0])
+        index = self.target_proxy.mapFromSource(self.target_model.index(first, 0))
+        self.target_table.scrollTo(index)
+        self.set_status(f"已按创建时间选择最新的 {len(latest)} 个仓库；请预览后同步。")
+
+    def refresh_actions(self) -> None:
+        super().refresh_actions()
+        if hasattr(self, "component_boxes") and "templater" in self.component_boxes:
+            self.component_boxes["templater"].setEnabled(
+                not self._global_busy and not self._task_active and not self.component_boxes["file"].isChecked())
+        if hasattr(self, "latest_button"):
+            self.latest_button.setEnabled(not self._global_busy and not self._task_active
+                and self.catalog is not None and bool(newest_vaults(self.target_model.rows)))
+        if hasattr(self, "occupancy_status") and self.open_state.reliable:
+            self.occupancy_status.setVisible(bool(self._open_selected_targets(
+                self.open_state, self._selected_target_paths())))
+
     def set_status(self, text: str, kind: str = "neutral") -> None:
         super().set_status(text.replace("部署", "同步"), kind)
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
-        self.target_table.setMaximumHeight(280 if self.height() > 1100 else 180)
+        self.target_table.setMaximumHeight(280 if self.height() > 1100 else 145)
+        if hasattr(self, "_component_grid"):
+            grid = self._component_grid
+            grid.removeWidget(self._component_caption)
+            for box in self.component_boxes.values():
+                grid.removeWidget(box)
+            columns = 5 if self.width() >= 930 else 3
+            grid.addWidget(self._component_caption, 0, 0, 1 if columns == 5 else 2, 1)
+            for index, box in enumerate(self.component_boxes.values()):
+                grid.addWidget(box, index // columns, index % columns + 1)
+            grid.setColumnStretch(4, 0)
+            grid.setColumnStretch(6, 1)
 
     def _components(self) -> tuple[DeploymentComponent, ...]:
-        if "obsidian" not in self.selected_component_ids():
-            return ()
-        return (DeploymentComponent.obsidian(self.source_picker.value),)
+        return components(self.source_picker.value, self.selected_component_ids())
 
 
-class TemplaterPage(DistributionPage):
-    page_key = "templater"
-    source_label = "模板 Templater"
-    source_hint = "选择模板仓库、File 目录或 File/Templater 目录"
-    component_options = (
-        ComponentOption("templater", "File/Templater", "File/Templater", True),
-    )
-
-    def __init__(self, state_dir: Path, settings: dict[str, Any], default_root: str,
-                 *, obsidian_config_path: str | Path | None = None,
-                 opened_vault_reader: Callable[[str | Path | None], OpenedVaultCandidates]
-                 | None = None) -> None:
-        super().__init__(
-            state_dir, settings, default_root,
-            title=".Templater",
-            description=("只完整克隆 File/Templater 子树，不触碰 File 下的其他内容；"
-                         "支持持久撤销与确认保留。"),
-            obsidian_config_path=obsidian_config_path,
-            opened_vault_reader=opened_vault_reader,
-        )
-
-    def _components(self) -> tuple[DeploymentComponent, ...]:
-        if "templater" not in self.selected_component_ids():
-            return ()
-        return (DeploymentComponent.templater(self.source_picker.value),)
-
-
-__all__ = [
-    "DeploymentPreviewRow",
-    "DeploymentPreviewTableModel",
-    "DistributionPage",
-    "ObsidianConfigPage",
-    "TemplateSuitePage",
-    "TemplaterPage",
-    "VaultTargetTableModel",
-]
+__all__ = ["DeploymentPreviewRow", "DeploymentPreviewTableModel", "DistributionPage",
+           "ComSyncPage", "VaultTargetTableModel"]

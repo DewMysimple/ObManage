@@ -10,6 +10,8 @@ from .controls import DropDownCombo
 
 
 TITLES = {**{f.key: f.short_title for f in FEATURES}, "system": "应用", "legacy": "历史日志"}
+TITLES.update({"obsidian_config": ".obsidian同步（旧版）", "template_suite": "模板套件（旧版）",
+               "templater": ".Templater（旧版）"})
 
 
 class OperationLogDialog(QDialog):
