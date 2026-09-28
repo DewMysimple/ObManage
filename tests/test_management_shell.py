@@ -419,6 +419,41 @@ def test_global_cancel_is_hidden_for_non_cancellable_recovery_task(application, 
         dispose(application, window)
 
 
+def test_resolving_changed_deployment_releases_all_pages_through_worker(application, tmp_path):
+    source, target, state = (tmp_path / name for name in ("source", "target", "state"))
+    (source / ".obsidian").mkdir(parents=True)
+    (target / ".obsidian").mkdir(parents=True)
+    (source / ".obsidian" / "settings.json").write_text("new")
+    (target / ".obsidian" / "settings.json").write_text("old")
+    engine = DeploymentEngine(state)
+    plan = engine.analyze(DeploymentRequest((DeploymentSelection(
+        DeploymentComponent.obsidian(source), DeploymentTarget("target", str(target)),
+    ),), label="legacy-v1"))
+    assert engine.execute(plan).success
+    (target / ".obsidian" / "workspace.json").write_text("later")
+    assert not engine.rollback(plan.batch_id).success
+    window = MainWindow(state)
+    try:
+        assert window._recovery_page_keys() == ("comsync",)
+        window.nav_recovery_button.click()
+        page = window.pages["comsync"]
+        page.inspect_button.click()
+        wait_until(application, lambda: not window.busy)
+        assert page.recovery_preview is not None
+        page.resolve_confirm.setChecked(True)
+        page.resolve_button.click()
+        wait_until(application, lambda: not window.busy)
+        assert not window._recovery_page_keys()
+        assert window.nav_recovery_button.isHidden()
+        for key in ("incremental", "vault_backup", "archive", "trash_cleanup"):
+            assert not window.pages[key]._external_recovery_pending
+        assert engine.get_batch(plan.batch_id).status == "resolved"
+        assert (target / ".obsidian" / "workspace.json").read_text() == "later"
+        assert tuple(target.glob(".obmanage-deploy-*.backup"))
+    finally:
+        dispose(application, window)
+
+
 def test_state_inside_configured_repository_blocks_ui_state_and_tasks(
         application, tmp_path):
     source = tmp_path / "source"
@@ -506,6 +541,9 @@ def test_comsync_new_vault_full_worker_flow_and_rollback(application, tmp_path):
         assert list((target / "File/Note").iterdir()) == []
         assert list((target / "File/Attachment").iterdir()) == []
         assert (source / "File/Note/private.md").read_text() == "private"
+        page.inspect_button.click()
+        wait_until(application, lambda: not window.busy)
+        page.preserve_confirm.setChecked(True)
         page.rollback_button.click()
         wait_until(application, lambda: not window.busy)
         assert not page.has_pending_recovery()

@@ -1082,6 +1082,7 @@ class MainWindow(QMainWindow):
         keys = self._recovery_page_keys()
         if keys:
             self._show_page(keys[0])
+            self.page_containers[keys[0]].verticalScrollBar().setValue(0)
 
     @Slot(object)
     def _on_feature_completed(self, outcome: tuple[str, Any]) -> None:
@@ -1487,7 +1488,7 @@ class MainWindow(QMainWindow):
             return
         if self._recovery_page_keys():
             self._set_status(
-                "存在待恢复事务，请先通过左侧入口完成撤销、恢复或确认清理。",
+                "存在待恢复事务，请通过左侧入口检查后回退，或保留现状并结束事务。",
                 "warning",
             )
             return
@@ -1534,7 +1535,7 @@ class MainWindow(QMainWindow):
         if self._reject_unsafe_state_location():
             return
         if self._recovery_page_keys():
-            message = "存在待恢复事务，本轮镜像已阻止；请先完成撤销、恢复或确认清理。"
+            message = "存在待恢复事务，本轮镜像已阻止；请先检查后回退，或保留现状并结束事务。"
             self._set_status(message, "warning")
             self._log(message, feature="mirror", event="执行", level="warning")
             return
@@ -1864,7 +1865,8 @@ class MainWindow(QMainWindow):
 
     def _begin_log_task(self, feature, kind):
         events = {"analyze": "分析差异", "preview": "预览", "execute": "执行", "archive": "打包",
-                  "scan": "扫描", "rollback": "撤销", "finalize": "确认保留", "clear": "清理",
+                  "scan": "扫描", "rollback": "回退", "finalize": "清理事务备份", "clear": "清理",
+                  "inspect_recovery": "检查恢复方案", "resolve": "保留现状结束事务",
                   "restore": "恢复", "statistics": "统计", "catalog": "读取仓库列表", "analyze_deep": "完整内容校验"}
         event = events.get(kind, kind or "任务")
         self._log_context = (feature, event, uuid.uuid4().hex)

@@ -54,6 +54,9 @@ def snapshot_tree(root: Path) -> dict[str, tuple[str, bytes]]:
 
 
 def run_last_operation(page, operations: list, starter):
+    if starter == page._start_rollback:
+        run_last_operation(page, operations, page._start_inspect_recovery)
+        page.preserve_confirm.setChecked(True)
     before = len(operations)
     starter()
     assert len(operations) == before + 1
@@ -221,8 +224,8 @@ def test_execute_and_new_page_can_rollback_persistent_batch(application, tmp_pat
         assert page.current_batch is not None
         assert page.current_batch.status == "committed"
         assert not page.recovery_frame.isHidden()
-        assert page.rollback_button.isEnabled()
-        assert page.finalize_confirm.isEnabled()
+        assert not page.rollback_button.isEnabled()  # inspect and confirm first
+        assert not page.finalize_confirm.isEnabled()  # ending and cleanup are separate
         assert not page.finalize_button.isEnabled()
 
         recovered = ComSyncPage(
@@ -240,10 +243,10 @@ def test_execute_and_new_page_can_rollback_persistent_batch(application, tmp_pat
         assert rollback.success
         assert snapshot_tree(target / ".obsidian") == original
         assert recovered.current_batch is not None
-        assert recovered.current_batch.status == "rolled_back"
+        assert recovered.current_batch.status == "rolled_back_with_residuals"
         assert not recovered.rollback_button.isEnabled()
         assert not recovered.finalize_button.isEnabled()
-        assert recovered.recovery_frame.isHidden()
+        assert not recovered.recovery_frame.isHidden()  # preserved current version stays accessible
     finally:
         if recovered is not None:
             dispose(recovered)
@@ -275,11 +278,18 @@ def test_execute_and_new_page_can_finalize_persistent_batch(application, tmp_pat
         before = len(recovered_operations)
         recovered._start_finalize()
         assert len(recovered_operations) == before
+        run_last_operation(recovered, recovered_operations, recovered._start_inspect_recovery)
+        recovered.resolve_confirm.setChecked(True)
+        resolved = run_last_operation(recovered, recovered_operations, recovered._start_resolve)
+        assert resolved.success
+        assert tuple(target.glob(".obmanage-deploy-*.backup"))
+        run_last_operation(recovered, recovered_operations, recovered._start_inspect_recovery)
         recovered.finalize_confirm.setChecked(True)
         assert recovered.finalize_button.isEnabled()
         recovered.invalidate_confirmation()
         assert not recovered.finalize_confirm.isChecked()
         assert not recovered.finalize_button.isEnabled()
+        run_last_operation(recovered, recovered_operations, recovered._start_inspect_recovery)
         recovered.finalize_confirm.setChecked(True)
         finalized = run_last_operation(
             recovered, recovered_operations, recovered._start_finalize
@@ -289,7 +299,7 @@ def test_execute_and_new_page_can_finalize_persistent_batch(application, tmp_pat
         assert snapshot_tree(target / ".obsidian") == snapshot_tree(source / ".obsidian")
         assert not tuple(target.glob(".obmanage-deploy-*.backup"))
         assert recovered.current_batch is not None
-        assert recovered.current_batch.status == "finalized"
+        assert recovered.current_batch.status == "resolved"
         assert not recovered.has_pending_recovery()
         assert not recovered.finalize_confirm.isChecked()
     finally:
@@ -354,7 +364,7 @@ def test_all_pending_deployment_batches_remain_selectable_and_actions_use_select
         assert (second_target / ".obsidian" / "value.json").read_text(
             encoding="utf-8"
         ) == "new-second"
-        assert page.batch_selector.count() == 1
+        assert page.batch_selector.count() == 2  # completed preserved copies remain reachable
         assert page.batch_selector.currentData() == second.batch_id
         assert page.current_batch is not None
         assert page.current_batch.batch_id == second.batch_id
@@ -423,7 +433,7 @@ def test_unknown_legacy_batch_is_reachable_from_config_recovery_page(
         assert config.current_batch is not None
         assert config.current_batch.label == "legacy-distribution-v0"
         assert str(target / ".obsidian") in config.batch_status.toolTip()
-        assert config.rollback_button.isEnabled()
+        assert not config.rollback_button.isEnabled()
 
         result = run_last_operation(config, operations, config._start_rollback)
 
@@ -472,6 +482,45 @@ def test_completed_rollback_with_residuals_remains_visible(application, tmp_path
         assert "已保留" in page.batch_status.toolTip()
         assert not page.rollback_button.isEnabled()
         assert not page.finalize_button.isEnabled()
+    finally:
+        dispose(page)
+
+
+def test_changed_transaction_resolution_requires_inspection_and_resets_consent(application, tmp_path):
+    root, source, target = tmp_path / "vaults", tmp_path / "source", tmp_path / "vaults" / "target"
+    state = tmp_path / "state"
+    batch = create_pending_config_batch(state, source, target, "target")
+    (target / ".obsidian" / "workspace.json").write_text("late change")
+    page = ComSyncPage(state, {}, str(root), opened_vault_reader=closed_vault_reader)
+    operations = []
+    page.task_requested.connect(operations.append)
+    try:
+        assert not page.resolve_button.isEnabled()
+        assert not page.rollback_button.isEnabled()
+        assert not page.finalize_confirm.isEnabled()
+        page._start_resolve()
+        assert not operations
+        run_last_operation(page, operations, page._start_inspect_recovery)
+        assert "已有变化" in page.recovery_details.toPlainText()
+        assert str(target) in page.recovery_details.toPlainText()
+        page.resolve_confirm.setChecked(True)
+        assert page.resolve_button.isEnabled()
+        page.invalidate_confirmation()
+        assert not page.resolve_confirm.isChecked()
+        assert not page.resolve_button.isEnabled()
+        run_last_operation(page, operations, page._start_inspect_recovery)
+        page.resolve_confirm.setChecked(True)
+        before = snapshot_tree(target)
+        result = run_last_operation(page, operations, page._start_resolve)
+        assert result.success
+        assert snapshot_tree(target) == before
+        assert not page.has_pending_recovery()
+        assert not page.recovery_frame.isHidden()
+        assert page.batch_selector.findData(batch.batch_id) >= 0
+        assert not page.finalize_button.isEnabled()
+        run_last_operation(page, operations, page._start_inspect_recovery)
+        assert page.finalize_confirm.isEnabled()
+        assert "单独清理将删除" in page.recovery_details.toPlainText()
     finally:
         dispose(page)
 
@@ -878,7 +927,7 @@ def test_old_distribution_batches_are_recoverable_in_merged_page(application, tm
     page.task_requested.connect(operations.append)
     try:
         assert page.has_pending_recovery() and page.current_batch.batch_id == plan.batch_id
-        assert page.rollback_button.isEnabled()
+        assert not page.rollback_button.isEnabled()
         run_last_operation(page, operations, page._start_rollback)
         assert not page.has_pending_recovery()
         assert (target / ".obsidian/changed.json").read_text() == "old"

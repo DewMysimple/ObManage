@@ -36,7 +36,7 @@ BATCH_STATUSES = frozenset({
     "prepare_failed", "recovery_required", "rolling_back", "rolled_back",
     "rolled_back_with_residuals",
     "rollback_blocked", "rollback_required", "finalizing", "finalized",
-    "finalize_required", "commit_failed",
+    "finalize_required", "commit_failed", "resolved",
 })
 TARGET_PHASES = frozenset({
     "planned", "unchanged", "staging", "prepared", "backing_up", "backed_up",
@@ -78,6 +78,9 @@ class JournalTarget:
     backup_identity: tuple[str, int, int] | None = None
     rollback_path: str | None = None
     rollback_identity: tuple[str, int, int] | None = None
+    # Explicitly previewed current content saved during recovery. Never a
+    # deletion authorization: it must survive rollback and backup cleanup.
+    preserved_manifest: dict[str, dict[str, Any]] | None = None
     deployed_identity: tuple[str, int, int] | None = None
     original_identity: tuple[str, int, int] | None = None
     source_manifest: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -259,6 +262,9 @@ def _target_from_json(value: Any) -> JournalTarget:
     if rollback_path is not None and (rollback_identity is None or rollback_identity[0] != "dir"):
         raise JournalError("事务日志中的回滚隔离目录缺少可信身份。")
     original_manifest = _manifest_from_json(value.get("original_manifest"), optional=True)
+    preserved_manifest = _manifest_from_json(value.get("preserved_manifest"), optional=True)
+    if preserved_manifest is not None and (rollback_path is None or rollback_identity is None):
+        raise JournalError("事务日志中的保全内容缺少路径或身份。")
     if original_manifest is not None and (original_identity is None or original_identity[0] != "dir"):
         raise JournalError("事务日志中的原目标目录缺少可信身份。")
     return JournalTarget(
@@ -279,6 +285,7 @@ def _target_from_json(value: Any) -> JournalTarget:
         backup_identity=backup_identity,
         rollback_path=rollback_path,
         rollback_identity=rollback_identity,
+        preserved_manifest=preserved_manifest,
         deployed_identity=deployed_identity,
         original_identity=original_identity,
         source_manifest=_manifest_from_json(value.get("source_manifest")) or {},

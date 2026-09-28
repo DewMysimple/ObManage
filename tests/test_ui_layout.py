@@ -21,6 +21,9 @@ from obmanage.management.models import (
 from obmanage.pages.distribution import DeploymentPreviewRow
 from obmanage.pages.vault_chooser import VaultSourceDialog
 from obmanage.pages.common import PathPicker
+from obmanage.management.deployment import (
+    DeploymentComponent, DeploymentEngine, DeploymentRequest, DeploymentSelection, DeploymentTarget,
+)
 from obmanage.ui import FILTERS, MainWindow
 
 
@@ -37,6 +40,52 @@ def settle(app):
     while time.monotonic() < deadline:
         app.processEvents()
         time.sleep(0.005)
+
+
+@pytest.mark.parametrize("size", [(980, 620), (1140, 920), (2560, 1440)])
+def test_recovery_workbench_is_readable_and_actions_reachable(application, tmp_path, size):
+    source, target, state = (tmp_path / name for name in ("source", "target", "state"))
+    (source / ".obsidian").mkdir(parents=True)
+    (target / ".obsidian").mkdir(parents=True)
+    (source / ".obsidian" / "config.json").write_text("new")
+    (target / ".obsidian" / "config.json").write_text("old")
+    engine = DeploymentEngine(state)
+    plan = engine.analyze(DeploymentRequest((DeploymentSelection(
+        DeploymentComponent.obsidian(source), DeploymentTarget("target", str(target))),)))
+    assert engine.execute(plan).success
+    (target / ".obsidian" / "workspace.json").write_text("changed")
+    window = MainWindow(state)
+    page = window.pages["comsync"]
+    page.recovery_preview = engine.inspect_recovery(plan.batch_id)
+    page.recovery_details.setPlainText("\n\n".join(page.recovery_preview.details))
+    page.refresh_actions()
+    window.resize(*size)
+    window._show_page("comsync", persist=False)
+    window.show()
+    try:
+        settle(application)
+        scroll = window.page_containers["comsync"]
+        assert scroll.horizontalScrollBar().maximum() == 0
+        assert page.recovery_details.horizontalScrollBar().maximum() == 0
+        assert str(target) in page.recovery_details.toPlainText()
+        assert page.recovery_frame.mapTo(page, QPoint()).y() < page.source_picker.mapTo(page, QPoint()).y()
+        for control in (page.inspect_button, page.resolve_confirm, page.resolve_button,
+                        page.preserve_confirm, page.rollback_button):
+            scroll.ensureWidgetVisible(control)
+            settle(application)
+            position = control.mapTo(scroll.viewport(), QPoint())
+            assert scroll.viewport().rect().contains(QRect(position, control.size()))
+        scroll.verticalScrollBar().setValue(0)
+        settle(application)
+        assert window.grab().save(str(tmp_path / "recovery.png"))
+    finally:
+        assert not window.busy
+        window._timer.stop()
+        window._save_timer.stop()
+        window.tray.hide()
+        window.hide()
+        window.deleteLater()
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
 
 
 @pytest.fixture

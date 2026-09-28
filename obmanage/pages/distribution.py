@@ -26,6 +26,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMenu,
+    QPlainTextEdit,
     QPushButton,
     QTableView,
     QVBoxLayout,
@@ -41,6 +42,8 @@ from ..management.deployment import (
     DeploymentResult,
     DeploymentSelection,
     DeploymentTarget,
+    RecoveryPreview,
+    TERMINAL_BATCH_STATUSES,
 )
 from ..management.journal import JournalBatch, JournalError
 from ..management.comsync import components, newest_vaults, source_root, with_creation_times
@@ -74,7 +77,7 @@ _ACTION_COLORS = {
 _COMPONENT_TITLES = {"claude": ".claude", "claudian": ".claudian", "obsidian": ".obsidian",
                      "templater": ".Templater", "file_note": ".File", "file_attachment": ".File"}
 
-_FINALIZE_STATUSES = frozenset({"committed", "finalizing", "finalize_required"})
+_FINALIZE_STATUSES = frozenset({"resolved"})
 _ROLLBACK_STATUSES = frozenset({
     "preparing",
     "prepared",
@@ -89,26 +92,27 @@ _ROLLBACK_STATUSES = frozenset({
     "finalizing",
     "finalize_required",
 })
-_PENDING_STATUSES = _FINALIZE_STATUSES | _ROLLBACK_STATUSES
+_PENDING_STATUSES = (_FINALIZE_STATUSES | _ROLLBACK_STATUSES) - TERMINAL_BATCH_STATUSES
 
 _STATUS_TEXT = {
     "preparing": "准备中断，建议撤销恢复",
     "prepared": "已准备，尚待恢复",
-    "committing": "提交中断，必须检查并撤销",
-    "commit_failed": "提交失败，必须撤销",
-    "committed": "已部署，等待确认保留或撤销",
+    "committing": "提交中断，请检查恢复方案",
+    "commit_failed": "提交失败，请检查恢复方案",
+    "committed": "已同步，等待保留现状或回退",
     "failed": "部署失败，等待恢复",
     "prepare_failed": "准备失败，目标未提交",
     "cancelled": "已取消，目标未提交",
     "recovery_required": "自动恢复未完成，需要继续撤销",
     "rolling_back": "撤销中断，需要继续撤销",
     "rollback_required": "撤销未完成，需要继续撤销",
-    "rollback_blocked": "目标已变化，撤销被安全阻止",
+    "rollback_blocked": "回退受阻，可检查后保全回退或保留现状",
     "rolled_back": "已撤销",
     "rolled_back_with_residuals": "已撤销，保留未授权的残留目录",
     "finalizing": "确认清理中断，可继续确认或撤销",
     "finalize_required": "备份清理未完成，可重试确认或撤销",
     "finalized": "已确认保留",
+    "resolved": "已结束 · 保留现状，不再阻塞",
 }
 
 
@@ -371,6 +375,7 @@ class DistributionPage(FeaturePage):
         self.plan: DeploymentPlan | None = None
         self.catalog: VaultCatalogResult | None = None
         self.current_batch: JournalBatch | None = None
+        self.recovery_preview: RecoveryPreview | None = None
         self._batches: tuple[JournalBatch, ...] = ()
         self._pending_batches: tuple[JournalBatch, ...] = ()
         self._recovery_blocked = False
@@ -563,7 +568,7 @@ class DistributionPage(FeaturePage):
 
         self.recovery_frame, recovery_layout = panel(self.body)
         recovery_row = QHBoxLayout()
-        recovery_title = QLabel("同步备份 · 保留或撤销" if self.compact_sync else "持久部署批次")
+        recovery_title = QLabel("事务处理与保留副本")
         recovery_title.setObjectName("SectionTitle")
         recovery_row.addWidget(recovery_title)
         self.batch_selector = DropDownCombo()
@@ -580,19 +585,34 @@ class DistributionPage(FeaturePage):
         self.batch_status.setWordWrap(True)
         self.batch_status.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         recovery_layout.addWidget(self.batch_status)
+        self.inspect_button = QPushButton("检查恢复方案")
+        recovery_layout.addWidget(self.inspect_button)
+        self.recovery_details = QPlainTextEdit()
+        self.recovery_details.setReadOnly(True)
+        self.recovery_details.setMinimumHeight(140)
+        self.recovery_details.setMaximumHeight(190)
+        self.recovery_details.setPlaceholderText("先检查所选事务，查看目标状态、回退方案和备份位置。")
+        recovery_layout.addWidget(self.recovery_details)
+        self.resolve_confirm = QCheckBox("接受当前状态（可能仅部分完成），保留全部副本")
+        recovery_layout.addWidget(self.resolve_confirm)
+        self.resolve_button = QPushButton("保留现状并结束事务")
+        recovery_layout.addWidget(self.resolve_button)
+        self.preserve_confirm = QCheckBox("已检查方案并关闭目标仓库，保全当前内容后回退")
+        recovery_layout.addWidget(self.preserve_confirm)
         recovery_actions = QHBoxLayout()
-        recovery_actions.addStretch()
-        self.rollback_button = QPushButton("撤销所选批次")
+        self.rollback_button = QPushButton("保全内容后回退")
         self.rollback_button.setObjectName("Danger")
         recovery_actions.addWidget(self.rollback_button)
-        self.finalize_button = QPushButton("保留所选批次并清理备份")
-        recovery_actions.addWidget(self.finalize_button)
+        self.finalize_button = QPushButton("清理所选事务备份")
         recovery_layout.addLayout(recovery_actions)
         self.finalize_confirm = QCheckBox(
             "我确认永久清理所选批次备份（完成后不能撤销）"
         )
         self.finalize_confirm.setObjectName(f"{self.page_key}_finalize_confirm")
         recovery_layout.addWidget(self.finalize_confirm)
+        recovery_layout.addWidget(self.finalize_button)
+        self.body.removeWidget(self.recovery_frame)
+        self.body.insertWidget(0, self.recovery_frame)
 
         self.confirm_checkbox = QCheckBox(
             "尚未生成计划；分析完成后必须确认目标与删除数量。"
@@ -651,6 +671,10 @@ class DistributionPage(FeaturePage):
         self.execute_button.clicked.connect(self._start_execute)
         self.cancel_button.clicked.connect(self.cancel_requested)
         self.rollback_button.clicked.connect(self._start_rollback)
+        self.inspect_button.clicked.connect(self._start_inspect_recovery)
+        self.resolve_button.clicked.connect(self._start_resolve)
+        self.resolve_confirm.toggled.connect(lambda *_: self.refresh_actions())
+        self.preserve_confirm.toggled.connect(lambda *_: self.refresh_actions())
         self.finalize_button.clicked.connect(self._start_finalize)
         self.batch_selector.currentIndexChanged.connect(self._batch_selection_changed)
         self.finalize_confirm.toggled.connect(lambda *_: self.refresh_actions())
@@ -785,6 +809,8 @@ class DistributionPage(FeaturePage):
         menu.exec(table.viewport().mapToGlobal(point))
 
     def _invalidate_plan(self, message: str = "计划已失效，请重新分析。") -> None:
+        self._reset_recovery_preview()
+        self._reset_finalize_confirmation()
         self.plan = None
         self.preview_model.set_rows(())
         self.preview_empty.setVisible(self.compact_sync)
@@ -798,6 +824,7 @@ class DistributionPage(FeaturePage):
             self.set_status(message)
 
     def invalidate_confirmation(self) -> None:
+        self._reset_recovery_preview()
         for checkbox in (self.confirm_checkbox, self.finalize_confirm):
             blocker = QSignalBlocker(checkbox)
             checkbox.setChecked(False)
@@ -978,30 +1005,59 @@ class DistributionPage(FeaturePage):
         self.start_task("execute", operation)
 
     @Slot()
-    def _start_rollback(self) -> None:
-        if self.current_batch is None or self.current_batch.status not in _ROLLBACK_STATUSES:
+    def _start_inspect_recovery(self) -> None:
+        if self.current_batch is None:
             return
-        batch_id = self.current_batch.batch_id
-        state_dir = self.state_dir
+        batch_id, state_dir = self.current_batch.batch_id, self.state_dir
+        self._reset_recovery_preview()
         self._reset_finalize_confirmation()
+        self.start_task("inspect_recovery", lambda _cancel, _progress:
+                        DeploymentEngine(state_dir).inspect_recovery(batch_id))
 
-        def operation(_cancel, _progress):
-            return DeploymentEngine(state_dir).rollback(batch_id)
+    @Slot()
+    def _start_resolve(self) -> None:
+        preview = self.recovery_preview
+        if (preview is None or not self.resolve_confirm.isChecked() or self.current_batch is None
+                or self.current_batch.status not in _PENDING_STATUSES):
+            return
+        state_dir = self.state_dir
+        self._reset_recovery_preview()
+        self.start_task("resolve", lambda _cancel, _progress: DeploymentEngine(state_dir).resolve(
+            preview.batch_id, expected_revision=preview.revision))
+
+    @Slot()
+    def _start_rollback(self) -> None:
+        preview = self.recovery_preview
+        if (preview is None or not preview.can_rollback or not self.preserve_confirm.isChecked()
+                or self.current_batch is None or self.current_batch.status not in _ROLLBACK_STATUSES):
+            return
+        state_dir = self.state_dir
+        target_paths = tuple(target.target_root for target in self.current_batch.targets)
+        self._reset_recovery_preview()
+
+        def operation(cancel, progress):
+            opened = self._read_open_state(cancel, progress, validate=False)
+            if self._open_selected_targets(opened, target_paths):
+                raise DeploymentError("目标仓库仍在 Obsidian 中打开，请关闭后重新检查。")
+            return DeploymentEngine(state_dir).rollback(preview.batch_id, preview=preview)
 
         self.start_task("rollback", operation)
 
     @Slot()
     def _start_finalize(self) -> None:
+        preview = self.recovery_preview
         if (self.current_batch is None
                 or self.current_batch.status not in _FINALIZE_STATUSES
+                or preview is None or preview.cleanup_error
                 or not self.finalize_confirm.isChecked()):
             return
         batch_id = self.current_batch.batch_id
         state_dir = self.state_dir
+        self._reset_recovery_preview()
         self._reset_finalize_confirmation()
 
         def operation(_cancel, _progress):
-            return DeploymentEngine(state_dir).finalize(batch_id)
+            return DeploymentEngine(state_dir).finalize(batch_id, preview=preview)
 
         self.start_task("finalize", operation)
 
@@ -1124,6 +1180,14 @@ class DistributionPage(FeaturePage):
         self.finalize_confirm.setChecked(False)
         del blocker
 
+    def _reset_recovery_preview(self) -> None:
+        self.recovery_preview = None
+        self.recovery_details.clear()
+        for checkbox in (self.resolve_confirm, self.preserve_confirm):
+            blocker = QSignalBlocker(checkbox)
+            checkbox.setChecked(False)
+            del blocker
+
     def _batch_choice_text(self, batch: JournalBatch) -> str:
         status = _STATUS_TEXT.get(batch.status, batch.status)
         updated = datetime.fromtimestamp(batch.updated_at).strftime("%m-%d %H:%M")
@@ -1166,6 +1230,7 @@ class DistributionPage(FeaturePage):
 
     @Slot(int)
     def _batch_selection_changed(self, index: int) -> None:
+        self._reset_recovery_preview()
         self._reset_finalize_confirmation()
         batch_id = self.batch_selector.itemData(index) if index >= 0 else None
         self.current_batch = next(
@@ -1175,6 +1240,7 @@ class DistributionPage(FeaturePage):
         self.refresh_actions()
 
     def _reload_persistent_batches(self) -> None:
+        self._reset_recovery_preview()
         selected_id = self.current_batch.batch_id if self.current_batch is not None else None
         self._reset_finalize_confirmation()
         try:
@@ -1196,7 +1262,10 @@ class DistributionPage(FeaturePage):
         self._pending_batches = tuple(
             batch for batch in batches if batch.status in _PENDING_STATUSES
         )
-        choices = self._pending_batches or batches[:1]
+        retained = tuple(batch for batch in batches if batch.status in {"resolved", "rolled_back_with_residuals"})
+        choices = self._pending_batches + retained or batches[:1]
+        if self._pending_batches and selected_id not in {batch.batch_id for batch in self._pending_batches}:
+            selected_id = self._pending_batches[0].batch_id
         blocker = QSignalBlocker(self.batch_selector)
         self.batch_selector.clear()
         for batch in choices:
@@ -1225,7 +1294,7 @@ class DistributionPage(FeaturePage):
             if result.success:
                 self.set_status(
                     f"部署完成：提交 {result.committed_targets} 个目标。"
-                    "备份仍保留，请选择确认保留或撤销。",
+                    "备份仍保留，请检查后选择保留现状或回退。",
                     "success",
                 )
             else:
@@ -1237,7 +1306,7 @@ class DistributionPage(FeaturePage):
                 if result.journal_status == "rolled_back_with_residuals":
                     self.set_status(
                         f"撤销完成：恢复 {result.rolled_back_targets} 个目标；"
-                        "未获删除授权的空目录已保留，不再阻塞其他任务。",
+                        "保全内容及残留目录仍可查看，不再阻塞其他任务。",
                         "warning",
                     )
                 else:
@@ -1248,9 +1317,16 @@ class DistributionPage(FeaturePage):
                 self.set_status(f"撤销未完成：{detail or result.journal_status}", "error")
         elif kind == "finalize":
             if result.success:
-                self.set_status("已确认保留部署结果，事务备份已安全清理。", "success")
+                self.set_status("事务备份已安全清理；当前仓库及回退时保全的内容保持不变。", "success")
             else:
                 self.set_status(f"备份清理未完成：{detail or result.journal_status}", "error")
+        elif kind == "resolve":
+            if result.success:
+                self.set_status("本事务已结束；仓库现状及全部副本保持不变。其他待处理事务仍需分别处理。", "success")
+            else:
+                self.set_status(f"事务未结束：{detail}", "error")
+        for message in result.errors:
+            self.message_logged.emit(message)
         self.message_logged.emit(self.status_label.text())
 
     def task_finished(self, status: str, payload: Any) -> None:
@@ -1273,7 +1349,11 @@ class DistributionPage(FeaturePage):
         elif kind == "analyze":
             self.open_state = payload.open_state
             self._accept_plan(payload.plan)
-        elif kind in {"execute", "rollback", "finalize"}:
+        elif kind == "inspect_recovery":
+            self.recovery_preview = payload
+            self.recovery_details.setPlainText("\n\n".join(payload.details))
+            self.set_status("检查完成；请选择保留现状或回退。清理备份需单独确认。")
+        elif kind in {"execute", "rollback", "finalize", "resolve"}:
             if kind == "execute":
                 self.open_state = payload.open_state
                 self._accept_operation_result(kind, payload.result)
@@ -1329,10 +1409,26 @@ class DistributionPage(FeaturePage):
         self.batch_selector.setEnabled(
             available and not self._recovery_blocked and self.batch_selector.count() > 0
         )
-        self.rollback_button.setEnabled(available and batch_status in _ROLLBACK_STATUSES)
-        can_finalize = available and batch_status in _FINALIZE_STATUSES
+        self.inspect_button.setEnabled(available and self.current_batch is not None)
+        inspected = self.recovery_preview is not None
+        can_resolve = available and inspected and batch_status in _PENDING_STATUSES
+        self.resolve_confirm.setEnabled(can_resolve)
+        self.resolve_button.setEnabled(can_resolve and self.resolve_confirm.isChecked())
+        self.recovery_details.setVisible(inspected)
+        self.resolve_confirm.setVisible(inspected and batch_status in _PENDING_STATUSES)
+        self.resolve_button.setVisible(inspected and batch_status in _PENDING_STATUSES)
+        can_preserve = (available and inspected and self.recovery_preview.can_rollback
+                        and batch_status in _ROLLBACK_STATUSES)
+        self.preserve_confirm.setEnabled(can_preserve)
+        self.rollback_button.setEnabled(can_preserve and self.preserve_confirm.isChecked())
+        self.preserve_confirm.setVisible(inspected and batch_status in _ROLLBACK_STATUSES)
+        self.rollback_button.setVisible(inspected and batch_status in _ROLLBACK_STATUSES)
+        can_finalize = (available and batch_status in _FINALIZE_STATUSES and inspected
+                        and not self.recovery_preview.cleanup_error)
         self.finalize_confirm.setEnabled(can_finalize)
         self.finalize_button.setEnabled(can_finalize and self.finalize_confirm.isChecked())
+        self.finalize_confirm.setVisible(inspected and batch_status in _FINALIZE_STATUSES)
+        self.finalize_button.setVisible(inspected and batch_status in _FINALIZE_STATUSES)
         self.copy_target_button.setEnabled(
             available and bool(self.target_table.selectionModel().selectedRows())
         )
@@ -1350,7 +1446,7 @@ class DistributionPage(FeaturePage):
         )
         if self.compact_sync:
             self.recovery_frame.setVisible(
-                pending or self._recovery_blocked or batch_status == "rolled_back_with_residuals"
+                pending or self._recovery_blocked or batch_status in {"rolled_back_with_residuals", "resolved"}
             )
             self.confirm_checkbox.setVisible(self.plan is not None and self.plan.needs_deploy)
             self.occupancy_status.setVisible(bool(target_paths))

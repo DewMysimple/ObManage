@@ -175,6 +175,13 @@ def test_new_directory_receiving_user_content_blocks_rollback_without_deleting_i
     result = DeploymentEngine(state).rollback(plan.batch_id)
     assert not result.success
     assert (second / "File/Note/user.md").read_text() == "keep"
+    preview = engine.inspect_recovery(plan.batch_id)
+    assert preview.can_rollback
+    recovered = engine.rollback(plan.batch_id, preview=preview)
+    assert recovered.success, recovered.errors
+    note = next(item for item in engine.get_batch(plan.batch_id).targets if item.component_id == "file_note")
+    assert (Path(note.rollback_path) / "user.md").read_text() == "keep"
+    assert not (second / "File/Note").exists()
 
 
 def test_creation_time_ties_and_unknown_are_explicit(tmp_path):
