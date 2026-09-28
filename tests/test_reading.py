@@ -70,3 +70,18 @@ def test_read_scope_cannot_be_used_for_directory_or_link(tmp_path):
         pytest.skip("symlink permission unavailable")
     with pytest.raises(SyncError):
         scope.child("link")
+
+
+def test_read_scope_observes_fresh_leaf_even_with_shared_ancestors(tmp_path, monkeypatch):
+    path = tmp_path / "note.md"
+    path.write_bytes(b"old")
+    scope = reading.ReadScope(str(tmp_path))
+    _, before = scope.observe("note.md")
+    path.write_bytes(b"new content")
+    _, after = scope.observe("note.md")
+    assert after != before
+    real = reading.snapshot
+    monkeypatch.setattr(reading, "snapshot", lambda p:
+                        dict(after, kind="link") if p == str(path) else real(p))
+    with pytest.raises(SyncError, match="链接"):
+        scope.observe("note.md")

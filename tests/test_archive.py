@@ -194,6 +194,38 @@ def test_verified_zip_mutation_during_source_recheck_is_not_published(tmp_path, 
     assert not list(out.iterdir())
 
 
+def test_read_scope_does_not_reuse_content_across_archive_phases(tmp_path, vault, monkeypatch):
+    out = tmp_path / "out"
+    out.mkdir()
+    engine = ArchiveEngine(tmp_path / "state")
+    plan = engine.analyze(str(vault), str(out))
+    original = module._verify_zip
+    def mutate_after_zip_verification(*args, **kwargs):
+        original(*args, **kwargs)
+        note = vault / "笔记.md"
+        before = note.stat()
+        note.write_bytes(b"x" * before.st_size)
+        os.utime(note, ns=(before.st_atime_ns, before.st_mtime_ns))
+    monkeypatch.setattr(module, "_verify_zip", mutate_after_zip_verification)
+    with pytest.raises(SyncError, match="来源"):
+        engine.execute(plan)
+    assert not list(out.iterdir())
+
+
+def test_preview_final_inventory_rejects_file_created_during_hash(tmp_path, vault):
+    engine = ArchiveEngine(tmp_path / "state")
+    inserted = False
+    def progress(event):
+        nonlocal inserted
+        if event.phase == "scan" and event.relative_path and not inserted:
+            inserted = True
+            (vault / "late.md").write_bytes(b"must not be silently omitted")
+    with pytest.raises(SyncError, match="清单"):
+        engine.analyze(str(vault), str(tmp_path), progress=progress)
+    assert inserted
+    assert not list(tmp_path.glob("*.zip"))
+
+
 def test_empty_vault_old_timestamps_long_paths_and_cancelled_preview(tmp_path, vault):
     note = vault / "笔记.md"
     os.utime(note, (0, 0))

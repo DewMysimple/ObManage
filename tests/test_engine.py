@@ -225,6 +225,45 @@ def test_same_volume_keeps_copy_and_writeback_verification_serial(mirror, monkey
     assert checked_first and copy_calls == 2
 
 
+def test_small_same_volume_copies_avoid_dispatch_but_large_files_keep_worker(mirror, monkeypatch):
+    engine, source, target = mirror
+    put(source, "small.md", b"a" * 4096)
+    put(source, "large.bin", b"b" * (128 * 1024))
+    plan = analyze(engine, source, target)
+    original = engine_module.copy_stream_and_hash
+    threads = {}
+    def observed(source_stream, destination, size, **kwargs):
+        threads[size] = get_ident()
+        return original(source_stream, destination, size, **kwargs)
+    monkeypatch.setattr(engine_module, "copy_stream_and_hash", observed)
+    result = engine.execute(plan)
+    assert result.status == "success", result.errors
+    assert threads[4096] == get_ident()
+    assert threads[128 * 1024] != get_ident()
+    assert (target / "small.md").read_bytes() == b"a" * 4096
+    assert (target / "large.bin").read_bytes() == b"b" * (128 * 1024)
+
+
+@pytest.mark.parametrize("mode", ["mirror", "no_video"])
+def test_reverse_cache_reuse_needs_no_duplicate_durable_records(mirror, monkeypatch, mode):
+    engine, source, target = mirror
+    put(source, "note.md", b"same")
+    put(target, "note.md", b"same")
+    forward = engine.analyze(source, target, mode=mode)
+    assert forward.can_execute and forward.counts["skip"] == 1
+    def no_hash_or_save(*args, **kwargs):
+        pytest.fail("A durable reverse equivalence requires neither a new hash nor another record")
+    with monkeypatch.context() as patch:
+        patch.setattr(BaselineStore, "save", no_hash_or_save)
+        patch.setattr(engine_module, "_hash_file", no_hash_or_save)
+        backward = engine.analyze(target, source, mode=mode)
+        again = engine.analyze(target, source, mode=mode)
+        assert backward.can_execute and again.can_execute
+        assert backward.counts["skip"] == again.counts["skip"] == 1
+    (source / "note.md").write_bytes(b"changed")
+    assert engine.analyze(target, source, mode=mode).counts["update"] == 1
+
+
 @pytest.mark.parametrize(("with_deletion", "expected_scans_per_root"), [
     (False, 2),
     (True, 3),

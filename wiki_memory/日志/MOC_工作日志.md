@@ -15,6 +15,7 @@ supersedes: null
 
 | 时间 | 类型 | 目标 | 状态 | 主题 | 日志 |
 | --- | --- | --- | --- | --- | --- |
+| 2026-09-28 | maintenance | - | archived | bounded-file-processing-performance | [文件处理性能优化](./2026-09-28-文件处理性能优化.md) |
 | 2026-09-28 | bug | - | archived | deployment-recovery-resolution | [待恢复事务重设计](./2026-09-28-待恢复事务重设计.md) |
 | 2026-09-27 | feature | - | archived | shared-vault-selection-io | [统一仓库选择与共享读取提速](./2026-09-27-统一仓库选择与共享读取提速.md) |
 | 2026-09-27 | feature | - | archived | archive-log-filtering | [归档工作台与日志筛选](./2026-09-27-归档工作台与日志筛选.md) |

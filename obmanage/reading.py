@@ -30,7 +30,8 @@ class ReadScope:
         self._checked_at = 0.0
         self._remaining = 0
 
-    def child(self, relative: str) -> str:
+    def observe(self, relative: str) -> tuple[str, dict]:
+        """Check a live ordinary child, sharing only bounded ancestor work."""
         path = lexical_child_path(self.root, relative)
         parent = os.path.dirname(path)
         now = time.monotonic()
@@ -39,8 +40,14 @@ class ReadScope:
             self._parent, self._checked_at, self._remaining = parent, now, 16
         self._remaining -= 1
         state = snapshot(path)
-        if state is None or state["kind"] != "file":
-            raise SyncError(f"读取路径已消失或变成非普通文件：{path}")
+        if state is None or state["kind"] not in ("file", "dir"):
+            raise SyncError(f"读取路径已消失或变成链接、特殊项目：{path}")
+        return path, state
+
+    def child(self, relative: str) -> str:
+        path, state = self.observe(relative)
+        if state["kind"] != "file":
+            raise SyncError(f"读取路径变成非普通文件：{path}")
         return path
 
 

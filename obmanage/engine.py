@@ -582,11 +582,9 @@ class SyncEngine:
                     item = PlanItem("skip", relative, src["size"], "两端与上次校验记录一致")
                 elif (not deep and _key(target_name) in reverse_keys
                       and reverse_keys[_key(target_name)][1][:2] == (dst, src)):
-                    reverse_record = reverse_keys[_key(target_name)][1]
-                    store.save(plan.pair_id, relative, src, dst, reverse_record[2])
-                    baseline_keys[_key(relative)] = (
-                        relative, (src, dst, reverse_record[2])
-                    )
+                    # The opposite direction already durably owns this exact
+                    # equality claim. Do not duplicate N records/commits merely
+                    # because the user switches direction; both are read each run.
                     item = PlanItem("skip", relative, src["size"], "两端与反向同步的已校验记录一致")
                 elif src["size"] != dst["size"]:
                     item = PlanItem("update", relative, src["size"], "文件大小不同，以源端为准")
@@ -712,8 +710,8 @@ class SyncEngine:
     def _start_copy(self, plan: SyncPlan, item: PlanItem, store: BaselineStore,
                     cancel: threading.Event | _CombinedCancel | None,
                     root_checkpoint: Callable[[bool], None],
-                    executor: ThreadPoolExecutor) -> _PendingCopy:
-        """Validate and register one temp before its source write is dispatched."""
+                    executor: ThreadPoolExecutor | None) -> _PendingCopy:
+        """Validate and register one temp before its inline or dispatched write."""
         relative = item.relative_path
         expected = plan.context["source_entries"][relative]
         dst_path, target_state = checked_child_snapshot(plan.target, relative)
@@ -744,7 +742,14 @@ class SyncEngine:
                 temp_fd=temp_fd,
             )
             store.register_temp(plan.pair_id, temp_path, temp_identity)
-            pending.future = executor.submit(self._write_copy_temp, pending, cancel)
+            if executor is None:
+                # A small same-volume copy has no I/O to overlap. Keep identical
+                # ownership and verification paths, without a thread round trip.
+                written = self._write_copy_temp(pending, cancel)
+                pending.future = Future()
+                pending.future.set_result(written)
+            else:
+                pending.future = executor.submit(self._write_copy_temp, pending, cancel)
             return pending
         except BaseException:
             if pending is not None:
@@ -765,7 +770,7 @@ class SyncEngine:
     @staticmethod
     def _write_copy_temp(pending: _PendingCopy,
                          cancel: threading.Event | _CombinedCancel | None) -> tuple[int, str, int]:
-        """Write and hash a source in the sole pipeline worker."""
+        """Write and hash a source; small same-volume files may run inline."""
         relative = pending.item.relative_path
         descriptor = pending.temp_fd
         if descriptor is None:
@@ -1205,12 +1210,17 @@ class SyncEngine:
             )
 
             def begin_copy(item: PlanItem) -> _PendingCopy:
-                nonlocal started_copy_files
+                nonlocal started_copy_files, copy_pool
                 _cancelled(pipeline_cancel)
                 started_copy_files += 1
-                assert copy_pool is not None
+                dispatch = overlap_copy_and_verify or item.size > 64 * 1024
+                if dispatch and copy_pool is None:
+                    copy_pool = ThreadPoolExecutor(
+                        max_workers=1, thread_name_prefix="obmanage-copy"
+                    )
                 pending = self._start_copy(
-                    plan, item, store, pipeline_cancel, root_checkpoint, copy_pool
+                    plan, item, store, pipeline_cancel, root_checkpoint,
+                    copy_pool if dispatch else None,
                 )
                 pending_copies.append(pending)
                 return pending
@@ -1222,9 +1232,6 @@ class SyncEngine:
                     # stages the next file. This overlaps independent source
                     # and target I/O without parallel commits or unbounded
                     # outstanding target mutations.
-                    copy_pool = ThreadPoolExecutor(
-                        max_workers=1, thread_name_prefix="obmanage-copy"
-                    )
                     current = begin_copy(copy_items[0])
                     for index, item in enumerate(copy_items):
                         assert current.item is item

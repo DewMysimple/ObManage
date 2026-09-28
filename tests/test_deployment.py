@@ -64,6 +64,26 @@ def layout(tmp_path: Path):
     return source, vault_a, vault_b, state
 
 
+def test_compact_and_indented_authenticated_journals_remain_interoperable(layout):
+    source, vault_a, _, state = layout
+    put(source, "中文.md", b"new version")
+    put(vault_a / "Config", "old.md", b"old version")
+    engine = DeploymentEngine(state)
+    plan = engine.analyze(request_for(source, [("a", vault_a)]))
+    assert engine.execute(plan).success
+    path = state / "deployment-journal" / f"{plan.batch_id}.json"
+    compact = path.read_text(encoding="utf-8")
+    assert compact.count("\n") == 1
+    document = json.loads(compact)
+    # Formatting changes alone neither change the signed value nor require a
+    # migration. A newly created engine must still authenticate and recover it.
+    path.write_text(json.dumps(document, ensure_ascii=False, indent=2), encoding="utf-8")
+    reopened = DeploymentEngine(state)
+    assert reopened.get_batch(plan.batch_id).status == "committed"
+    assert reopened.rollback(plan.batch_id).success
+    assert tree_bytes(vault_a / "Config") == {"old.md": b"old version"}
+
+
 def test_preview_is_file_level_and_analysis_does_not_write_targets(layout):
     source, vault_a, _, state = layout
     put(source, "same.txt", b"same")

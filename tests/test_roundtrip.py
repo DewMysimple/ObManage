@@ -225,8 +225,11 @@ def test_switching_directions_reuses_only_verified_equivalence(workstations, mon
     store = BaselineStore(engine.state_dir)
     try:
         forward_record = store.records(outward.pair_id)["电影.mp4"]
-        reverse_record = store.records(returning.pair_id)["电影.mp4"]
-        assert reverse_record == (forward_record[1], forward_record[0], forward_record[2])
+        assert store.records(returning.pair_id) == {}
+        assert forward_record[:2] == (
+            returning.context["target_entries"]["电影.mp4"],
+            returning.context["source_entries"]["电影.mp4"],
+        )
     finally:
         store.close()
 

@@ -14,9 +14,9 @@ from pathlib import Path
 from ..copying import copy_stream_and_hash
 from ..file_types import is_video_filename
 from ..models import Progress, SyncCancelled, SyncError
-from ..paths import (assert_plain_chain, canonical, checked_child, identity, native,
-                     snapshot, validate_state_separation, volume_identity)
-from ..reading import hash_stream
+from ..paths import (assert_plain_chain, canonical, checked_child, checked_child_snapshot,
+                     identity, native, snapshot, validate_state_separation, volume_identity)
+from ..reading import ReadScope, hash_stream
 from .recovery import require_recovery_clear
 
 
@@ -79,9 +79,12 @@ def _resolve_directory(raw):
     return path, state
 
 
-def _read_entry(source, entry, cancel, destination=None, progress=None):
-    path = checked_child(source, entry.path)
-    if snapshot(path) != entry.state:
+def _read_entry(source, entry, cancel, destination=None, progress=None, *, reads=None):
+    # Writing a ZIP retains full per-file source-chain checks. Pure read phases
+    # may share bounded ancestors, followed by their full inventory barrier.
+    path, before = (reads.observe(entry.path) if reads is not None and destination is None
+                    else checked_child_snapshot(source, entry.path))
+    if before != entry.state:
         raise SyncError(f"来源已改变，请重新预览：{entry.path}")
     expected = entry.state
     with open(native(path), "rb", buffering=0) as stream:
@@ -101,7 +104,9 @@ def _read_entry(source, entry, cancel, destination=None, progress=None):
         finished = os.fstat(stream.fileno())
         if actual != (finished.st_dev, finished.st_ino, finished.st_size, finished.st_mtime_ns, finished.st_ctime_ns):
             raise SyncError(f"读取期间来源改变：{entry.path}")
-    if count != expected["size"] or snapshot(checked_child(source, entry.path)) != expected:
+    after = (snapshot(path) if reads is not None and destination is None
+             else checked_child_snapshot(source, entry.path)[1])
+    if count != expected["size"] or after != expected:
         raise SyncError(f"读取后来源改变：{entry.path}")
     return digest
 
@@ -110,6 +115,7 @@ def _inventory(source, exclude_videos, cancel):
     rows = []
     stack = [(source, "")]
     seen = set()
+    reads = ReadScope(source)
     while stack:
         _cancel(cancel)
         folder, prefix = stack.pop()
@@ -122,10 +128,7 @@ def _inventory(source, exclude_videos, cancel):
         for child in children:
             _cancel(cancel)
             relative = prefix + child.name
-            path = checked_child(source, relative)
-            state = snapshot(path)
-            if state is None or state["kind"] not in {"dir", "file"}:
-                raise SyncError(f"项目已消失或不是普通文件/目录：{relative}")
+            path, state = reads.observe(relative)
             if relative.casefold() in seen:
                 raise SyncError(f"存在大小写重名：{relative}")
             seen.add(relative.casefold())
@@ -134,6 +137,7 @@ def _inventory(source, exclude_videos, cancel):
             rows.append(ArchiveEntry(relative, state, reason))
             if state["kind"] == "dir" and not reason:
                 stack.append((path, relative + "/"))
+        assert_plain_chain(folder)
         if snapshot(folder) != before:
             raise SyncError(f"枚举期间目录改变：{folder}")
     return tuple(sorted(rows, key=lambda e: e.path))
@@ -201,11 +205,12 @@ class ArchiveEngine:
         rows = []
         total = sum(e.state["size"] for e in raw if not e.excluded)
         done = 0
+        reads = ReadScope(source)
         for entry in raw:
             digest = ""
             if entry.state["kind"] == "file" and not entry.excluded:
                 digest = _read_entry(source, entry, cancel, progress=lambda n:
-                    _emit(progress, "scan", "正在生成打包预览", entry.path, done + n, total))
+                    _emit(progress, "scan", "正在生成打包预览", entry.path, done + n, total), reads=reads)
                 done += entry.state["size"]
             rows.append(ArchiveEntry(entry.path, entry.state, entry.excluded, digest))
         plan = ArchivePlan(source, output, level, bool(exclude_videos), tuple(rows), source_state,
@@ -268,9 +273,10 @@ class ArchiveEngine:
                 raise SyncError("临时压缩包身份改变，已停止校验。")
             _verify_zip(temporary, plan.entries, cancel, progress)
             # Re-read the source after writing: the archive must still represent the preview.
+            reads = ReadScope(plan.source)
             for entry in files:
                 _emit(progress, "source_verify", "正在复核来源", entry.path)
-                if _read_entry(plan.source, entry, cancel) != entry.digest:
+                if _read_entry(plan.source, entry, cancel, reads=reads) != entry.digest:
                     raise SyncError(f"打包期间来源内容改变：{entry.path}")
             self._validate(plan, cancel)
             require_recovery_clear(self.state_dir)

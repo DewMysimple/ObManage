@@ -18,6 +18,7 @@ from obmanage.management.deployment import (DeploymentComponent, DeploymentEngin
     DeploymentRequest, DeploymentSelection, DeploymentTarget)
 from obmanage.management.trash import TrashCleanupEngine
 from obmanage.management.incremental import IncrementalEngine
+from obmanage.management.archive import ArchiveEngine
 
 
 def main():
@@ -25,9 +26,36 @@ def main():
     parser.add_argument("--files", type=int, default=300)
     parser.add_argument("--output", type=Path)
     parser.add_argument("--profile", type=Path)
+    parser.add_argument("--large-mib", type=int, default=16,
+                        help="Mixed binary/text fixture size for archive and large-copy checks")
+    parser.add_argument("--reverse-only", action="store_true",
+                        help="Measure three fresh reverse-cache scans without unrelated I/O")
     args = parser.parse_args()
     if args.files < 1:
         parser.error("--files must be positive")
+    if args.large_mib < 0:
+        parser.error("--large-mib must not be negative")
+    if args.reverse_only:
+        samples = []
+        for _ in range(3):
+            with tempfile.TemporaryDirectory() as temporary:
+                base = Path(temporary)
+                source, target = base / "a", base / "b"
+                source.mkdir()
+                for index in range(args.files):
+                    (source / f"{index}.md").write_bytes(b"x" * 1024)
+                shutil.copytree(source, target)
+                engine = SyncEngine(base / "state")
+                assert engine.analyze(source, target).can_execute
+                start = time.perf_counter()
+                plan = engine.analyze(target, source)
+                assert plan.can_execute and plan.counts["skip"] == args.files
+                samples.append(time.perf_counter() - start)
+        payload = {"files": args.files, "reverse_seconds": samples}
+        print(json.dumps(payload, indent=2))
+        if args.output:
+            args.output.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        return
     results = {}
     profiler = cProfile.Profile() if args.profile else None
 
@@ -56,8 +84,11 @@ def main():
         assert not stats.issues, stats.issues
         for mode in ("mirror", "no_video"):
             engine = SyncEngine(base / ("state-" + mode))
-            measure(mode + "_first", lambda: engine.analyze(source, target, mode=mode))
-            measure(mode + "_cached", lambda: engine.analyze(source, target, mode=mode))
+            first = measure(mode + "_first", lambda: engine.analyze(source, target, mode=mode))
+            cached = measure(mode + "_cached", lambda: engine.analyze(source, target, mode=mode))
+            assert not first.errors and not cached.errors, (first.errors, cached.errors)
+            reverse = measure(mode + "_reverse_cached", lambda: engine.analyze(target, source, mode=mode))
+            assert not reverse.errors, reverse.errors
             for index in range(args.files):
                 (source / "notes" / f"group-{index // 50}" / f"item-{index}.md").write_text(
                     "Changed " + mode + str(index), encoding="utf-8")
@@ -85,11 +116,35 @@ def main():
         assert result.success, result
         result = measure("deploy_rollback", lambda: deploy.rollback(plan.batch_id))
         assert result.success, result
+        # Include the full archive lifecycle: all content reads, ZIP verification
+        # and final source checks. Never measure just the compressor in isolation.
+        archive = ArchiveEngine(base / "archive-state")
+        output = base / "archives"
+        output.mkdir()
+        plan = measure("archive_small_preview", lambda: archive.analyze(str(source), str(output)))
+        result = measure("archive_small_execute", lambda: archive.execute(plan))
+        assert Path(result.output).is_file()
+        if args.large_mib:
+            import random
+            block = random.Random(20260928).randbytes(512 * 1024) + b"ObManage benchmark\n" * 29127
+            block = block[:1024 * 1024]
+            with (source / "large.bin").open("wb") as stream:
+                for _ in range(args.large_mib):
+                    stream.write(block)
+            engine = SyncEngine(base / "large-state")
+            plan = measure("large_copy_preview", lambda: engine.analyze(source, target))
+            result = measure("large_copy_execute", lambda: engine.execute(plan))
+            assert result.status == "success", result
+            for level in (0, 1, 6):
+                plan = measure(f"archive_mixed_l{level}_preview", lambda: archive.analyze(
+                    str(source), str(output), filename=f"mixed-{level}.zip", level=level))
+                result = measure(f"archive_mixed_l{level}_execute", lambda: archive.execute(plan))
+                assert Path(result.output).is_file()
         trash = TrashCleanupEngine(base / "trash-state")
         plan = measure("trash_preview", lambda: trash.analyze([source]))
         result = measure("trash_execute", lambda: trash.execute(plan, [source]))
         assert result.status == "success", result
-    payload = {"files_per_tree": args.files, "seconds": results}
+    payload = {"files_per_tree": args.files, "large_mib": args.large_mib, "seconds": results}
     print(json.dumps(payload, ensure_ascii=False, indent=2))
     if args.output:
         args.output.write_text(json.dumps(payload, indent=2), encoding="utf-8")

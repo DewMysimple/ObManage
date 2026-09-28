@@ -721,7 +721,10 @@ class DeploymentJournal:
             )
             with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as stream:
                 descriptor = None
-                json.dump(document, stream, ensure_ascii=False, sort_keys=True, indent=2)
+                # Compact encoding uses the C encoder and one stream write,
+                # avoiding Python's indented-token loop for every full manifest.
+                # Authentication covers the same JSON value, not whitespace.
+                stream.write(_canonical_json(document).decode("utf-8"))
                 stream.write("\n")
                 stream.flush()
                 os.fsync(stream.fileno())
