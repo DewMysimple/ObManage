@@ -73,6 +73,7 @@ from .pages.distribution import ComSyncPage
 from .pages.registry import FEATURES
 from .pages.statistics import StatisticsPage
 from .pages.trash_cleanup import TrashCleanupPage
+from .pages.transactions import TransactionsPage
 from .pages.logs import OperationLogDialog
 from .operation_log import append_entry, new_entry, read_entries
 
@@ -945,6 +946,8 @@ class MainWindow(QMainWindow):
                     self.settings_document.features.get(feature.key, {}),
                     self.settings.local_path,
                 )
+            elif feature.key == "transactions":
+                page = TransactionsPage(self.state_dir, self.pages["comsync"], self.pages["trash_cleanup"])
             elif feature.key == "trash_cleanup":
                 page = TrashCleanupPage(
                     self.state_dir,
@@ -954,7 +957,7 @@ class MainWindow(QMainWindow):
             else:
                 raise RuntimeError(f"未注册功能页面：{feature.key}")
             page.task_requested.connect(
-                lambda operation, current=page: self._start_feature_task(current, operation)
+                lambda operation, current=page: self._route_feature_task(current, operation)
             )
             page.cancel_requested.connect(self.cancel_operation)
             page.settings_changed.connect(self._queue_settings_save)
@@ -974,8 +977,23 @@ class MainWindow(QMainWindow):
             self.page_containers[feature.key] = page_scroll
             self.page_stack.addWidget(page_scroll)
 
+        self.pages["transactions"].refresh_button.clicked.connect(self._refresh_actions)
         selected = self.settings_document.selected_page
         self._show_page(selected if selected in self.pages else "mirror", persist=False)
+
+    def _route_feature_task(self, page, operation):
+        transactions = self.pages.get("transactions")
+        if transactions is not None and page in transactions.owners and page._task_kind in {
+                "inspect_recovery", "resolve", "rollback", "finalize", "restore"}:
+            transactions.adopt_task(page)
+            page = transactions
+        self._start_feature_task(page, operation)
+        if page is transactions and self._feature_page is not transactions and transactions._delegate is not None:
+            owner = transactions._delegate
+            owner._task_active = False
+            owner.set_status(transactions.status_label.text(), transactions._status_kind)
+            transactions._delegate = None
+            owner.refresh_actions()
 
     def _show_page(self, key: str, *, persist: bool = True) -> None:
         page = self.pages.get(key)
@@ -1081,8 +1099,8 @@ class MainWindow(QMainWindow):
     def _show_first_recovery_page(self) -> None:
         keys = self._recovery_page_keys()
         if keys:
-            self._show_page(keys[0])
-            self.page_containers[keys[0]].verticalScrollBar().setValue(0)
+            self._show_page("transactions")
+            self.page_containers["transactions"].verticalScrollBar().setValue(0)
 
     @Slot(object)
     def _on_feature_completed(self, outcome: tuple[str, Any]) -> None:
@@ -1105,6 +1123,8 @@ class MainWindow(QMainWindow):
             elif status == "cancelled":
                 self._log("管理任务已取消。", level="cancelled")
         self._end_log_task(log_context, outcome)
+        if page is not self.pages["transactions"]:
+            self.pages["transactions"].refresh_records()
         self._refresh_actions()
         if self._exit_requested:
             self._finish_exit()
@@ -1448,7 +1468,7 @@ class MainWindow(QMainWindow):
         self.nav_cancel_button.setVisible(cancellable)
         self.nav_cancel_button.setEnabled(cancellable and not cancel_sent and not self._exit_requested)
         self.nav_recovery_button.setVisible(recovery_pending)
-        self.nav_recovery_button.setText(f"待恢复事务 · {len(recovery_keys)} 页")
+        self.nav_recovery_button.setText("待恢复事务")
         self.tray_sync_action.setEnabled(available and state_location_safe)
         for key, page in self.pages.items():
             if key != "mirror" and isinstance(page, FeaturePage):
@@ -1630,6 +1650,7 @@ class MainWindow(QMainWindow):
         else:
             self._accept_result(payload)
         self._end_log_task(log_context, outcome)
+        self.pages["transactions"].refresh_records()
         self._refresh_actions()
 
     def _accept_plan(self, plan: SyncPlan, scheduled: bool) -> None:

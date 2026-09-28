@@ -20,4 +20,5 @@ FEATURES = (
     FeatureDescriptor("comsync", ".comSync", ".comSync", "统一同步配置、Templater 和 File 目录结构"),
     FeatureDescriptor("trash_cleanup", ".Trash", ".Trash", "预览并直接清理仓库的 .trash 内容"),
     FeatureDescriptor("archive", ".Archive", ".Archive", "打包仓库为 ZIP，可排除视频并选择压缩级别"),
+    FeatureDescriptor("transactions", "事务处理", "事务处理", "集中恢复事务，清除已结束事务及保留副本"),
 )

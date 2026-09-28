@@ -113,6 +113,7 @@ _STATUS_TEXT = {
     "finalize_required": "备份清理未完成，可重试确认或撤销",
     "finalized": "已确认保留",
     "resolved": "已结束 · 保留现状，不再阻塞",
+    "discarded": "已确认删除记录，待重试",
 }
 
 
@@ -568,7 +569,7 @@ class DistributionPage(FeaturePage):
 
         self.recovery_frame, recovery_layout = panel(self.body)
         recovery_row = QHBoxLayout()
-        recovery_title = QLabel("事务处理与保留副本")
+        recovery_title = QLabel("部署事务")
         recovery_title.setObjectName("SectionTitle")
         recovery_row.addWidget(recovery_title)
         self.batch_selector = DropDownCombo()
@@ -1262,8 +1263,7 @@ class DistributionPage(FeaturePage):
         self._pending_batches = tuple(
             batch for batch in batches if batch.status in _PENDING_STATUSES
         )
-        retained = tuple(batch for batch in batches if batch.status in {"resolved", "rolled_back_with_residuals"})
-        choices = self._pending_batches + retained or batches[:1]
+        choices = self._pending_batches + tuple(batch for batch in batches if batch not in self._pending_batches)
         if self._pending_batches and selected_id not in {batch.batch_id for batch in self._pending_batches}:
             selected_id = self._pending_batches[0].batch_id
         blocker = QSignalBlocker(self.batch_selector)
@@ -1294,7 +1294,7 @@ class DistributionPage(FeaturePage):
             if result.success:
                 self.set_status(
                     f"部署完成：提交 {result.committed_targets} 个目标。"
-                    "备份仍保留，请检查后选择保留现状或回退。",
+                    "请到事务处理页选择保留现状或回退。",
                     "success",
                 )
             else:
@@ -1306,7 +1306,7 @@ class DistributionPage(FeaturePage):
                 if result.journal_status == "rolled_back_with_residuals":
                     self.set_status(
                         f"撤销完成：恢复 {result.rolled_back_targets} 个目标；"
-                        "保全内容及残留目录仍可查看，不再阻塞其他任务。",
+                        "保全内容及残留目录可在事务处理页查看，不再阻塞其他任务。",
                         "warning",
                     )
                 else:
@@ -1427,8 +1427,10 @@ class DistributionPage(FeaturePage):
                         and not self.recovery_preview.cleanup_error)
         self.finalize_confirm.setEnabled(can_finalize)
         self.finalize_button.setEnabled(can_finalize and self.finalize_confirm.isChecked())
-        self.finalize_confirm.setVisible(inspected and batch_status in _FINALIZE_STATUSES)
-        self.finalize_button.setVisible(inspected and batch_status in _FINALIZE_STATUSES)
+        self.finalize_confirm.setVisible(inspected and batch_status in _FINALIZE_STATUSES
+                                         and not getattr(self, "recovery_detached", False))
+        self.finalize_button.setVisible(inspected and batch_status in _FINALIZE_STATUSES
+                                        and not getattr(self, "recovery_detached", False))
         self.copy_target_button.setEnabled(
             available and bool(self.target_table.selectionModel().selectedRows())
         )
@@ -1446,7 +1448,7 @@ class DistributionPage(FeaturePage):
         )
         if self.compact_sync:
             self.recovery_frame.setVisible(
-                pending or self._recovery_blocked or batch_status in {"rolled_back_with_residuals", "resolved"}
+                getattr(self, "recovery_detached", False) or pending or self._recovery_blocked or batch_status in {"rolled_back_with_residuals", "resolved"}
             )
             self.confirm_checkbox.setVisible(self.plan is not None and self.plan.needs_deploy)
             self.occupancy_status.setVisible(bool(target_paths))

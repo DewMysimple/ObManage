@@ -36,7 +36,7 @@ BATCH_STATUSES = frozenset({
     "prepare_failed", "recovery_required", "rolling_back", "rolled_back",
     "rolled_back_with_residuals",
     "rollback_blocked", "rollback_required", "finalizing", "finalized",
-    "finalize_required", "commit_failed", "resolved",
+    "finalize_required", "commit_failed", "resolved", "discarded",
 })
 TARGET_PHASES = frozenset({
     "planned", "unchanged", "staging", "prepared", "backing_up", "backed_up",
@@ -78,8 +78,9 @@ class JournalTarget:
     backup_identity: tuple[str, int, int] | None = None
     rollback_path: str | None = None
     rollback_identity: tuple[str, int, int] | None = None
-    # Explicitly previewed current content saved during recovery. Never a
-    # deletion authorization: it must survive rollback and backup cleanup.
+    # Explicitly previewed current content saved during recovery. Never an
+    # automatic deletion authorization: only explicit whole-transaction clearing
+    # may remove it after a fresh preview.
     preserved_manifest: dict[str, dict[str, Any]] | None = None
     deployed_identity: tuple[str, int, int] | None = None
     original_identity: tuple[str, int, int] | None = None
@@ -629,8 +630,15 @@ class DeploymentJournal:
                 batch_id = self._valid_batch_id(name[:-len(suffix)])
                 values.add(batch_id)
             identifiers[label] = values
-        if identifiers["journal"] != identifiers["grant"]:
+        if identifiers["grant"] - identifiers["journal"]:
             raise JournalError("部署事务日志与授权锚点不完整，拒绝创建新批次。")
+        for batch_id in identifiers["journal"] - identifiers["grant"]:
+            try:
+                discarded = self._read_path(self._path(batch_id)).status == "discarded"
+            except JournalError as exc:
+                raise JournalError("部署事务日志与授权锚点不完整，且没有有效删除意图。") from exc
+            if not discarded:
+                raise JournalError("部署事务日志与授权锚点不完整，拒绝创建新批次。")
         if not identifiers["journal"]:
             # A present key is itself persistent security state.  Listing is
             # the UI recovery probe, so expose a damaged/partial key here even
@@ -694,7 +702,10 @@ class DeploymentJournal:
         self._verify_record_authentication(payload, authentication)
         if self._path(record.batch_id) != canonical(path):
             raise JournalError("事务日志文件名与批次编号不一致。")
-        self._verify_grant(record)
+        # An authenticated deletion intent survives a crash between the two
+        # metadata unlinks. No other state may omit its authorization anchor.
+        if record.status != "discarded" or snapshot(self._grant_path(record.batch_id)) is not None:
+            self._verify_grant(record)
         return record
 
     def _write(self, record: JournalBatch, *, must_not_exist: bool = False) -> None:
@@ -845,3 +856,19 @@ class DeploymentJournal:
             return replace(record, targets=tuple(targets))
 
         return self.update(batch_id, transform)
+
+    def discard(self, batch_id: str) -> None:
+        """Remove metadata after explicit engine-level clearance or forget consent.
+
+        Persist an authenticated terminal intent first. If either unlink fails,
+        listing remains valid and explicit clearing can resume after restart.
+        """
+        with _JOURNAL_LOCK:
+            record = self.get(batch_id)
+            if record.status != "discarded":
+                self.set_batch(batch_id, status="discarded")
+            grant = self._grant_path(batch_id)
+            if snapshot(grant) is not None:
+                self._read_regular_bytes(grant, "部署授权锚点")
+                os.unlink(native(grant))
+            os.unlink(native(self._path(batch_id)))

@@ -40,7 +40,7 @@ _LOCAL_PROCESS_LOCK = threading.Lock()
 _LOCAL_PROCESS_KEYS: set[str] = set()
 TERMINAL_BATCH_STATUSES = frozenset({
     "cancelled", "prepare_failed", "rolled_back",
-    "rolled_back_with_residuals", "finalized", "resolved",
+    "rolled_back_with_residuals", "finalized", "resolved", "discarded",
 })
 
 
@@ -1767,7 +1767,7 @@ class DeploymentEngine:
                          "deployed": "仍是同步结果", "changed": "同步后已有变化"}[state]
                 trees.append((target.selection_id, tree))
                 details.append(f"{target.target_path}\n  {label}；阶段：{target.phase}")
-                if tree and state in {"changed", "deployed"}:
+                if tree and state in {"changed", "deployed"} and batch.status not in TERMINAL_BATCH_STATUSES:
                     details.append(f"  回退将保全当前 {len(tree.files)} 个文件、{tree.total_bytes} 字节至："
                                    f"{self._rollback_path(batch, target)}")
             self._preflight_rollback(batch, preserve=dict(trees))
@@ -1779,14 +1779,15 @@ class DeploymentEngine:
             for label, path, manifest, root_identity, incomplete in (
                 ("同步前备份", target.backup_path, target.original_manifest or {}, target.backup_identity, False),
                 ("暂存", target.stage_path, target.deployed_manifest, target.stage_identity, True),
-                ("回退保全/隔离", target.rollback_path, target.preserved_manifest or target.deployed_manifest,
+                ("回退保全/隔离", target.rollback_path,
+                 target.preserved_manifest if target.preserved_manifest is not None else target.deployed_manifest,
                  target.rollback_identity, False),
             ):
                 if path:
                     details.append(f"{label}：{path}")
                     if target.preserved_manifest is not None and path == target.rollback_path:
-                        details.append("  保全内容不会自动删除，可按需手动取回。")
-                    elif disk_safe:
+                        details.append("  保全内容仅在明确确认清除整个事务时删除。")
+                    if disk_safe:
                         try:
                             if snapshot(path) is None:
                                 details.append("  该记录位置现已不存在。")
@@ -2213,4 +2214,77 @@ class DeploymentEngine:
         finally:
             if process_locks is not None:
                 process_locks.release()
+            self._lock.release()
+
+    def clear_transaction(self, batch_id: str, *, preview: RecoveryPreview) -> DeploymentResult:
+        """Explicitly delete all authenticated copies and then the ended record."""
+        if not self._lock.acquire(blocking=False):
+            return DeploymentResult(batch_id, "failed", errors=("已有仓库管理任务正在运行。",))
+        locks = None
+        try:
+            batch = self.journal.get(batch_id)
+            locks = _InterprocessLockSet(self.state_dir, (t.target_root for t in batch.targets), ())
+            locks.acquire()
+            batch = self.journal.get(batch_id)
+            if batch.status not in TERMINAL_BATCH_STATUSES:
+                raise DeploymentError("请先保留现状结束事务或完成回退，再清除。")
+            if preview.batch_id != batch_id or preview.revision != batch.revision or preview.cleanup_error:
+                raise DeploymentError("清除预览已失效，请重新检查。")
+            self._validate_record(batch)
+            observed = {tree.root: tree for tree in preview.cleanup_trees}
+            candidates = []
+            for target in batch.targets:
+                for path, manifest, root_identity, incomplete in (
+                    (target.backup_path, target.original_manifest or {}, target.backup_identity, False),
+                    (target.stage_path, target.deployed_manifest, target.stage_identity, True),
+                    (target.rollback_path,
+                     target.preserved_manifest if target.preserved_manifest is not None else target.deployed_manifest,
+                     target.rollback_identity, False),
+                ):
+                    if path and snapshot(path) is not None:
+                        tree = _assert_manifest(path, manifest, root_identity, "待清除事务副本",
+                                                allow_subset=True, allow_incomplete_files=incomplete)
+                        if path not in observed or not _tree_matches(tree, observed[path]):
+                            raise DeploymentError(f"检查后副本发生变化，请重新检查：{path}")
+                        candidates.append((path, manifest, root_identity, incomplete))
+            for path, manifest, root_identity, incomplete in candidates:
+                self._validate_record(batch)
+                _remove_owned_tree(path, manifest, root_identity, "待清除事务副本",
+                                   allow_subset=True, allow_incomplete_files=incomplete,
+                                   observed=observed[path])
+            # Never forget an unexpected/reappearing copy; retain the record for retry.
+            for target in batch.targets:
+                for path in (target.backup_path, target.stage_path, target.rollback_path):
+                    if path and snapshot(path) is not None:
+                        raise DeploymentError(f"仍有事务副本，保留记录：{path}")
+            self.journal.discard(batch_id)
+            return DeploymentResult(batch_id, "success", "discarded")
+        except (OSError, ValueError, SyncError) as exc:
+            return DeploymentResult(batch_id, "failed", errors=(str(exc),))
+        finally:
+            if locks is not None:
+                locks.release()
+            self._lock.release()
+
+    def forget_transaction(self, batch_id: str, *, expected_revision: int) -> DeploymentResult:
+        """Explicitly forget an ended record, leaving every copy in place."""
+        if not self._lock.acquire(blocking=False):
+            return DeploymentResult(batch_id, "failed", errors=("已有仓库管理任务正在运行。",))
+        locks = None
+        try:
+            locks = _InterprocessLockSet(self.state_dir, (), ())
+            locks.acquire()
+            batch = self.journal.get(batch_id)
+            self._validate_record(batch, check_disk=False)
+            if batch.status not in TERMINAL_BATCH_STATUSES:
+                raise DeploymentError("请先结束事务或完成回退，再删除记录。")
+            if batch.revision != expected_revision:
+                raise DeploymentError("记录在检查后发生变化，请重新检查。")
+            self.journal.discard(batch_id)
+            return DeploymentResult(batch_id, "success", "discarded")
+        except (OSError, ValueError, SyncError) as exc:
+            return DeploymentResult(batch_id, "failed", errors=(str(exc),))
+        finally:
+            if locks is not None:
+                locks.release()
             self._lock.release()

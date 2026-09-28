@@ -62,12 +62,12 @@ def dispose(app, window):
     QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
 
 
-def test_shell_registers_seven_pages_with_mirror_first(application, tmp_path):
+def test_shell_registers_eight_pages_with_mirror_first(application, tmp_path):
     window = MainWindow(tmp_path / "state")
     try:
         assert tuple(window.pages) == tuple(feature.key for feature in FEATURES)
         assert tuple(window.pages)[0] == "mirror"
-        assert len(window.pages) == 7
+        assert len(window.pages) == 8
         assert window.page_stack.currentWidget() is window.mirror_page
         assert window.navigation_buttons["mirror"].isChecked()
         assert "仓库镜像" in window.windowTitle()
@@ -322,7 +322,7 @@ def test_legacy_trash_quarantine_still_blocks_writes_until_finalized(
         assert window.scheduler.next_run > datetime.now()
         assert any("待恢复事务" in line and "跳过" in line for line in window._log_lines)
         window.nav_recovery_button.click()
-        assert window._current_page_key == "trash_cleanup"
+        assert window._current_page_key == "transactions"
 
         finalized = TrashCleanupEngine(state).finalize(operation_id)
         assert finalized.status == "success"
@@ -388,7 +388,7 @@ def test_unknown_legacy_deployment_is_globally_blocked_and_reachable(
 
         window.nav_recovery_button.click()
 
-        assert window._current_page_key == "comsync"
+        assert window._current_page_key == "transactions"
         page = window.pages["comsync"]
         assert page.current_batch is not None
         assert page.current_batch.batch_id == plan.batch_id
@@ -550,5 +550,80 @@ def test_comsync_new_vault_full_worker_flow_and_rollback(application, tmp_path):
         assert not (target / "File").exists()
         assert not (target / ".obsidian/app.json").exists()
         assert any(row.feature == "comsync" and row.level == "success" for row in window._log_entries)
+    finally:
+        dispose(application, window)
+
+
+@pytest.mark.parametrize("record_only", [False, True])
+def test_transactions_clear_through_worker_and_restart(application, tmp_path, record_only):
+    source, target, state = (tmp_path / name for name in ("source", "target", "state"))
+    (source / ".obsidian").mkdir(parents=True)
+    (target / ".obsidian").mkdir(parents=True)
+    (source / ".obsidian" / "config.json").write_text("new")
+    (target / ".obsidian" / "config.json").write_text("old")
+    engine = DeploymentEngine(state)
+    plan = engine.analyze(DeploymentRequest((DeploymentSelection(
+        DeploymentComponent.obsidian(source), DeploymentTarget("target", str(target))),)))
+    assert engine.execute(plan).success
+    assert engine.resolve(plan.batch_id, expected_revision=engine.get_batch(plan.batch_id).revision).success
+    window = MainWindow(state)
+    try:
+        page = window.pages["transactions"]
+        controller = window.pages["comsync"]
+        assert page.isAncestorOf(controller.recovery_frame)
+        assert not controller.isAncestorOf(controller.recovery_frame)
+        window._show_page("transactions")
+        controller.inspect_button.click()
+        wait_until(application, lambda: not window.busy)
+        assert page.clear_confirm.isEnabled()
+        page.clear_confirm.setChecked(True)
+        window._show_page("archive")
+        assert not page.clear_confirm.isChecked()
+        window._show_page("transactions")
+        controller.inspect_button.click()
+        wait_until(application, lambda: not window.busy)
+        if record_only:
+            page.clear_mode.setCurrentIndex(1)
+            assert not page.clear_confirm.isChecked()
+        page.clear_confirm.setChecked(True)
+        page.clear_button.click()
+        wait_until(application, lambda: not window.busy)
+        assert controller.batch_selector.count() == 0
+        assert ("记录已删除" if record_only else "已清除") in page.status_label.text()
+        assert bool(tuple(target.glob(".obmanage-deploy-*.backup"))) == record_only
+        assert (target / ".obsidian/config.json").read_text() == "new"
+        assert not window._recovery_page_keys()
+    finally:
+        dispose(application, window)
+    fresh = MainWindow(state)
+    try:
+        assert fresh.pages["comsync"].batch_selector.count() == 0
+        assert not fresh.pages["transactions"].clear_button.isEnabled()
+    finally:
+        dispose(application, fresh)
+
+
+def test_clear_finalized_legacy_record(application, tmp_path, seed_legacy_quarantine):
+    state, vault = tmp_path / "state", tmp_path / "vault"
+    (vault / ".obsidian").mkdir(parents=True)
+    (vault / ".trash").mkdir()
+    (vault / ".trash/note.md").write_text("old")
+    operation_id, _ = seed_legacy_quarantine(state, vault)
+    engine = TrashCleanupEngine(state)
+    import pytest
+    with pytest.raises(Exception, match="先永久清理"):
+        engine.clear_record(operation_id)
+    assert engine.finalize(operation_id).status == "success"
+    window = MainWindow(state)
+    try:
+        window._show_page("transactions")
+        page = window.pages["transactions"]
+        assert page.legacy_confirm.isEnabled()
+        page.legacy_confirm.setChecked(True)
+        page.legacy_clear.click()
+        wait_until(application, lambda: not window.busy)
+        assert not engine.list_operations()
+        assert window.pages["trash_cleanup"].legacy_recovery_panel.isHidden()
+        assert (vault / ".trash").exists()
     finally:
         dispose(application, window)

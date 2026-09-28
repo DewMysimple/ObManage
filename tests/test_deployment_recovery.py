@@ -289,3 +289,104 @@ def test_all_recovery_targets_are_rechecked_before_the_first_move(tmp_path):
     before = [contents(target) for target in targets]
     assert not engine.rollback(plan.batch_id, preview=preview).success
     assert [contents(target) for target in targets] == before
+
+
+@pytest.mark.parametrize("rollback", [False, True])
+def test_clear_ended_transaction_removes_all_copies_and_record(committed, rollback):
+    engine, batch_id, source, target, state = committed
+    (target / ".obsidian" / "later.md").write_text("keep")
+    preview = engine.inspect_recovery(batch_id)
+    assert not engine.clear_transaction(batch_id, preview=preview).success
+    if rollback:
+        assert engine.rollback(batch_id, preview=preview).success
+    else:
+        assert engine.resolve(batch_id, expected_revision=preview.revision).success
+    current = contents(target / ".obsidian")
+    original_source = contents(source)
+    batch = engine.get_batch(batch_id)
+    paths = [Path(path) for t in batch.targets for path in
+             (t.backup_path, t.stage_path, t.rollback_path) if path]
+    preview = engine.inspect_recovery(batch_id)
+    assert not preview.cleanup_error
+    assert engine.clear_transaction(batch_id, preview=preview).success
+    assert all(not path.exists() for path in paths)
+    assert not Path(engine.journal._path(batch_id)).exists()
+    assert not Path(engine.journal._grant_path(batch_id)).exists()
+    assert DeploymentEngine(state).list_batches() == ()
+    assert contents(target / ".obsidian") == current
+    assert contents(source) == original_source
+    require_recovery_clear(state)
+
+
+def test_clear_rejects_changed_copy_and_retains_record(committed):
+    engine, batch_id, _, _, _ = committed
+    assert engine.resolve(batch_id, expected_revision=engine.get_batch(batch_id).revision).success
+    preview = engine.inspect_recovery(batch_id)
+    backup = Path(engine.get_batch(batch_id).targets[0].backup_path)
+    (backup / "unknown.txt").write_text("user content")
+    assert not engine.clear_transaction(batch_id, preview=preview).success
+    assert (backup / "old.json").exists()
+    assert (backup / "unknown.txt").read_text() == "user content"
+    assert engine.get_batch(batch_id).status == "resolved"
+
+
+@pytest.mark.parametrize("suffix", [".grant.json", ".json"])
+def test_clear_metadata_unlink_failure_is_terminal_and_restart_retryable(committed, monkeypatch, suffix):
+    import obmanage.management.journal as journal
+    engine, batch_id, _, _, state = committed
+    assert engine.resolve(batch_id, expected_revision=engine.get_batch(batch_id).revision).success
+    original = journal.os.unlink
+    failed_path = engine.journal._grant_path(batch_id) if suffix == ".grant.json" else engine.journal._path(batch_id)
+    def fail(path, *args, **kwargs):
+        if journal.canonical(path) == journal.canonical(failed_path):
+            raise PermissionError("injected metadata lock")
+        return original(path, *args, **kwargs)
+    with monkeypatch.context() as patch:
+        patch.setattr(journal.os, "unlink", fail)
+        assert not engine.clear_transaction(batch_id, preview=engine.inspect_recovery(batch_id)).success
+    fresh = DeploymentEngine(state)
+    assert fresh.list_batches()[0].status == "discarded"
+    require_recovery_clear(state)
+    assert fresh.clear_transaction(batch_id, preview=fresh.inspect_recovery(batch_id)).success
+    assert fresh.list_batches() == ()
+
+
+def test_clear_copy_failure_retains_retryable_record(committed, monkeypatch):
+    engine, batch_id, _, _, state = committed
+    assert engine.resolve(batch_id, expected_revision=engine.get_batch(batch_id).revision).success
+    with monkeypatch.context() as patch:
+        patch.setattr(deployment, "_remove_owned_tree", lambda *args, **kwargs: (_ for _ in ()).throw(PermissionError("locked")))
+        assert not engine.clear_transaction(batch_id, preview=engine.inspect_recovery(batch_id)).success
+    assert engine.get_batch(batch_id).status == "resolved"
+    require_recovery_clear(state)
+    assert engine.clear_transaction(batch_id, preview=engine.inspect_recovery(batch_id)).success
+
+
+def test_clear_stale_revision_and_tampered_journal_are_rejected(committed):
+    engine, batch_id, _, _, _ = committed
+    assert engine.resolve(batch_id, expected_revision=engine.get_batch(batch_id).revision).success
+    preview = engine.inspect_recovery(batch_id)
+    engine.journal.set_batch(batch_id, error="changed")
+    assert not engine.clear_transaction(batch_id, preview=preview).success
+    preview = engine.inspect_recovery(batch_id)
+    path = Path(engine.journal._path(batch_id))
+    value = json.loads(path.read_text(encoding="utf-8"))
+    value["errors"] = ["tampered"]
+    path.write_text(json.dumps(value), encoding="utf-8")
+    assert not engine.clear_transaction(batch_id, preview=preview).success
+    assert Path(engine.journal._grant_path(batch_id)).exists()
+
+
+def test_forget_ended_offline_record_leaves_all_data_unchanged(committed, monkeypatch):
+    engine, batch_id, source, target, state = committed
+    revision = engine.get_batch(batch_id).revision
+    assert not engine.forget_transaction(batch_id, expected_revision=revision).success
+    assert engine.resolve(batch_id, expected_revision=revision).success
+    revision = engine.get_batch(batch_id).revision
+    before = contents(target)
+    with monkeypatch.context() as patch:
+        patch.setattr(deployment, "volume_identity", lambda *_: (_ for _ in ()).throw(OSError("offline")))
+        assert engine.forget_transaction(batch_id, expected_revision=revision).success
+    assert contents(target) == before
+    assert DeploymentEngine(state).list_batches() == ()
+    require_recovery_clear(state)

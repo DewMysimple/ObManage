@@ -17,6 +17,7 @@ supersedes: null
 | --- | --- | --- | --- | --- | --- |
 | 2026-09-28 | maintenance | - | archived | bounded-file-processing-performance | [文件处理性能优化](./2026-09-28-文件处理性能优化.md) |
 | 2026-09-28 | bug | - | archived | deployment-recovery-resolution | [待恢复事务重设计](./2026-09-28-待恢复事务重设计.md) |
+| 2026-09-28 | feature | - | archived | transaction-management-clearance | [事务管理独立页面与清除](./2026-09-28-事务管理独立页面与清除.md) |
 | 2026-09-27 | feature | - | archived | shared-vault-selection-io | [统一仓库选择与共享读取提速](./2026-09-27-统一仓库选择与共享读取提速.md) |
 | 2026-09-27 | feature | - | archived | archive-log-filtering | [归档工作台与日志筛选](./2026-09-27-归档工作台与日志筛选.md) |
 | 2026-09-27 | maintenance | - | archived | obsidian-sync-delivery-merge | [同步工作台交付合并](./2026-09-27-同步工作台交付合并.md) |

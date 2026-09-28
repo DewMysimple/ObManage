@@ -681,8 +681,9 @@ class TrashCleanupPage(FeaturePage):
             operation for operation in operations
             if self._operation_pending(operation)
         )
-        self.legacy_recovery_panel.setVisible(bool(self._pending_operations))
-        choices = self._pending_operations or operations[:1]
+        self.legacy_recovery_panel.setVisible(bool(operations) if getattr(self, "recovery_detached", False) else bool(self._pending_operations))
+        choices = (self._pending_operations + tuple(op for op in operations if op not in self._pending_operations)
+                   if getattr(self, "recovery_detached", False) else self._pending_operations or operations[:1])
         blocker = QSignalBlocker(self.operation_selector)
         self.operation_selector.clear()
         for operation in choices:

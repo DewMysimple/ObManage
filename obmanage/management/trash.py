@@ -1909,3 +1909,27 @@ class TrashCleanupEngine:
         return TrashOperationResult(
             status, operation_id, tuple(results), tuple(failures), bytes_freed
         )
+
+    def clear_record(self, operation_id: str) -> None:
+        """Explicitly remove a finalized legacy record; never delete vault data."""
+        if not _TRASH_TASK_LOCK.acquire(blocking=False):
+            raise TrashSafetyError("另一个仓库管理任务正在运行。")
+        file_lock = None
+        try:
+            self._validate_persisted_state_location(operation_id, None)
+            file_lock = self._acquire_file_lock()
+            if file_lock is None:
+                raise TrashSafetyError("另一个进程正在执行回收站任务。")
+            data = self._load_journal(operation_id)
+            if not all(value.get("status") == "finalized" for value in data["vaults"]):
+                raise TrashSafetyError("请先永久清理所选旧版隔离备份，再删除记录。")
+            self._remove_finalized_operation_root(data)
+            if snapshot(self._operation_backup_root(operation_id)) is not None:
+                raise TrashSafetyError("隔离目录仍存在，不能删除记录。")
+            assert_plain_chain(self._journal_base)
+            _read_snapshot(self._journal_path(operation_id), "file")
+            os.unlink(native(self._journal_path(operation_id)))
+        finally:
+            if file_lock is not None:
+                file_lock.release()
+            _TRASH_TASK_LOCK.release()
