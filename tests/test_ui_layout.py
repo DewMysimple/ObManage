@@ -57,13 +57,16 @@ def test_recovery_workbench_is_readable_and_actions_reachable(application, tmp_p
     window = MainWindow(state)
     page = window.pages["comsync"]
     window._show_page("transactions", persist=False)
-    page.recovery_preview = engine.inspect_recovery(plan.batch_id)
-    page.recovery_details.setPlainText("\n\n".join(page.recovery_preview.details))
-    page.refresh_actions()
     window.resize(*size)
-    window._show_page("transactions", persist=False)
     window.show()
     try:
+        deadline = time.monotonic() + 8
+        while page.recovery_preview is None or window.busy:
+            assert time.monotonic() < deadline
+            settle(application)
+        transactions = window.pages["transactions"]
+        assert page.recovery_details.isHidden()
+        transactions.details_button.click()
         settle(application)
         scroll = window.page_containers["transactions"]
         assert scroll.horizontalScrollBar().maximum() == 0
@@ -71,8 +74,10 @@ def test_recovery_workbench_is_readable_and_actions_reachable(application, tmp_p
         assert str(target) in page.recovery_details.toPlainText()
         assert window.pages["transactions"].isAncestorOf(page.recovery_frame)
         assert not page.isAncestorOf(page.recovery_frame)
-        for control in (page.inspect_button, page.resolve_confirm, page.resolve_button,
-                        page.preserve_confirm, page.rollback_button):
+        assert page.inspect_button.isHidden()
+        assert page.resolve_confirm.isHidden()
+        assert page.preserve_confirm.isHidden()
+        for control in (transactions.details_button, page.resolve_button, page.rollback_button):
             scroll.ensureWidgetVisible(control)
             settle(application)
             position = control.mapTo(scroll.viewport(), QPoint())
@@ -281,7 +286,7 @@ def test_every_management_page_fits_width_and_bottom_actions_are_reachable(
             ),
             "trash_cleanup": (window.pages["trash_cleanup"].clear_button,),
             "archive": (window.pages["archive"].execute_button,),
-            "transactions": (window.pages["transactions"].clear_button, window.pages["transactions"].refresh_button),
+            "transactions": (window.pages["transactions"].empty_label, window.pages["transactions"].refresh_button),
         }
         for key, controls in bottom_controls.items():
             window._show_page(key, persist=False)
@@ -426,8 +431,6 @@ def test_legacy_trash_recovery_actions_fit_and_are_scroll_reachable(
         settle(application)
         assert not page.legacy_recovery_panel.isHidden()
         assert scroll.horizontalScrollBar().maximum() == 0
-        assert scroll.verticalScrollBar().maximum() > 0
-
         for control in (page.restore_button, page.finalize_button):
             scroll.ensureWidgetVisible(control)
             settle(application)

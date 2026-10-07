@@ -437,10 +437,10 @@ def test_resolving_changed_deployment_releases_all_pages_through_worker(applicat
         assert window._recovery_page_keys() == ("comsync",)
         window.nav_recovery_button.click()
         page = window.pages["comsync"]
-        page.inspect_button.click()
-        wait_until(application, lambda: not window.busy)
+        window.show()
+        wait_until(application, lambda: not window.busy and page.recovery_preview is not None)
         assert page.recovery_preview is not None
-        page.resolve_confirm.setChecked(True)
+        assert page.resolve_confirm.isHidden()
         page.resolve_button.click()
         wait_until(application, lambda: not window.busy)
         assert not window._recovery_page_keys()
@@ -506,7 +506,7 @@ def test_management_page_root_cannot_enclose_state_directory(application, tmp_pa
 
 
 
-def test_comsync_new_vault_full_worker_flow_and_rollback(application, tmp_path):
+def test_comsync_new_vault_full_worker_flow_and_rollback(application, tmp_path, monkeypatch):
     from obmanage.management.models import OpenedVaultCandidates
     source, target = tmp_path / "source", tmp_path / "collection" / "new"
     (source / ".obsidian").mkdir(parents=True)
@@ -541,11 +541,15 @@ def test_comsync_new_vault_full_worker_flow_and_rollback(application, tmp_path):
         assert list((target / "File/Note").iterdir()) == []
         assert list((target / "File/Attachment").iterdir()) == []
         assert (source / "File/Note/private.md").read_text() == "private"
-        page.inspect_button.click()
-        wait_until(application, lambda: not window.busy)
-        page.preserve_confirm.setChecked(True)
+        window._show_page("transactions", persist=False)
+        window.show()
+        wait_until(application, lambda: not window.busy and page.recovery_preview is not None)
+        confirmations = []
+        monkeypatch.setattr(window.pages["transactions"], "_confirm",
+                            lambda *args: confirmations.append(args) or True)
         page.rollback_button.click()
         wait_until(application, lambda: not window.busy)
+        assert len(confirmations) == 1
         assert not page.has_pending_recovery()
         assert not (target / "File").exists()
         assert not (target / ".obsidian/app.json").exists()
@@ -555,7 +559,7 @@ def test_comsync_new_vault_full_worker_flow_and_rollback(application, tmp_path):
 
 
 @pytest.mark.parametrize("record_only", [False, True])
-def test_transactions_clear_through_worker_and_restart(application, tmp_path, record_only):
+def test_transactions_clear_through_worker_and_restart(application, tmp_path, record_only, monkeypatch):
     source, target, state = (tmp_path / name for name in ("source", "target", "state"))
     (source / ".obsidian").mkdir(parents=True)
     (target / ".obsidian").mkdir(parents=True)
@@ -573,21 +577,22 @@ def test_transactions_clear_through_worker_and_restart(application, tmp_path, re
         assert page.isAncestorOf(controller.recovery_frame)
         assert not controller.isAncestorOf(controller.recovery_frame)
         window._show_page("transactions")
-        controller.inspect_button.click()
-        wait_until(application, lambda: not window.busy)
-        assert page.clear_confirm.isEnabled()
-        page.clear_confirm.setChecked(True)
+        window.show()
+        wait_until(application, lambda: not window.busy and controller.recovery_preview is not None)
+        assert page.clear_button.isEnabled()
+        assert controller.inspect_button.isHidden()
+        assert controller.recovery_details.isHidden()
         window._show_page("archive")
-        assert not page.clear_confirm.isChecked()
+        assert controller.recovery_preview is None
+        assert not page.clear_button.isEnabled()
         window._show_page("transactions")
-        controller.inspect_button.click()
+        wait_until(application, lambda: not window.busy and controller.recovery_preview is not None)
+        confirmations = []
+        monkeypatch.setattr(page, "_confirm", lambda *args: confirmations.append(args) or True)
+        (page.forget_button if record_only else page.clear_button).click()
         wait_until(application, lambda: not window.busy)
-        if record_only:
-            page.clear_mode.setCurrentIndex(1)
-            assert not page.clear_confirm.isChecked()
-        page.clear_confirm.setChecked(True)
-        page.clear_button.click()
-        wait_until(application, lambda: not window.busy)
+        assert len(confirmations) == 1
+        assert str(target) in confirmations[0][2]
         assert controller.batch_selector.count() == 0
         assert ("记录已删除" if record_only else "已清除") in page.status_label.text()
         assert bool(tuple(target.glob(".obmanage-deploy-*.backup"))) == record_only
@@ -603,7 +608,7 @@ def test_transactions_clear_through_worker_and_restart(application, tmp_path, re
         dispose(application, fresh)
 
 
-def test_clear_finalized_legacy_record(application, tmp_path, seed_legacy_quarantine):
+def test_clear_finalized_legacy_record(application, tmp_path, seed_legacy_quarantine, monkeypatch):
     state, vault = tmp_path / "state", tmp_path / "vault"
     (vault / ".obsidian").mkdir(parents=True)
     (vault / ".trash").mkdir()
@@ -618,12 +623,228 @@ def test_clear_finalized_legacy_record(application, tmp_path, seed_legacy_quaran
     try:
         window._show_page("transactions")
         page = window.pages["transactions"]
-        assert page.legacy_confirm.isEnabled()
-        page.legacy_confirm.setChecked(True)
+        assert page.legacy_clear.isEnabled()
+        assert window.pages["trash_cleanup"].finalize_button.isHidden()
+        confirmations = []
+        monkeypatch.setattr(page, "_confirm", lambda *args: confirmations.append(args) or True)
         page.legacy_clear.click()
         wait_until(application, lambda: not window.busy)
+        assert len(confirmations) == 1
         assert not engine.list_operations()
         assert window.pages["trash_cleanup"].legacy_recovery_panel.isHidden()
         assert (vault / ".trash").exists()
+    finally:
+        dispose(application, window)
+
+
+@pytest.mark.parametrize("record_only", [False, True])
+def test_transaction_cancel_and_navigation_during_confirmation_do_not_write(
+    application, tmp_path, monkeypatch, record_only
+):
+    source, target, state = (tmp_path / name for name in ("source", "target", "state"))
+    (source / ".obsidian").mkdir(parents=True)
+    (target / ".obsidian").mkdir(parents=True)
+    (source / ".obsidian/new.json").write_text("new")
+    (target / ".obsidian/old.json").write_text("old")
+    engine = DeploymentEngine(state)
+    plan = engine.analyze(DeploymentRequest((DeploymentSelection(
+        DeploymentComponent.obsidian(source), DeploymentTarget("target", str(target))),)))
+    assert engine.execute(plan).success
+    assert engine.resolve(plan.batch_id, expected_revision=engine.get_batch(plan.batch_id).revision).success
+    window = MainWindow(state)
+    try:
+        window._show_page("transactions", persist=False)
+        window.show()
+        controller, page = window.pages["comsync"], window.pages["transactions"]
+        wait_until(application, lambda: not window.busy and controller.recovery_preview is not None)
+        revision = engine.get_batch(plan.batch_id).revision
+        button = page.forget_button if record_only else page.clear_button
+        calls = []
+        monkeypatch.setattr(page, "_confirm", lambda *args: calls.append(args) or False)
+        button.click()
+        assert len(calls) == 1
+        assert not window.busy
+        assert engine.get_batch(plan.batch_id).revision == revision
+        assert tuple(target.glob(".obmanage-deploy-*.backup"))
+        assert (target / ".obsidian/new.json").read_text() == "new"
+
+        def leave_page(*args):
+            window._show_page("archive", persist=False)
+            return True
+
+        monkeypatch.setattr(page, "_confirm", leave_page)
+        button.click()
+        assert not window.busy
+        assert controller.recovery_preview is None
+        assert engine.get_batch(plan.batch_id).revision == revision
+        assert tuple(target.glob(".obmanage-deploy-*.backup"))
+    finally:
+        dispose(application, window)
+
+
+def test_transaction_stale_backup_keeps_record_and_disables_clear(
+    application, tmp_path, monkeypatch
+):
+    source, target, state = (tmp_path / name for name in ("source", "target", "state"))
+    (source / ".obsidian").mkdir(parents=True)
+    (target / ".obsidian").mkdir(parents=True)
+    (source / ".obsidian/new.json").write_text("new")
+    (target / ".obsidian/old.json").write_text("old")
+    engine = DeploymentEngine(state)
+    plan = engine.analyze(DeploymentRequest((DeploymentSelection(
+        DeploymentComponent.obsidian(source), DeploymentTarget("target", str(target))),)))
+    assert engine.execute(plan).success
+    assert engine.resolve(plan.batch_id, expected_revision=engine.get_batch(plan.batch_id).revision).success
+    window = MainWindow(state)
+    try:
+        window._show_page("transactions", persist=False)
+        window.show()
+        controller, page = window.pages["comsync"], window.pages["transactions"]
+        wait_until(application, lambda: not window.busy and controller.recovery_preview is not None)
+        backup = next(target.glob(".obmanage-deploy-*.backup"))
+        (backup / "unknown.txt").write_text("keep unknown data")
+        monkeypatch.setattr(page, "_confirm", lambda *args: True)
+        page.clear_button.click()
+        wait_until(application, lambda: not window.busy and controller.recovery_preview is not None)
+        assert engine.get_batch(plan.batch_id).status == "resolved"
+        assert (backup / "unknown.txt").read_text() == "keep unknown data"
+        assert (backup / "old.json").read_text() == "old"
+        assert (target / ".obsidian/new.json").read_text() == "new"
+        assert not page.clear_button.isEnabled()
+        assert page.forget_button.isEnabled()
+        assert "清除未完成" in page.status_label.text()
+        assert not window._recovery_page_keys()
+    finally:
+        dispose(application, window)
+
+
+@pytest.mark.parametrize("fail_cleanup", [False, True])
+def test_legacy_clear_removes_record_once_and_retains_failed_batch(
+    application, tmp_path, seed_legacy_quarantine, monkeypatch, fail_cleanup
+):
+    import obmanage.management.trash as trash_module
+    state, vault = tmp_path / "state", tmp_path / "vault"
+    (vault / ".obsidian").mkdir(parents=True)
+    (vault / ".trash").mkdir()
+    (vault / ".trash/note.md").write_text("old")
+    operation_id, backup = seed_legacy_quarantine(state, vault)
+    window = MainWindow(state)
+    try:
+        window._show_page("transactions", persist=False)
+        page, controller = window.pages["transactions"], window.pages["trash_cleanup"]
+        confirmations = []
+        monkeypatch.setattr(page, "_confirm", lambda *args: confirmations.append(args) or True)
+        if fail_cleanup:
+            monkeypatch.setattr(trash_module, "_remove_backup_tree", lambda *args, **kwargs:
+                                (_ for _ in ()).throw(PermissionError("injected cleanup failure")))
+        controller.finalize_button.click()
+        wait_until(application, lambda: not window.busy)
+        assert len(confirmations) == 1
+        assert "1 个文件" in confirmations[0][1]
+        assert str(backup) in confirmations[0][2]
+        assert (vault / ".trash").is_dir()
+        assert not tuple((vault / ".trash").iterdir())
+        operations = TrashCleanupEngine(state).list_operations()
+        if fail_cleanup:
+            assert operations[0].operation_id == operation_id
+            assert backup.exists()
+            assert window._recovery_page_keys() == ("trash_cleanup",)
+        else:
+            assert operations == ()
+            assert not backup.exists()
+            assert not window._recovery_page_keys()
+    finally:
+        dispose(application, window)
+
+
+def test_transaction_confirmation_has_one_action_and_cancel_default(application, tmp_path, monkeypatch):
+    from PySide6.QtWidgets import QMessageBox
+    window = MainWindow(tmp_path / "state")
+    try:
+        page = window.pages["transactions"]
+        dialogs = []
+
+        def inspect(dialog):
+            dialogs.append(dialog)
+            assert dialog.defaultButton() is dialog.button(QMessageBox.StandardButton.Cancel)
+            assert dialog.button(QMessageBox.StandardButton.Ok).text() == "清除副本和记录"
+            assert "1 个文件" in dialog.text()
+            assert dialog.detailedText() == "demo/backup"
+            return QMessageBox.StandardButton.Cancel
+
+        monkeypatch.setattr(QMessageBox, "exec", inspect)
+        assert not page._confirm("清除副本和记录", "1 个文件，删除后不可恢复", "demo/backup")
+        assert len(dialogs) == 1
+    finally:
+        dispose(application, window)
+
+
+def test_transaction_selection_automatically_inspects_selected_batch(application, tmp_path):
+    source, target, state = (tmp_path / name for name in ("source", "target", "state"))
+    (source / ".obsidian").mkdir(parents=True)
+    (target / ".obsidian").mkdir(parents=True)
+    (target / ".obsidian/config.json").write_text("original")
+    engine = DeploymentEngine(state)
+    ids = []
+    for value in ("first", "second"):
+        (source / ".obsidian/config.json").write_text(value)
+        plan = engine.analyze(DeploymentRequest((DeploymentSelection(
+            DeploymentComponent.obsidian(source), DeploymentTarget("target", str(target))),)))
+        assert engine.execute(plan).success
+        assert engine.resolve(plan.batch_id, expected_revision=engine.get_batch(plan.batch_id).revision).success
+        ids.append(plan.batch_id)
+    revisions = {batch.batch_id: batch.revision for batch in engine.list_batches()}
+    window = MainWindow(state)
+    try:
+        window._show_page("transactions", persist=False)
+        window.show()
+        controller, page = window.pages["comsync"], window.pages["transactions"]
+        wait_until(application, lambda: not window.busy and controller.recovery_preview is not None)
+        for batch_id in ids:
+            index = controller.batch_selector.findData(batch_id)
+            controller.batch_selector.setCurrentIndex(index)
+            wait_until(application, lambda: not window.busy and controller.recovery_preview is not None
+                       and controller.recovery_preview.batch_id == batch_id)
+            assert page.clear_button.isEnabled()
+            assert not page.details_button.isChecked()
+        assert {batch.batch_id: batch.revision for batch in engine.list_batches()} == revisions
+        assert (target / ".obsidian/config.json").read_text() == "second"
+        assert len(tuple(target.glob(".obmanage-deploy-*.backup"))) == 2
+    finally:
+        dispose(application, window)
+
+
+@pytest.mark.parametrize("finalized", [False, True])
+def test_legacy_confirmation_cancel_and_navigation_keep_selected_record(
+    application, tmp_path, seed_legacy_quarantine, monkeypatch, finalized
+):
+    state, vault = tmp_path / "state", tmp_path / "vault"
+    (vault / ".obsidian").mkdir(parents=True)
+    (vault / ".trash").mkdir()
+    (vault / ".trash/note.md").write_text("old")
+    operation_id, backup = seed_legacy_quarantine(state, vault)
+    engine = TrashCleanupEngine(state)
+    if finalized:
+        assert engine.finalize(operation_id).status == "success"
+    window = MainWindow(state)
+    try:
+        window._show_page("transactions", persist=False)
+        controller, page = window.pages["trash_cleanup"], window.pages["transactions"]
+        button = page.legacy_clear if finalized else controller.finalize_button
+        monkeypatch.setattr(page, "_confirm", lambda *args: False)
+        button.click()
+        assert not window.busy
+        assert engine.list_operations()[0].operation_id == operation_id
+
+        def leave_page(*args):
+            window._show_page("archive", persist=False)
+            return True
+
+        monkeypatch.setattr(page, "_confirm", leave_page)
+        button.click()
+        assert not window.busy
+        assert engine.list_operations()[0].operation_id == operation_id
+        if not finalized:
+            assert (backup / "note.md").read_text() == "old"
     finally:
         dispose(application, window)

@@ -1016,9 +1016,9 @@ class DistributionPage(FeaturePage):
                         DeploymentEngine(state_dir).inspect_recovery(batch_id))
 
     @Slot()
-    def _start_resolve(self) -> None:
+    def _start_resolve(self, *, confirmed: bool = False) -> None:
         preview = self.recovery_preview
-        if (preview is None or not self.resolve_confirm.isChecked() or self.current_batch is None
+        if (preview is None or not (confirmed or self.resolve_confirm.isChecked()) or self.current_batch is None
                 or self.current_batch.status not in _PENDING_STATUSES):
             return
         state_dir = self.state_dir
@@ -1027,9 +1027,9 @@ class DistributionPage(FeaturePage):
             preview.batch_id, expected_revision=preview.revision))
 
     @Slot()
-    def _start_rollback(self) -> None:
+    def _start_rollback(self, *, confirmed: bool = False) -> None:
         preview = self.recovery_preview
-        if (preview is None or not preview.can_rollback or not self.preserve_confirm.isChecked()
+        if (preview is None or not preview.can_rollback or not (confirmed or self.preserve_confirm.isChecked())
                 or self.current_batch is None or self.current_batch.status not in _ROLLBACK_STATUSES):
             return
         state_dir = self.state_dir
@@ -1431,6 +1431,14 @@ class DistributionPage(FeaturePage):
                                          and not getattr(self, "recovery_detached", False))
         self.finalize_button.setVisible(inspected and batch_status in _FINALIZE_STATUSES
                                         and not getattr(self, "recovery_detached", False))
+        if getattr(self, "recovery_detached", False):
+            self.inspect_button.hide()
+            self.resolve_confirm.hide()
+            self.preserve_confirm.hide()
+            self.resolve_button.setEnabled(can_resolve)
+            self.rollback_button.setEnabled(can_preserve)
+            self.rollback_button.setToolTip(self.recovery_preview.rollback_error if inspected else "正在检查事务")
+            self.recovery_details.setVisible(inspected and self.recovery_details_expanded)
         self.copy_target_button.setEnabled(
             available and bool(self.target_table.selectionModel().selectedRows())
         )
