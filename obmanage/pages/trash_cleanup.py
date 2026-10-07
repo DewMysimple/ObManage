@@ -324,7 +324,7 @@ class TrashCleanupPage(FeaturePage):
 
         self.legacy_recovery_panel, recovery_layout = panel(self.body)
         recovery_header = QHBoxLayout()
-        recovery_title = QLabel("旧版隔离批次（升级兼容）")
+        recovery_title = QLabel("事务")
         recovery_title.setObjectName("SectionTitle")
         recovery_header.addWidget(recovery_title)
         self.operation_selector = QComboBox()
@@ -673,7 +673,7 @@ class TrashCleanupPage(FeaturePage):
             del blocker
             self.operation_status.setText(f"隔离记录无法安全读取：{exc}")
             self.operation_status.setToolTip(str(exc))
-            self.legacy_recovery_panel.show()
+            self.legacy_recovery_panel.setVisible(not getattr(self, "recovery_detached", False))
             return
         self._recovery_blocked = False
         self._operations = operations
@@ -681,7 +681,7 @@ class TrashCleanupPage(FeaturePage):
             operation for operation in operations
             if self._operation_pending(operation)
         )
-        self.legacy_recovery_panel.setVisible(bool(operations) if getattr(self, "recovery_detached", False) else bool(self._pending_operations))
+        self.legacy_recovery_panel.setVisible(not getattr(self, "recovery_detached", False) and bool(self._pending_operations))
         choices = (self._pending_operations + tuple(op for op in operations if op not in self._pending_operations)
                    if getattr(self, "recovery_detached", False) else self._pending_operations or operations[:1])
         blocker = QSignalBlocker(self.operation_selector)
@@ -741,7 +741,7 @@ class TrashCleanupPage(FeaturePage):
                     "warning",
                 )
             else:
-                self.set_status("旧版隔离批次操作已取消。", "warning")
+                self.set_status("事务操作已取消。", "warning")
         elif result.status == "rejected":
             self.set_status(f"操作被安全拒绝：{failure or '范围或内容已变化。'}", "error")
         elif kind == "clear":

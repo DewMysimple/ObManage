@@ -710,3 +710,56 @@ def test_unknown_legacy_journal_temp_fails_closed_before_direct_cleanup(tmp_path
     assert result.status == "rejected"
     assert result.bytes_freed == 0
     assert item.read_bytes() == b"keep"
+
+
+def test_combined_clear_holds_locks_until_record_is_removed(tmp_path, seed_legacy_quarantine, monkeypatch):
+    import obmanage.management.trash as module
+    state, vault = tmp_path / "state", tmp_path / "vault"
+    (vault / ".obsidian").mkdir(parents=True)
+    (vault / ".trash").mkdir()
+    (vault / ".trash/note.md").write_text("original")
+    identifier, backup = seed_legacy_quarantine(state, vault)
+    engine = TrashCleanupEngine(state)
+    original = engine._clear_record_locked
+    observations = []
+
+    def check_locks(operation_id):
+        acquired = module._TRASH_TASK_LOCK.acquire(blocking=False)
+        if acquired:
+            module._TRASH_TASK_LOCK.release()
+        assert not acquired
+        assert TrashCleanupEngine(state)._acquire_file_lock() is None
+        assert not backup.exists()
+        observations.append(operation_id)
+        original(operation_id)
+
+    monkeypatch.setattr(engine, "_clear_record_locked", check_locks)
+    assert engine.clear_transaction(identifier).status == "success"
+    assert observations == [identifier]
+    assert not engine.list_operations()
+    assert (vault / ".trash").is_dir()
+
+
+def test_combined_clear_record_failure_can_retry_after_restart(tmp_path, seed_legacy_quarantine, monkeypatch):
+    import obmanage.management.trash as module
+    state, vault = tmp_path / "state", tmp_path / "vault"
+    (vault / ".obsidian").mkdir(parents=True)
+    (vault / ".trash").mkdir()
+    (vault / ".trash/note.md").write_text("original")
+    identifier, backup = seed_legacy_quarantine(state, vault)
+    engine = TrashCleanupEngine(state)
+    original = module.os.unlink
+
+    def fail_journal(path, *args, **kwargs):
+        if module.canonical(path) == module.canonical(engine._journal_path(identifier)):
+            raise PermissionError("injected record lock")
+        return original(path, *args, **kwargs)
+
+    with monkeypatch.context() as patch:
+        patch.setattr(module.os, "unlink", fail_journal)
+        assert engine.clear_transaction(identifier).status == "partial"
+    assert not backup.exists()
+    fresh = TrashCleanupEngine(state)
+    assert fresh.list_operations()[0].operation_id == identifier
+    assert fresh.clear_transaction(identifier).status == "success"
+    assert fresh.list_operations() == ()

@@ -429,7 +429,7 @@ def test_unknown_legacy_batch_is_reachable_from_config_recovery_page(
         assert config.has_pending_recovery()
         assert config.batch_selector.count() == 1
         assert config.batch_selector.currentData() == plan.batch_id
-        assert "旧版/未知入口" in config.batch_selector.currentText()
+        assert "旧版" not in config.batch_selector.currentText()
         assert config.current_batch is not None
         assert config.current_batch.label == "legacy-distribution-v0"
         assert str(target / ".obsidian") in config.batch_status.toolTip()

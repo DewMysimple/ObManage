@@ -2265,26 +2265,3 @@ class DeploymentEngine:
             if locks is not None:
                 locks.release()
             self._lock.release()
-
-    def forget_transaction(self, batch_id: str, *, expected_revision: int) -> DeploymentResult:
-        """Explicitly forget an ended record, leaving every copy in place."""
-        if not self._lock.acquire(blocking=False):
-            return DeploymentResult(batch_id, "failed", errors=("已有仓库管理任务正在运行。",))
-        locks = None
-        try:
-            locks = _InterprocessLockSet(self.state_dir, (), ())
-            locks.acquire()
-            batch = self.journal.get(batch_id)
-            self._validate_record(batch, check_disk=False)
-            if batch.status not in TERMINAL_BATCH_STATUSES:
-                raise DeploymentError("请先结束事务或完成回退，再删除记录。")
-            if batch.revision != expected_revision:
-                raise DeploymentError("记录在检查后发生变化，请重新检查。")
-            self.journal.discard(batch_id)
-            return DeploymentResult(batch_id, "success", "discarded")
-        except (OSError, ValueError, SyncError) as exc:
-            return DeploymentResult(batch_id, "failed", errors=(str(exc),))
-        finally:
-            if locks is not None:
-                locks.release()
-            self._lock.release()

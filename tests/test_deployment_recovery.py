@@ -377,16 +377,15 @@ def test_clear_stale_revision_and_tampered_journal_are_rejected(committed):
     assert Path(engine.journal._grant_path(batch_id)).exists()
 
 
-def test_forget_ended_offline_record_leaves_all_data_unchanged(committed, monkeypatch):
+def test_clear_offline_record_keeps_record_and_all_copies(committed, monkeypatch):
     engine, batch_id, source, target, state = committed
     revision = engine.get_batch(batch_id).revision
-    assert not engine.forget_transaction(batch_id, expected_revision=revision).success
     assert engine.resolve(batch_id, expected_revision=revision).success
-    revision = engine.get_batch(batch_id).revision
     before = contents(target)
+    preview = engine.inspect_recovery(batch_id)
     with monkeypatch.context() as patch:
         patch.setattr(deployment, "volume_identity", lambda *_: (_ for _ in ()).throw(OSError("offline")))
-        assert engine.forget_transaction(batch_id, expected_revision=revision).success
+        assert not engine.clear_transaction(batch_id, preview=preview).success
     assert contents(target) == before
-    assert DeploymentEngine(state).list_batches() == ()
+    assert DeploymentEngine(state).list_batches()[0].batch_id == batch_id
     require_recovery_clear(state)

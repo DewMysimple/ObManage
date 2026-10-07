@@ -1192,8 +1192,7 @@ class DistributionPage(FeaturePage):
     def _batch_choice_text(self, batch: JournalBatch) -> str:
         status = _STATUS_TEXT.get(batch.status, batch.status)
         updated = datetime.fromtimestamp(batch.updated_at).strftime("%m-%d %H:%M")
-        legacy = " · 旧版/未知入口" if batch.label != self.batch_label else ""
-        return f"{batch.batch_id[:8]} · {status}{legacy} · {updated}"
+        return f"{batch.batch_id[:8]} · {status} · {updated}"
 
     @staticmethod
     def _batch_tooltip(batch: JournalBatch) -> str:
@@ -1208,7 +1207,7 @@ class DistributionPage(FeaturePage):
         )
         return (
             f"批次：{batch.batch_id}\n状态：{batch.status}\n"
-            f"来源标签：{batch.label or '旧版（无标签）'}\n"
+            f"来源标签：{batch.label or '无标签'}\n"
             f"组件/目标：{len(batch.targets)}\n更新时间：{updated}"
             + ("\n目标：\n" + targets if targets else "")
             + ("\n记录：" + "\n".join(notes) if notes else "")
@@ -1456,7 +1455,8 @@ class DistributionPage(FeaturePage):
         )
         if self.compact_sync:
             self.recovery_frame.setVisible(
-                getattr(self, "recovery_detached", False) or pending or self._recovery_blocked or batch_status in {"rolled_back_with_residuals", "resolved"}
+                not getattr(self, "recovery_detached", False)
+                and (pending or self._recovery_blocked or batch_status in {"rolled_back_with_residuals", "resolved"})
             )
             self.confirm_checkbox.setVisible(self.plan is not None and self.plan.needs_deploy)
             self.occupancy_status.setVisible(bool(target_paths))

@@ -72,8 +72,8 @@ def test_recovery_workbench_is_readable_and_actions_reachable(application, tmp_p
         assert scroll.horizontalScrollBar().maximum() == 0
         assert page.recovery_details.horizontalScrollBar().maximum() == 0
         assert str(target) in page.recovery_details.toPlainText()
-        assert window.pages["transactions"].isAncestorOf(page.recovery_frame)
-        assert not page.isAncestorOf(page.recovery_frame)
+        assert window.pages["transactions"].isAncestorOf(page.recovery_details)
+        assert page.recovery_frame.isHidden()
         assert page.inspect_button.isHidden()
         assert page.resolve_confirm.isHidden()
         assert page.preserve_confirm.isHidden()
@@ -352,7 +352,7 @@ def test_obsidian_tables_and_source_chooser_keep_long_paths_accessible(applicati
         assert vault.path in page.preview_model.index(0, 3).data(Qt.ItemDataRole.ToolTipRole)
         assert dialog.proxy.index(0, 1).data(Qt.ItemDataRole.ToolTipRole) == vault.path
         assert window.page_containers["comsync"].horizontalScrollBar().maximum() == 0
-        assert not page.isAncestorOf(page.recovery_frame)
+        assert page.recovery_frame.isHidden()
     finally:
         dialog.close()
         window._timer.stop()
@@ -429,9 +429,9 @@ def test_legacy_trash_recovery_actions_fit_and_are_scroll_reachable(
         scroll = window.page_containers["transactions"]
         page = window.pages["trash_cleanup"]
         settle(application)
-        assert not page.legacy_recovery_panel.isHidden()
+        assert page.legacy_recovery_panel.isHidden()
         assert scroll.horizontalScrollBar().maximum() == 0
-        for control in (page.restore_button, page.finalize_button):
+        for control in (page.restore_button, window.pages["transactions"].clear_button):
             scroll.ensureWidgetVisible(control)
             settle(application)
             viewport = scroll.viewport()

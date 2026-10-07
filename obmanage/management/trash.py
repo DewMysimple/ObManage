@@ -1920,15 +1920,44 @@ class TrashCleanupEngine:
             file_lock = self._acquire_file_lock()
             if file_lock is None:
                 raise TrashSafetyError("另一个进程正在执行回收站任务。")
-            data = self._load_journal(operation_id)
-            if not all(value.get("status") == "finalized" for value in data["vaults"]):
-                raise TrashSafetyError("请先永久清理所选旧版隔离备份，再删除记录。")
-            self._remove_finalized_operation_root(data)
-            if snapshot(self._operation_backup_root(operation_id)) is not None:
-                raise TrashSafetyError("隔离目录仍存在，不能删除记录。")
-            assert_plain_chain(self._journal_base)
-            _read_snapshot(self._journal_path(operation_id), "file")
-            os.unlink(native(self._journal_path(operation_id)))
+            self._clear_record_locked(operation_id)
+        finally:
+            if file_lock is not None:
+                file_lock.release()
+            _TRASH_TASK_LOCK.release()
+
+    def _clear_record_locked(self, operation_id: str) -> None:
+        data = self._load_journal(operation_id)
+        if not all(value.get("status") == "finalized" for value in data["vaults"]):
+            raise TrashSafetyError("请先永久清理所选事务副本，再删除记录。")
+        self._remove_finalized_operation_root(data)
+        if snapshot(self._operation_backup_root(operation_id)) is not None:
+            raise TrashSafetyError("副本目录仍存在，不能删除记录。")
+        assert_plain_chain(self._journal_base)
+        _read_snapshot(self._journal_path(operation_id), "file")
+        os.unlink(native(self._journal_path(operation_id)))
+
+    def clear_transaction(self, operation_id: str, *, cancel: Event | None = None) -> TrashOperationResult:
+        """Clear all copies and their record under the same process and file locks."""
+        if not _TRASH_TASK_LOCK.acquire(blocking=False):
+            return TrashOperationResult("rejected", operation_id, failures=(
+                TrashFailure("", "", "lock", "另一个仓库管理任务正在运行。"),))
+        file_lock = None
+        result = None
+        try:
+            self._validate_persisted_state_location(operation_id, None)
+            file_lock = self._acquire_file_lock()
+            if file_lock is None:
+                raise TrashSafetyError("另一个进程正在执行回收站任务。")
+            result = self._finalize_locked(operation_id, cancel=cancel)
+            if result.status == "success":
+                self._clear_record_locked(operation_id)
+            return result
+        except (OSError, SyncError) as exc:
+            return TrashOperationResult("partial" if result else "rejected", operation_id,
+                                        vaults=result.vaults if result else (),
+                                        failures=(TrashFailure("", "", "clear_transaction", str(exc)),),
+                                        bytes_freed=result.bytes_freed if result else 0)
         finally:
             if file_lock is not None:
                 file_lock.release()
