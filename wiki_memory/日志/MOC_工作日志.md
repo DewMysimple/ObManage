@@ -16,6 +16,7 @@ supersedes: null
 | 时间 | 类型 | 目标 | 状态 | 主题 | 日志 |
 | --- | --- | --- | --- | --- | --- |
 | 2026-10-07 | ui | - | archived | unified-transaction-workbench | [事务统一列表与成套清除](./2026-10-07-事务统一列表与成套清除.md) |
+| 2026-10-07 | bug | - | archived | complete-bulk-transaction-cleanup | [事务彻底批量清理](./2026-10-07-事务彻底批量清理.md) |
 | 2026-10-07 | ui | - | archived | transaction-workbench-simplification | [事务工作台简化](./2026-10-07-事务工作台简化.md) |
 | 2026-09-28 | maintenance | - | archived | bounded-file-processing-performance | [文件处理性能优化](./2026-09-28-文件处理性能优化.md) |
 | 2026-09-28 | bug | - | archived | deployment-recovery-resolution | [待恢复事务重设计](./2026-09-28-待恢复事务重设计.md) |

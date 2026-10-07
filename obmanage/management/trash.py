@@ -150,6 +150,15 @@ class TrashOperation:
     records: tuple[TrashBackupRecord, ...]
 
 
+@dataclass(frozen=True)
+class TrashClearPreview:
+    operation: TrashOperation
+    revision: str
+    file_count: int
+    dir_count: int
+    total_bytes: int
+
+
 ProgressCallback = Callable[[TrashProgress], None] | None
 
 
@@ -1937,7 +1946,50 @@ class TrashCleanupEngine:
         _read_snapshot(self._journal_path(operation_id), "file")
         os.unlink(native(self._journal_path(operation_id)))
 
-    def clear_transaction(self, operation_id: str, *, cancel: Event | None = None) -> TrashOperationResult:
+    def inspect_clear(self, operation_id: str, *, cancel: Event | None = None) -> TrashClearPreview:
+        """Read and authenticate every copy without changing the record."""
+        data = self._load_journal(operation_id)
+        records = self._journal_selection(data, None)
+        self._validate_state_location(preview for _, _, preview in records)
+        verified = self._verify_operation_root(data, allow_finalized_missing=True)
+        expected_names = set()
+        files, directories, size = 0, int(verified is not None), 0
+        for _, value, preview in records:
+            _check_cancel(cancel)
+            backup = self._backup_path(operation_id, str(value["backup_rel"]))
+            current = snapshot(backup)
+            if value["status"] == "finalized":
+                if current is not None:
+                    raise TrashSafetyError("已清理的副本位置重新出现内容，拒绝删除。")
+                continue
+            if current is None:
+                if value["status"] != "finalizing":
+                    raise TrashSafetyError("隔离备份缺失，拒绝推断已清理。")
+                continue
+            expected_names.add(str(value["backup_rel"]))
+            backup, _ = self._verify_backup_root(operation_id, value)
+            entries, digest = _scan_content(backup, cancel)
+            files += sum(entry.kind == "file" for entry in entries)
+            directories += 1 + sum(entry.kind == "dir" for entry in entries)
+            size += sum(entry.size for entry in entries if entry.kind == "file")
+            exact = (_content_signature(entries) == _content_signature(preview.entries)
+                     and digest == preview.tree_sha256)
+            remaining = preview.total_bytes if exact else _validated_manifest_subset(
+                entries, preview.entries, require_strict=True)
+            if not exact and value["status"] not in {"finalizing", "finalize_partial"}:
+                raise TrashSafetyError("隔离备份内容发生变化，拒绝清除。")
+            if int(value["freed_bytes"]) > preview.total_bytes - remaining:
+                raise TrashSafetyError("隔离备份出现已清理内容回流，拒绝继续。")
+        if verified is not None:
+            with os.scandir(native(verified[0])) as iterator:
+                if {entry.name for entry in iterator} != expected_names:
+                    raise TrashSafetyError("隔离事务目录包含未知项目，拒绝清除。")
+        return TrashClearPreview(self._operation_from_data(data),
+                                 hashlib.sha256(self._authenticated_payload(data)).hexdigest(),
+                                 files, directories, size)
+
+    def clear_transaction(self, operation_id: str, *, cancel: Event | None = None,
+                          expected_revision: str | None = None) -> TrashOperationResult:
         """Clear all copies and their record under the same process and file locks."""
         if not _TRASH_TASK_LOCK.acquire(blocking=False):
             return TrashOperationResult("rejected", operation_id, failures=(
@@ -1949,6 +2001,10 @@ class TrashCleanupEngine:
             file_lock = self._acquire_file_lock()
             if file_lock is None:
                 raise TrashSafetyError("另一个进程正在执行回收站任务。")
+            if expected_revision is not None:
+                data = self._load_journal(operation_id)
+                if hashlib.sha256(self._authenticated_payload(data)).hexdigest() != expected_revision:
+                    raise TrashSafetyError("事务记录在检查后发生变化，请重新清理。")
             result = self._finalize_locked(operation_id, cancel=cancel)
             if result.status == "success":
                 self._clear_record_locked(operation_id)
