@@ -3,7 +3,7 @@ type: moc
 status: active
 kind: process
 importance: high
-updated: 2026-10-07
+updated: 2026-10-31
 topic: work-log-index
 source_logs: []
 supersedes: null
@@ -15,6 +15,7 @@ supersedes: null
 
 | 时间 | 类型 | 目标 | 状态 | 主题 | 日志 |
 | --- | --- | --- | --- | --- | --- |
+| 2026-10-31 | feature | - | archived | comsync-obsidian-lifecycle | [.comSync 自动关闭与打开仓库](./2026-10-31-comSync自动关闭与打开仓库.md) |
 | 2026-10-07 | ui | - | archived | unified-transaction-workbench | [事务统一列表与成套清除](./2026-10-07-事务统一列表与成套清除.md) |
 | 2026-10-07 | bug | - | archived | complete-bulk-transaction-cleanup | [事务彻底批量清理](./2026-10-07-事务彻底批量清理.md) |
 | 2026-10-07 | ui | - | archived | transaction-workbench-simplification | [事务工作台简化](./2026-10-07-事务工作台简化.md) |

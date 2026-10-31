@@ -22,6 +22,7 @@ from obmanage.management.trash import TrashCleanupEngine
 from obmanage.models import PlanItem, SyncCancelled, SyncPlan
 from obmanage.pages.backup import VaultBackupPage
 from obmanage.pages.incremental import IncrementalPage
+import obmanage.pages.distribution as distribution_page
 from obmanage.pages.distribution import ComSyncPage
 from obmanage.pages.registry import FEATURES
 from obmanage.pages.statistics import StatisticsPage
@@ -524,6 +525,17 @@ def test_comsync_new_vault_full_worker_flow_and_rollback(application, tmp_path, 
     (target / ".obsidian").mkdir(parents=True)
     window = MainWindow(tmp_path / "state")
     page = window.pages["comsync"]
+    obsidian_actions = []
+    monkeypatch.setattr(distribution_page, "close_obsidian",
+                        lambda **_kwargs: obsidian_actions.append("close") or 1)
+
+    def open_targets(paths, **_kwargs):
+        assert (target / ".obsidian/app.json").read_text() == "new"
+        assert (target / "File/Templater/template.md").read_text() == "template"
+        obsidian_actions.append(("open", tuple(paths)))
+        return ()
+
+    monkeypatch.setattr(distribution_page, "open_vaults", open_targets)
     try:
         page.opened_vault_reader = lambda _: OpenedVaultCandidates()
         page.source_picker.set_value(str(source))
@@ -538,9 +550,11 @@ def test_comsync_new_vault_full_worker_flow_and_rollback(application, tmp_path, 
         page.analyze_button.click()
         wait_until(application, lambda: not window.busy)
         assert page.plan and "1 个仓库" in page.confirm_checkbox.text()
+        assert obsidian_actions == []
         page.confirm_checkbox.setChecked(True)
         page.execute_button.click()
         wait_until(application, lambda: not window.busy)
+        assert obsidian_actions == ["close", ("open", (str(target),))]
         assert page.has_pending_recovery()
         assert (target / ".obsidian/app.json").read_text() == "new"
         assert (target / "File/Templater/template.md").read_text() == "template"

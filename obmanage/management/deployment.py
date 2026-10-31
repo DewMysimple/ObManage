@@ -1493,7 +1493,8 @@ class DeploymentEngine:
               target_id=item.target_id, message="限定子树已原子切换，旧版本仍保留为事务备份")
 
     def execute(self, plan: DeploymentPlan, cancel: threading.Event | None = None,
-                progress: ProgressCallback = None) -> DeploymentResult:
+                progress: ProgressCallback = None, *,
+                safety_check: Callable[[], None] | None = None) -> DeploymentResult:
         started = time.monotonic()
         if not self._lock.acquire(blocking=False):
             return DeploymentResult(plan.batch_id, "failed", errors=("已有仓库管理任务正在运行。",))
@@ -1504,6 +1505,8 @@ class DeploymentEngine:
         process_locks: _InterprocessLockSet | None = None
         try:
             _cancelled(cancel)
+            if safety_check is not None:
+                safety_check()
             self._validate_plan(plan)
             process_locks = _InterprocessLockSet(
                 self.state_dir, (item.target_root for item in plan.targets),
@@ -1540,12 +1543,16 @@ class DeploymentEngine:
             prepared = self._prepare(plan, cancel, progress)
             self.journal.set_batch(plan.batch_id, status="prepared")
             _cancelled(cancel)
+            if safety_check is not None:
+                safety_check()
             self.journal.set_batch(plan.batch_id, status="committing")
             created: dict[str, OwnedDirectory] = {}
             for item in plan.targets:
                 if not item.needs_deploy:
                     continue
                 _cancelled(cancel)
+                if safety_check is not None:
+                    safety_check()
                 self._commit_one(plan, item, created, progress)
                 committed += 1
             self.journal.set_batch(plan.batch_id, status="committed")

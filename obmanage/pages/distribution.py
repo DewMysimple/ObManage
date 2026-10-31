@@ -47,6 +47,7 @@ from ..management.deployment import (
 )
 from ..management.journal import JournalBatch, JournalError
 from ..management.comsync import components, newest_vaults, source_root, with_creation_times
+from ..management.obsidian_lifecycle import close_obsidian, assert_obsidian_closed, open_vaults
 from ..management.models import (
     ManagementIssue,
     OpenedVaultCandidates,
@@ -194,6 +195,8 @@ class AnalyzeTaskResult:
 class ExecuteTaskResult:
     result: DeploymentResult
     open_state: OpenVaultState
+    launch_errors: tuple[str, ...] = ()
+    opened_targets: int = 0
 
 
 class VaultTargetTableModel(QAbstractTableModel):
@@ -362,6 +365,7 @@ class DistributionPage(FeaturePage):
     source_label = "模板来源"
     source_hint = "选择包含待部署组件的目录"
     compact_sync = False
+    manage_obsidian = False
 
     def __init__(self, state_dir: Path, settings: dict[str, Any], default_root: str,
                  *, title: str, description: str,
@@ -985,6 +989,24 @@ class DistributionPage(FeaturePage):
         del blocker
 
         def operation(cancel, progress):
+            if self.manage_obsidian:
+                close_obsidian(cancel=cancel, progress=progress)
+                result = DeploymentEngine(state_dir).execute(
+                    plan, cancel=cancel, progress=progress,
+                    safety_check=assert_obsidian_closed,
+                )
+                launch_errors = ()
+                opened_targets = 0
+                if result.success:
+                    # Opening is separate from the committed transaction.
+                    try:
+                        launch_errors = open_vaults(
+                            tuple(dict.fromkeys(target_paths)), config_path=self.obsidian_config_path)
+                    except Exception as exc:
+                        launch_errors = (f"无法打开仓库：{exc}",)
+                    if not launch_errors:
+                        opened_targets = len(set(target_paths))
+                return ExecuteTaskResult(result, OpenVaultState(), launch_errors, opened_targets)
             open_state = self._read_open_state(cancel, progress, validate=False)
             open_targets = self._open_selected_targets(open_state, target_paths)
             if open_targets:
@@ -1163,13 +1185,13 @@ class DistributionPage(FeaturePage):
         open_targets = self._open_selected_targets(
             self.open_state, (item.target_root for item in plan.targets)
         )
-        if open_targets:
+        if open_targets and not self.manage_obsidian:
             self.set_status(
                 f"已阻止部署：{len(open_targets)} 个所选目标正被 Obsidian 标记为打开。"
                 "关闭后重新发现并分析。",
                 "error",
             )
-        elif not self.open_state.reliable:
+        elif not self.open_state.reliable and not self.manage_obsidian:
             self.set_status(
                 "文件与目录预览已完成，但无法自动确认 Obsidian 占用状态；"
                 "确认已关闭所选目标后才能部署。",
@@ -1285,7 +1307,9 @@ class DistributionPage(FeaturePage):
         )
         self._show_current_batch()
 
-    def _accept_operation_result(self, kind: str, result: DeploymentResult) -> None:
+    def _accept_operation_result(self, kind: str, result: DeploymentResult, *,
+                                 launch_errors: tuple[str, ...] = (),
+                                 opened_targets: int = 0) -> None:
         self._reload_persistent_batches()
         detail = result.errors[0] if result.errors else ""
         if kind == "execute":
@@ -1293,8 +1317,10 @@ class DistributionPage(FeaturePage):
             if result.success:
                 self.set_status(
                     f"部署完成：提交 {result.committed_targets} 个目标。"
-                    "请到事务处理页选择保留现状或回退。",
-                    "success",
+                    + (f"已请求在 Obsidian 中打开 {opened_targets} 个仓库。" if opened_targets else "")
+                    + ("同步已完成，但打开仓库失败，请手动打开。" if launch_errors else "")
+                    + "请到事务处理页选择保留现状或回退。",
+                    "warning" if launch_errors else "success",
                 )
             else:
                 self.set_status(
@@ -1326,6 +1352,10 @@ class DistributionPage(FeaturePage):
                 self.set_status(f"事务未结束：{detail}", "error")
         for message in result.errors:
             self.message_logged.emit(message)
+        for message in launch_errors:
+            self.message_logged.emit(message)
+        if launch_errors:
+            self.status_label.setToolTip("\n".join(launch_errors))
         self.message_logged.emit(self.status_label.text())
 
     def task_finished(self, status: str, payload: Any) -> None:
@@ -1355,7 +1385,8 @@ class DistributionPage(FeaturePage):
         elif kind in {"execute", "rollback", "finalize", "resolve"}:
             if kind == "execute":
                 self.open_state = payload.open_state
-                self._accept_operation_result(kind, payload.result)
+                self._accept_operation_result(kind, payload.result,
+                    launch_errors=payload.launch_errors, opened_targets=payload.opened_targets)
             else:
                 self._accept_operation_result(kind, payload)
         self._task_kind = ""
@@ -1382,10 +1413,9 @@ class DistributionPage(FeaturePage):
             if self.plan is not None else self._selected_target_paths()
         )
         open_targets = self._open_selected_targets(self.open_state, target_paths)
-        occupancy_allowed = (
+        occupancy_allowed = self.manage_obsidian or (
             not open_targets
-            and (self.open_state.reliable or self.occupancy_confirm.isChecked())
-        )
+            and (self.open_state.reliable or self.occupancy_confirm.isChecked()))
         self.analyze_button.setEnabled(
             available and not pending and not self._external_recovery_pending
             and not self._recovery_blocked and self.catalog is not None
@@ -1394,7 +1424,7 @@ class DistributionPage(FeaturePage):
         self.confirm_checkbox.setEnabled(
             available and not pending and not self._external_recovery_pending
             and not self._recovery_blocked and self.plan is not None and self.plan.needs_deploy
-            and not open_targets
+            and (self.manage_obsidian or not open_targets)
         )
         self.execute_button.setEnabled(
             available and not pending and not self._external_recovery_pending
@@ -1490,6 +1520,7 @@ class ComSyncPage(DistributionPage):
     source_label = "配置来源"
     source_hint = "选择来源仓库或模板套件根目录"
     compact_sync = True
+    manage_obsidian = True
     component_options = (
         ComponentOption("claude", ".claude", ".claude"),
         ComponentOption("claudian", ".claudian", ".claudian"),
@@ -1532,6 +1563,10 @@ class ComSyncPage(DistributionPage):
         self.component_scope.setText(
             ".File 包含 .Templater 内容；Note、Attachment 只补齐目录，已有笔记和附件保留。")
         self.safety_hint.setText("选中配置和模板按来源完整同步，目标独有内容会进入删除预览。")
+        self.execute_button.setText("同步并打开")
+        self.execute_button.setToolTip(
+            "先退出所有 Obsidian 窗口；未及时退出时强制结束 Obsidian。"
+            "同步成功后仅请求打开本次所选仓库，请先保存正在编辑的内容。")
         self.preview_table.setColumnHidden(1, False)
         self.preview_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
         self.preview_table.setColumnWidth(1, 95)
@@ -1588,7 +1623,29 @@ class ComSyncPage(DistributionPage):
         first = next(i for i, vault in enumerate(self.target_model.rows) if vault == latest[0])
         index = self.target_proxy.mapFromSource(self.target_model.index(first, 0))
         self.target_table.scrollTo(index)
-        self.set_status(f"已按创建时间选择最新的 {len(latest)} 个仓库；请预览后同步。")
+        self.set_status(f"已按创建时间选择最新的 {len(latest)} 个仓库；预览并同步后会自动打开。")
+
+    def _update_occupancy_display(self, *, reset_confirmation: bool = True,
+                                  target_paths: Iterable[str] | None = None) -> None:
+        # Registry flags survive crashes and are not proof of a live writer.
+        # Execution instead checks actual processes before every commit.
+        self.occupancy_confirm.setChecked(False)
+        self.occupancy_confirm.hide()
+        paths = tuple(target_paths) if target_paths is not None else self._selected_target_paths()
+        opened = self._open_selected_targets(self.open_state, paths)
+        self.occupancy_status.setText(
+            f"{len(opened)} 个所选仓库标记为打开；同步时将自动关闭 Obsidian。"
+            if opened else "同步前自动退出 Obsidian，成功后打开所选仓库。")
+        self.occupancy_status.setToolTip(
+            "关闭所有 Obsidian 窗口，必要时强制结束进程；请先保存编辑内容。\n"
+            "保存的打开标记不再阻止同步，执行时核验实际进程已退出。")
+
+    def _accept_plan(self, plan: DeploymentPlan) -> None:
+        super()._accept_plan(plan)
+        if plan.needs_deploy:
+            self.confirm_checkbox.setText(
+                self.confirm_checkbox.text().replace("确认同步所选组件到", "确认同步至") + "\n"
+                "允许退出 Obsidian（必要时强制结束全部窗口），成功后打开所选仓库。")
 
     def refresh_actions(self) -> None:
         super().refresh_actions()
@@ -1598,9 +1655,6 @@ class ComSyncPage(DistributionPage):
         if hasattr(self, "latest_button"):
             self.latest_button.setEnabled(not self._global_busy and not self._task_active
                 and self.catalog is not None and bool(newest_vaults(self.target_model.rows)))
-        if hasattr(self, "occupancy_status") and self.open_state.reliable:
-            self.occupancy_status.setVisible(bool(self._open_selected_targets(
-                self.open_state, self._selected_target_paths())))
 
     def set_status(self, text: str, kind: str = "neutral") -> None:
         super().set_status(text.replace("部署", "同步"), kind)

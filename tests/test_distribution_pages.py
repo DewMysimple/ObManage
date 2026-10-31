@@ -22,6 +22,8 @@ from obmanage.management.deployment import (
 from obmanage.management.models import ManagementIssue, OpenedVaultCandidates, VaultInfo
 from obmanage.management.models import VaultCatalogResult
 from obmanage.management.comsync import DatedVault
+import obmanage.pages.distribution as distribution_page
+from obmanage.models import SyncCancelled
 from obmanage.pages.distribution import (
     DeploymentPreviewRow,
     ComSyncPage,
@@ -775,91 +777,216 @@ def test_filtered_target_selection_and_copy_use_visible_rows(application, tmp_pa
         dispose(page)
 
 
-def test_open_target_is_blocked_again_in_worker_immediately_before_execute(
-    application, tmp_path
-):
+def test_open_registry_does_not_block_close_sync_and_open_flow(application, tmp_path, monkeypatch):
     root, source, target, _fake = create_config_fixture(tmp_path)
-    state_dir = tmp_path / "state"
-    open_registry = {"paths": (str(target),)}
-    reads: list[tuple[str, ...]] = []
+    events = []
 
-    def reader(_config_path):
-        paths = open_registry["paths"]
-        reads.append(paths)
-        return OpenedVaultCandidates(paths=paths)
+    def close(**_kwargs):
+        events.append("close")
+        return 2
 
+    def check_closed():
+        events.append("check")
+
+    def open_targets(paths, **_kwargs):
+        assert (target / ".obsidian/changed.json").read_text() == "new"
+        events.append(("open", tuple(paths)))
+        return ()
+
+    monkeypatch.setattr(distribution_page, "close_obsidian", close)
+    monkeypatch.setattr(distribution_page, "assert_obsidian_closed", check_closed)
+    monkeypatch.setattr(distribution_page, "open_vaults", open_targets)
     page = ComSyncPage(
-        state_dir, {"root": str(root), "source": str(source)}, str(root),
-        opened_vault_reader=reader,
+        tmp_path / "state", {"root": str(root), "source": str(source)}, str(root),
+        opened_vault_reader=lambda _: OpenedVaultCandidates(paths=(str(target),)),
     )
-    operations: list = []
+    operations = []
     page.task_requested.connect(operations.append)
-    target_before = snapshot_tree(target / ".obsidian")
+    before = snapshot_tree(root)
     try:
         prepare_config_plan(page, operations)
-        assert page.plan is not None
-        assert not page.confirm_checkbox.isEnabled()
-        assert not page.execute_button.isEnabled()
-        assert "已阻止" in page.occupancy_status.text()
-
-        open_registry["paths"] = ()
-        run_last_operation(page, operations, page._start_analyze)
+        assert snapshot_tree(root) == before
+        assert events == []  # Scanning and preview remain read-only.
         assert page.confirm_checkbox.isEnabled()
+        assert "退出 Obsidian" in page.confirm_checkbox.text()
+        assert "必要时强制结束全部窗口" in page.confirm_checkbox.text()
         page.confirm_checkbox.setChecked(True)
         assert page.execute_button.isEnabled()
-
-        # Occupancy can change after analysis; the worker must read it again.
-        open_registry["paths"] = (str(target),)
-        before = len(operations)
-        page._start_execute()
-        assert len(operations) == before + 1
-        with pytest.raises(DeploymentError, match="标记为打开") as error:
-            operations[-1](threading.Event(), lambda _event: None)
-        page.task_finished("error", str(error.value))
-
-        assert snapshot_tree(target / ".obsidian") == target_before
-        assert not (state_dir / "deployment-journal").exists()
-        assert page.plan is None
-        assert "标记为打开" in page.status_label.text()
-        assert len(reads) == 4  # catalog, first analyze, re-analyze, execute preflight
+        result = run_last_operation(page, operations, page._start_execute)
+        assert result.success
+        assert events[0] == "close"
+        assert "check" in events
+        assert events[-1] == ("open", (str(target),))
+        assert snapshot_tree(target / ".obsidian") == snapshot_tree(source / ".obsidian")
     finally:
         dispose(page)
 
 
-def test_unreadable_open_registry_requires_explicit_closed_target_confirmation(
-    application, tmp_path
+def test_unreadable_open_registry_uses_process_checks_instead_of_manual_override(
+    application, tmp_path, monkeypatch
 ):
     root, source, target, _fake = create_config_fixture(tmp_path)
     unavailable = OpenedVaultCandidates(issues=(ManagementIssue(
         "config_unreadable", "测试配置不可读取", str(tmp_path / "obsidian.json")
     ),))
-
-    def reader(_config_path):
-        return unavailable
-
+    checks = []
+    monkeypatch.setattr(distribution_page, "assert_obsidian_closed", lambda: checks.append("checked"))
     page = ComSyncPage(
         tmp_path / "state", {"root": str(root), "source": str(source)}, str(root),
-        opened_vault_reader=reader,
+        opened_vault_reader=lambda _: unavailable,
     )
-    operations: list = []
+    operations = []
     page.task_requested.connect(operations.append)
     try:
         prepare_config_plan(page, operations)
         assert page.open_state.reliable is False
-        assert not page.occupancy_confirm.isHidden()
-        assert "测试配置不可读取" in page.occupancy_status.text()
-
+        assert page.occupancy_confirm.isHidden()
         page.confirm_checkbox.setChecked(True)
-        assert not page.execute_button.isEnabled()
-        page.occupancy_confirm.setChecked(True)
         assert page.execute_button.isEnabled()
         result = run_last_operation(page, operations, page._start_execute)
-
-        assert result.success
+        assert result.success and checks
         assert snapshot_tree(target / ".obsidian") == snapshot_tree(source / ".obsidian")
     finally:
         dispose(page)
 
+
+@pytest.mark.parametrize("cancelled", [False, True])
+def test_close_failure_or_cancellation_never_writes_or_opens_vaults(
+    application, tmp_path, monkeypatch, cancelled
+):
+    root, source, target, _fake = create_config_fixture(tmp_path)
+    state = tmp_path / "state"
+    opened = []
+
+    def close(**_kwargs):
+        if cancelled:
+            raise SyncCancelled("已取消关闭 Obsidian")
+        raise DeploymentError("无法确认 Obsidian 已退出")
+
+    monkeypatch.setattr(distribution_page, "close_obsidian", close)
+    monkeypatch.setattr(distribution_page, "open_vaults", lambda paths, **_kwargs: opened.append(tuple(paths)) or ())
+    page = ComSyncPage(state, {"root": str(root), "source": str(source)}, str(root),
+                       opened_vault_reader=closed_vault_reader)
+    operations = []
+    page.task_requested.connect(operations.append)
+    try:
+        prepare_config_plan(page, operations)
+        before = snapshot_tree(target)
+        page.confirm_checkbox.setChecked(True)
+        page._start_execute()
+        with pytest.raises(SyncCancelled if cancelled else DeploymentError) as error:
+            operations[-1](threading.Event(), lambda _event: None)
+        page.task_finished("cancelled" if cancelled else "error", str(error.value))
+        assert snapshot_tree(target) == before
+        assert not (state / "deployment-journal").exists()
+        assert opened == []
+        assert page.plan is None
+    finally:
+        dispose(page)
+
+
+def test_close_side_effects_invalidate_preview_without_overwriting_new_content(
+    application, tmp_path, monkeypatch
+):
+    root, source, target, _fake = create_config_fixture(tmp_path)
+    opened = []
+
+    def close(**_kwargs):
+        (target / ".obsidian/workspace.json").write_text("saved by Obsidian")
+        return 1
+
+    monkeypatch.setattr(distribution_page, "close_obsidian", close)
+    monkeypatch.setattr(distribution_page, "open_vaults", lambda paths, **_kwargs: opened.append(tuple(paths)) or ())
+    page = ComSyncPage(tmp_path / "state", {"root": str(root), "source": str(source)}, str(root),
+                       opened_vault_reader=closed_vault_reader)
+    operations = []
+    page.task_requested.connect(operations.append)
+    try:
+        prepare_config_plan(page, operations)
+        page.confirm_checkbox.setChecked(True)
+        result = run_last_operation(page, operations, page._start_execute)
+        assert not result.success
+        assert (target / ".obsidian/workspace.json").read_text() == "saved by Obsidian"
+        assert (target / ".obsidian/changed.json").read_text() == "old"
+        assert opened == []
+        assert page.plan is None
+    finally:
+        dispose(page)
+
+
+def test_cancellation_during_sync_never_opens_targets(application, tmp_path, monkeypatch):
+    root, source, target, _fake = create_config_fixture(tmp_path)
+    opened = []
+    monkeypatch.setattr(distribution_page, "open_vaults", lambda paths, **_kwargs: opened.append(tuple(paths)) or ())
+    page = ComSyncPage(tmp_path / "state", {"root": str(root), "source": str(source)}, str(root),
+                       opened_vault_reader=closed_vault_reader)
+    operations = []
+    page.task_requested.connect(operations.append)
+    cancel = threading.Event()
+
+    def progress(event):
+        if event.phase == "stage":
+            cancel.set()
+
+    try:
+        prepare_config_plan(page, operations)
+        before = snapshot_tree(target / ".obsidian")
+        page.confirm_checkbox.setChecked(True)
+        page._start_execute()
+        payload = operations[-1](cancel, progress)
+        page.task_finished("ok", payload)
+        assert payload.result.status == "cancelled"
+        assert snapshot_tree(target / ".obsidian") == before
+        assert opened == []
+    finally:
+        dispose(page)
+
+
+def test_multiple_components_open_each_selected_vault_once(application, tmp_path, monkeypatch):
+    root, source, first, _fake = create_config_fixture(tmp_path)
+    second = root / "另一仓库"
+    (second / ".obsidian").mkdir(parents=True)
+    (source / ".claude").mkdir()
+    (source / ".claude/settings.json").write_text("template")
+    opened = []
+    monkeypatch.setattr(distribution_page, "open_vaults", lambda paths, **_kwargs: opened.append(tuple(paths)) or ())
+    page = ComSyncPage(tmp_path / "state", {"root": str(root), "source": str(source)}, str(root),
+                       opened_vault_reader=closed_vault_reader)
+    operations = []
+    page.task_requested.connect(operations.append)
+    try:
+        page.component_boxes["claude"].setChecked(True)
+        run_last_operation(page, operations, page._start_catalog)
+        page.target_model.set_all_checked(True)
+        run_last_operation(page, operations, page._start_analyze)
+        assert len(page.plan.targets) == 4
+        page.confirm_checkbox.setChecked(True)
+        assert run_last_operation(page, operations, page._start_execute).success
+        assert len(opened) == 1 and len(opened[0]) == 2
+        assert set(opened[0]) == {str(first), str(second)}
+    finally:
+        dispose(page)
+
+
+def test_open_failure_preserves_completed_sync_and_reports_launch_error(application, tmp_path, monkeypatch):
+    root, source, target, _fake = create_config_fixture(tmp_path)
+    monkeypatch.setattr(distribution_page, "open_vaults", lambda _paths, **_kwargs: ("测试：无法启动 Obsidian",))
+    page = ComSyncPage(tmp_path / "state", {"root": str(root), "source": str(source)}, str(root),
+                       opened_vault_reader=closed_vault_reader)
+    operations = []
+    page.task_requested.connect(operations.append)
+    try:
+        prepare_config_plan(page, operations)
+        page.confirm_checkbox.setChecked(True)
+        result = run_last_operation(page, operations, page._start_execute)
+        assert result.success
+        assert page.current_batch.status == "committed"
+        assert snapshot_tree(target / ".obsidian") == snapshot_tree(source / ".obsidian")
+        assert "同步完成" in page.status_label.text()
+        assert "打开仓库失败" in page.status_label.text()
+        assert "无法启动 Obsidian" in page.status_label.toolTip()
+    finally:
+        dispose(page)
 
 
 def test_newest_selection_uses_creation_time_excludes_source_and_replaces_hidden_choices(application, tmp_path):
