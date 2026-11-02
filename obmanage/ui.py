@@ -1508,7 +1508,7 @@ class MainWindow(QMainWindow):
             return
         if self._recovery_page_keys():
             self._set_status(
-                "存在待恢复事务，请通过左侧入口检查后回退，或保留现状并结束事务。",
+                "存在待处理事务，请到事务处理页选择确认完成或确认回退。",
                 "warning",
             )
             return
@@ -1555,7 +1555,7 @@ class MainWindow(QMainWindow):
         if self._reject_unsafe_state_location():
             return
         if self._recovery_page_keys():
-            message = "存在待恢复事务，本轮镜像已阻止；请先检查后回退，或保留现状并结束事务。"
+            message = "存在待处理事务，本轮镜像已阻止；请到事务处理页选择确认完成或确认回退。"
             self._set_status(message, "warning")
             self._log(message, feature="mirror", event="执行", level="warning")
             return
@@ -1888,7 +1888,8 @@ class MainWindow(QMainWindow):
         events = {"analyze": "分析差异", "preview": "预览", "execute": "执行", "archive": "打包",
                   "scan": "扫描", "rollback": "回退", "finalize": "清理事务备份", "clear": "清理",
                   "inspect_recovery": "检查恢复方案", "resolve": "保留现状结束事务",
-                  "restore": "恢复", "statistics": "统计", "catalog": "读取仓库列表", "analyze_deep": "完整内容校验"}
+                  "restore": "恢复", "statistics": "统计", "catalog": "读取仓库列表", "analyze_deep": "完整内容校验",
+                  "prepare_clear": "检查完成范围", "clear_all": "确认完成"}
         event = events.get(kind, kind or "任务")
         self._log_context = (feature, event, uuid.uuid4().hex)
         self._log("任务开始。")

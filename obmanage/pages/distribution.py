@@ -100,7 +100,7 @@ _STATUS_TEXT = {
     "prepared": "已准备，尚待恢复",
     "committing": "提交中断，请检查恢复方案",
     "commit_failed": "提交失败，请检查恢复方案",
-    "committed": "已同步，等待保留现状或回退",
+    "committed": "已同步，等待确认完成或确认回退",
     "failed": "部署失败，等待恢复",
     "prepare_failed": "准备失败，目标未提交",
     "cancelled": "已取消，目标未提交",
@@ -984,6 +984,10 @@ class DistributionPage(FeaturePage):
         state_dir = self.state_dir
         occupancy_override = not self.occupancy_confirm.isHidden() and self.occupancy_confirm.isChecked()
         target_paths = tuple(item.target_root for item in plan.targets)
+        selected_paths = self._selected_target_paths()
+        # Bind reopening to the user's whole selection, including unchanged
+        # targets; a batch must never turn into a series of editor launches.
+        auto_open_paths = selected_paths if len(selected_paths) == 1 else ()
         blocker = QSignalBlocker(self.confirm_checkbox)
         self.confirm_checkbox.setChecked(False)
         del blocker
@@ -997,15 +1001,15 @@ class DistributionPage(FeaturePage):
                 )
                 launch_errors = ()
                 opened_targets = 0
-                if result.success:
+                if result.success and auto_open_paths:
                     # Opening is separate from the committed transaction.
                     try:
                         launch_errors = open_vaults(
-                            tuple(dict.fromkeys(target_paths)), config_path=self.obsidian_config_path)
+                            auto_open_paths, config_path=self.obsidian_config_path)
                     except Exception as exc:
                         launch_errors = (f"无法打开仓库：{exc}",)
                     if not launch_errors:
-                        opened_targets = len(set(target_paths))
+                        opened_targets = 1
                 return ExecuteTaskResult(result, OpenVaultState(), launch_errors, opened_targets)
             open_state = self._read_open_state(cancel, progress, validate=False)
             open_targets = self._open_selected_targets(open_state, target_paths)
@@ -1319,7 +1323,7 @@ class DistributionPage(FeaturePage):
                     f"部署完成：提交 {result.committed_targets} 个目标。"
                     + (f"已请求在 Obsidian 中打开 {opened_targets} 个仓库。" if opened_targets else "")
                     + ("同步已完成，但打开仓库失败，请手动打开。" if launch_errors else "")
-                    + "请到事务处理页选择保留现状或回退。",
+                    + "请到事务处理页选择确认完成或确认回退。",
                     "warning" if launch_errors else "success",
                 )
             else:
@@ -1381,7 +1385,7 @@ class DistributionPage(FeaturePage):
         elif kind == "inspect_recovery":
             self.recovery_preview = payload
             self.recovery_details.setPlainText("\n\n".join(payload.details))
-            self.set_status("检查完成；请选择保留现状或回退。清理备份需单独确认。")
+            self.set_status("检查完成；请选择确认完成或确认回退。")
         elif kind in {"execute", "rollback", "finalize", "resolve"}:
             if kind == "execute":
                 self.open_state = payload.open_state
@@ -1563,10 +1567,10 @@ class ComSyncPage(DistributionPage):
         self.component_scope.setText(
             ".File 包含 .Templater 内容；Note、Attachment 只补齐目录，已有笔记和附件保留。")
         self.safety_hint.setText("选中配置和模板按来源完整同步，目标独有内容会进入删除预览。")
-        self.execute_button.setText("同步并打开")
         self.execute_button.setToolTip(
             "先退出所有 Obsidian 窗口；未及时退出时强制结束 Obsidian。"
-            "同步成功后仅请求打开本次所选仓库，请先保存正在编辑的内容。")
+            "仅选一个目标仓库时，同步成功后请求打开该仓库；选择多个时不自动打开。"
+            "请先保存正在编辑的内容。")
         self.preview_table.setColumnHidden(1, False)
         self.preview_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
         self.preview_table.setColumnWidth(1, 95)
@@ -1623,7 +1627,17 @@ class ComSyncPage(DistributionPage):
         first = next(i for i, vault in enumerate(self.target_model.rows) if vault == latest[0])
         index = self.target_proxy.mapFromSource(self.target_model.index(first, 0))
         self.target_table.scrollTo(index)
-        self.set_status(f"已按创建时间选择最新的 {len(latest)} 个仓库；预览并同步后会自动打开。")
+        self.set_status(
+            f"已按创建时间选择最新的 {len(latest)} 个仓库；"
+            + ("同步成功后会自动打开。" if len(latest) == 1 else "多个目标同步后不自动打开。"))
+
+    def _reopen_hint(self) -> str:
+        selected_count = len(self._selected_target_paths())
+        if selected_count == 1:
+            return "成功后打开该仓库。"
+        if selected_count > 1:
+            return "多个目标同步后不自动打开。"
+        return "仅选一个目标时，成功后自动打开。"
 
     def _update_occupancy_display(self, *, reset_confirmation: bool = True,
                                   target_paths: Iterable[str] | None = None) -> None:
@@ -1633,9 +1647,9 @@ class ComSyncPage(DistributionPage):
         self.occupancy_confirm.hide()
         paths = tuple(target_paths) if target_paths is not None else self._selected_target_paths()
         opened = self._open_selected_targets(self.open_state, paths)
-        self.occupancy_status.setText(
-            f"{len(opened)} 个所选仓库标记为打开；同步时将自动关闭 Obsidian。"
-            if opened else "同步前自动退出 Obsidian，成功后打开所选仓库。")
+        close_hint = (f"{len(opened)} 个所选仓库标记为打开；同步时将自动关闭 Obsidian。"
+                      if opened else "同步前自动退出 Obsidian；")
+        self.occupancy_status.setText(close_hint + self._reopen_hint())
         self.occupancy_status.setToolTip(
             "关闭所有 Obsidian 窗口，必要时强制结束进程；请先保存编辑内容。\n"
             "保存的打开标记不再阻止同步，执行时核验实际进程已退出。")
@@ -1645,10 +1659,13 @@ class ComSyncPage(DistributionPage):
         if plan.needs_deploy:
             self.confirm_checkbox.setText(
                 self.confirm_checkbox.text().replace("确认同步所选组件到", "确认同步至") + "\n"
-                "允许退出 Obsidian（必要时强制结束全部窗口），成功后打开所选仓库。")
+                "允许退出 Obsidian（必要时强制结束全部窗口）；" + self._reopen_hint())
 
     def refresh_actions(self) -> None:
         super().refresh_actions()
+        if hasattr(self, "execute_button"):
+            self.execute_button.setText(
+                "同步并打开" if len(self._selected_target_paths()) == 1 else "同步所选")
         if hasattr(self, "component_boxes") and "templater" in self.component_boxes:
             self.component_boxes["templater"].setEnabled(
                 not self._global_busy and not self._task_active and not self.component_boxes["file"].isChecked())

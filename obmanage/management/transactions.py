@@ -1,5 +1,5 @@
 """Read-only preparation and explicit bulk removal of transaction copies/records."""
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import Event
 
@@ -29,6 +29,20 @@ class TransactionClearPreview:
 
 
 @dataclass(frozen=True)
+class TransactionCompletionPreview:
+    clear_preview: TransactionClearPreview
+    selected: RecoveryPreview | None = None
+
+    @property
+    def count(self) -> int:
+        return self.clear_preview.count
+
+    @property
+    def details(self) -> str:
+        return self.clear_preview.details
+
+
+@dataclass(frozen=True)
 class TransactionClearResult:
     removed: int
     total: int
@@ -47,6 +61,11 @@ def _check_cancel(cancel: Event) -> None:
 
 def inspect_transaction_clear(state_dir: Path, cancel: Event) -> TransactionClearPreview:
     """Freeze the complete eligible set before the one destructive confirmation."""
+    return _inspect_transaction_clear(state_dir, cancel, allow_cleanup_errors=False)
+
+
+def _inspect_transaction_clear(state_dir: Path, cancel: Event, *,
+                               allow_cleanup_errors: bool) -> TransactionClearPreview:
     deployment, trash = DeploymentEngine(state_dir), TrashCleanupEngine(state_dir)
     batches, operations = deployment.list_batches(), trash.list_operations()
     previews = []
@@ -57,7 +76,7 @@ def inspect_transaction_clear(state_dir: Path, cancel: Event) -> TransactionClea
             pending += 1
             continue
         preview = deployment.inspect_recovery(batch.batch_id)
-        if preview.cleanup_error:
+        if preview.cleanup_error and not allow_cleanup_errors:
             raise SyncError(f"事务 {batch.batch_id[:8]} 无法清理：{preview.cleanup_error}")
         previews.append(preview)
     quarantines = []
@@ -66,6 +85,73 @@ def inspect_transaction_clear(state_dir: Path, cancel: Event) -> TransactionClea
         quarantines.append(trash.inspect_clear(operation.operation_id, cancel=cancel))
     _check_cancel(cancel)
     return TransactionClearPreview(tuple(previews), tuple(quarantines), pending)
+
+
+def inspect_transaction_completion(
+        state_dir: Path, cancel: Event,
+        selected_deployment: RecoveryPreview | None = None) -> TransactionCompletionPreview:
+    """Freeze cleanup consent, optionally including one pending deployment."""
+    _check_cancel(cancel)
+    deployment = DeploymentEngine(state_dir)
+    if selected_deployment is not None:
+        selected_batch = deployment.get_batch(selected_deployment.batch_id)
+        if selected_batch.revision != selected_deployment.revision:
+            raise SyncError("所选事务在检查后已改变，请重新检查并确认。")
+    # An ended batch with unreadable/changed copies must not stop a different
+    # selected batch from ending. Its authenticated preview stays in the set,
+    # and clear_transaction will retain its copies/record and report the error.
+    # Journal authentication and quarantine inspection failures still raise.
+    clear_preview = _inspect_transaction_clear(state_dir, cancel, allow_cleanup_errors=True)
+    if selected_deployment is None:
+        return TransactionCompletionPreview(clear_preview)
+    _check_cancel(cancel)
+    selected_batch = deployment.get_batch(selected_deployment.batch_id)
+    if selected_batch.revision != selected_deployment.revision:
+        raise SyncError("所选事务在检查后已改变，请重新检查并确认。")
+    if selected_batch.status in TERMINAL_BATCH_STATUSES:
+        return TransactionCompletionPreview(clear_preview)
+    # A pending batch can be ended even when its copies are unsafe to remove.
+    # Keep that cleanup error in the frozen preview so execution retains the
+    # ended record and all unverified bytes instead of broadening consent.
+    clear_preview = replace(
+        clear_preview,
+        deployments=(selected_deployment, *clear_preview.deployments),
+        pending_deployments=clear_preview.pending_deployments - 1,
+    )
+    return TransactionCompletionPreview(clear_preview, selected_deployment)
+
+
+def complete_transactions(state_dir: Path, preview: TransactionCompletionPreview,
+                          cancel: Event) -> TransactionClearResult:
+    """End the selected batch and remove only the copies/records confirmed."""
+    if cancel.is_set():
+        return TransactionClearResult(0, preview.count, (), True)
+    clear_preview, selected = preview.clear_preview, preview.selected
+    if selected is not None:
+        deployment = DeploymentEngine(state_dir)
+        try:
+            batch = deployment.get_batch(selected.batch_id)
+            if (batch.revision != selected.revision
+                    or batch.status in TERMINAL_BATCH_STATUSES):
+                raise SyncError("所选事务在检查后已改变，请重新检查并确认。")
+            if cancel.is_set():
+                return TransactionClearResult(0, preview.count, (), True)
+            result = deployment.resolve(selected.batch_id, expected_revision=selected.revision)
+        except (OSError, ValueError, SyncError) as exc:
+            return TransactionClearResult(0, preview.count, (str(exc),))
+        if not result.success:
+            return TransactionClearResult(
+                0, preview.count, result.errors or ("所选事务未能结束。",)
+            )
+        # resolve performs exactly one authenticated journal update. Preserve
+        # every observed tree and require this one revision transition; never
+        # re-inspect/adopt a later state after the user's confirmation.
+        clear_preview = replace(clear_preview, deployments=tuple(
+            replace(item, revision=selected.revision + 1)
+            if item.batch_id == selected.batch_id else item
+            for item in clear_preview.deployments
+        ))
+    return clear_transactions(state_dir, clear_preview, cancel)
 
 
 def clear_transactions(state_dir: Path, preview: TransactionClearPreview,

@@ -942,12 +942,21 @@ def test_cancellation_during_sync_never_opens_targets(application, tmp_path, mon
         dispose(page)
 
 
-def test_multiple_components_open_each_selected_vault_once(application, tmp_path, monkeypatch):
+@pytest.mark.parametrize("selection", ["single", "batch", "batch_one_changed", "newest_tie"])
+def test_multiple_components_only_open_a_single_selected_vault(
+    application, tmp_path, monkeypatch, selection
+):
     root, source, first, _fake = create_config_fixture(tmp_path)
     second = root / "另一仓库"
-    (second / ".obsidian").mkdir(parents=True)
+    if selection != "single":
+        (second / ".obsidian").mkdir(parents=True)
     (source / ".claude").mkdir()
     (source / ".claude/settings.json").write_text("template")
+    if selection == "batch_one_changed":
+        for component in (".obsidian", ".claude"):
+            (second / component).mkdir(exist_ok=True)
+            for source_file in (source / component).iterdir():
+                (second / component / source_file.name).write_bytes(source_file.read_bytes())
     opened = []
     monkeypatch.setattr(distribution_page, "open_vaults", lambda paths, **_kwargs: opened.append(tuple(paths)) or ())
     page = ComSyncPage(tmp_path / "state", {"root": str(root), "source": str(source)}, str(root),
@@ -956,14 +965,28 @@ def test_multiple_components_open_each_selected_vault_once(application, tmp_path
     page.task_requested.connect(operations.append)
     try:
         page.component_boxes["claude"].setChecked(True)
-        run_last_operation(page, operations, page._start_catalog)
-        page.target_model.set_all_checked(True)
+        catalog = run_last_operation(page, operations, page._start_catalog)
+        if selection == "newest_tie":
+            page._accept_catalog(VaultCatalogResult(tuple(
+                DatedVault(vault.path, vault.name, created_ns=20) for vault in catalog.vaults
+            )))
+            page.latest_button.click()
+        else:
+            page.select_all_targets_button.click()
+        assert page.execute_button.text() == ("同步并打开" if selection == "single" else "同步所选")
         run_last_operation(page, operations, page._start_analyze)
-        assert len(page.plan.targets) == 4
+        assert len(page.plan.targets) == (2 if selection == "single" else 4)
+        if selection == "batch_one_changed":
+            assert {item.target_root for item in page.plan.targets if item.needs_deploy} == {str(first)}
+        assert ("成功后打开该仓库" if selection == "single" else "多个目标同步后不自动打开") in page.confirm_checkbox.text()
         page.confirm_checkbox.setChecked(True)
         assert run_last_operation(page, operations, page._start_execute).success
-        assert len(opened) == 1 and len(opened[0]) == 2
-        assert set(opened[0]) == {str(first), str(second)}
+        assert opened == ([(str(first),)] if selection == "single" else [])
+        assert snapshot_tree(first / ".obsidian") == snapshot_tree(source / ".obsidian")
+        assert snapshot_tree(first / ".claude") == snapshot_tree(source / ".claude")
+        if selection != "single":
+            assert snapshot_tree(second / ".obsidian") == snapshot_tree(source / ".obsidian")
+            assert snapshot_tree(second / ".claude") == snapshot_tree(source / ".claude")
     finally:
         dispose(page)
 
@@ -1006,6 +1029,8 @@ def test_newest_selection_uses_creation_time_excludes_source_and_replaces_hidden
         page.confirm_checkbox.setChecked(True)
         page.latest_button.click()
         assert {v.name for v in page.target_model.checked_vaults()} == {"new", "tie"}
+        assert "多个目标同步后不自动打开" in page.status_label.text()
+        assert page.execute_button.text() == "同步所选"
         assert page.target_filter.text() == ""
         assert page.plan is None and not page.confirm_checkbox.isChecked()
         assert page.target_model.index(1, 3).data()

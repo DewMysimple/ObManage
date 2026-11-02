@@ -1,4 +1,4 @@
-"""One transaction list, state-specific recovery, and combined copy/record deletion."""
+"""One transaction list with completion and rollback actions."""
 from pathlib import Path
 
 from PySide6.QtCore import QSignalBlocker, QTimer, Qt
@@ -7,14 +7,14 @@ from PySide6.QtWidgets import QComboBox, QHBoxLayout, QLabel, QMessageBox, QPush
 from .common import FeaturePage, format_bytes, panel
 from .controls import DropDownCombo
 from ..management.deployment import TERMINAL_BATCH_STATUSES
-from ..management.transactions import clear_transactions, inspect_transaction_clear
+from ..management.transactions import complete_transactions, inspect_transaction_completion
 
 
 class TransactionsPage(FeaturePage):
     page_key = "transactions"
 
     def __init__(self, state_dir: Path, distribution, trash):
-        super().__init__("事务处理", "选择事务可恢复；清除会一次处理全部可清理事务的副本和记录。")
+        super().__init__("事务处理", "确认完成会保留仓库现状并清理事务副本和记录；确认回退会恢复旧内容。")
         self.state_dir = state_dir
         self.owners = (distribution, trash)
         self.distribution = distribution
@@ -68,16 +68,18 @@ class TransactionsPage(FeaturePage):
         distribution.recovery_details_expanded = False
 
         actions = QHBoxLayout()
-        for button in (distribution.resolve_button, distribution.rollback_button, trash.restore_button):
-            actions.addWidget(button)
-        self.clear_button = QPushButton("清除全部副本和记录")
+        self.clear_button = QPushButton("确认完成")
         self.clear_button.setObjectName("Danger")
         actions.addWidget(self.clear_button)
+        distribution.resolve_button.hide()
+        for button in (distribution.rollback_button, trash.restore_button):
+            button.setText("确认回退")
+            actions.addWidget(button)
         layout.addLayout(actions)
-        distribution.resolve_button.clicked.disconnect(distribution._start_resolve)
-        distribution.resolve_button.clicked.connect(self._resolve)
         distribution.rollback_button.clicked.disconnect(distribution._start_rollback)
         distribution.rollback_button.clicked.connect(self._rollback)
+        trash.restore_button.clicked.disconnect(trash._start_restore)
+        trash.restore_button.clicked.connect(self._restore)
         self.clear_button.clicked.connect(self._clear)
         self.selector.currentIndexChanged.connect(self._selection_changed)
         distribution.batch_selector.currentIndexChanged.connect(
@@ -207,14 +209,14 @@ class TransactionsPage(FeaturePage):
             self._task_kind = ""
             if status == "ok" and self._clear_revision == self._confirmation_revision:
                 self._clear_preview = payload
-                self.set_status("检查完成，等待清除确认。")
+                self.set_status("检查完成，等待确认完成。")
                 self._clear_confirm_timer.start(0)
             else:
                 self._clear_preview = None
                 if status == "ok":
-                    self.set_status("页面已变化，清除已取消。")
+                    self.set_status("页面已变化，确认完成已取消。")
                 elif status == "error":
-                    self.set_status("清除检查未通过：" + str(payload), "error")
+                    self.set_status("完成检查未通过：" + str(payload), "error")
                     self.refresh_records()
             self.refresh_actions()
             return
@@ -227,8 +229,8 @@ class TransactionsPage(FeaturePage):
             else:
                 self.set_status(owner.status_label.text(), owner._status_kind)
         elif status == "ok":
-            self.set_status(f"已清除 {payload.removed} 条事务的全部副本和记录。" if payload.success else
-                            f"清除未完成：已清除 {payload.removed}/{payload.total} 条；"
+            self.set_status(f"已完成：已清除 {payload.removed} 条事务的全部副本和记录。" if payload.success else
+                            f"完成处理未全部结束：已清除 {payload.removed}/{payload.total} 条；"
                             "剩余记录保留供重试。" + ("操作已取消。" if payload.cancelled else "")
                             + "；".join(payload.errors),
                             "success" if payload.success else "error")
@@ -257,29 +259,39 @@ class TransactionsPage(FeaturePage):
         finally:
             dialog.deleteLater()
 
-    def _resolve(self):
-        if self._selected_kind() == "deploy" and self.distribution.resolve_button.isEnabled():
-            self.distribution._start_resolve(confirmed=True)
-
     def _rollback(self):
         owner = self.distribution
         preview = owner.recovery_preview
         revision = self._confirmation_revision
         if self._selected_kind() != "deploy" or not owner.rollback_button.isEnabled() or preview is None:
             return
-        if not self._confirm("保全内容后回退", "将恢复所选事务涉及的子树，当前内容先保全为副本。\n"
+        if not self._confirm("确认回退", "将恢复所选事务涉及的子树，当前内容先保全为副本。\n"
                              "请关闭目标 Obsidian 仓库。", "\n\n".join(preview.details)):
             return
         if (revision == self._confirmation_revision and owner.recovery_preview is preview
                 and owner.rollback_button.isEnabled()):
             owner._start_rollback(confirmed=True)
 
+    def _restore(self):
+        owner = self.owners[1]
+        operation = owner.current_operation
+        revision = self._confirmation_revision
+        if self._selected_kind() != "trash" or not owner.restore_button.isEnabled() or operation is None:
+            return
+        if not self._confirm("确认回退", "将所选事务的隔离内容恢复到对应的空 .trash，保留恢复副本。",
+                             self._trash_details(operation)):
+            return
+        if (revision == self._confirmation_revision and owner.current_operation is operation
+                and owner.restore_button.isEnabled()):
+            owner._start_restore()
+
     def _clear(self):
         if not self.clear_button.isEnabled():
             return
         self._clear_revision = self._confirmation_revision
+        selected = self.distribution.recovery_preview if self._selected_kind() == "deploy" else None
         self.start_task("prepare_clear", lambda cancel, _progress:
-                        inspect_transaction_clear(self.state_dir, cancel))
+                        inspect_transaction_completion(self.state_dir, cancel, selected_deployment=selected))
 
     def _confirm_clear(self):
         preview = self._clear_preview
@@ -289,30 +301,35 @@ class TransactionsPage(FeaturePage):
                 or self._global_busy or self._task_active):
             return
         if not preview.count:
-            self.set_status("没有可清理事务；待处理部署请先保留现状结束或回退。")
+            self.set_status("没有可完成的事务。")
             self.refresh_records()
             return
-        trees = [tree for item in preview.deployments for tree in item.cleanup_trees]
-        files = sum(len(tree.files) for tree in trees) + sum(p.file_count for p in preview.quarantines)
+        clear_preview = preview.clear_preview
+        trees = [tree for item in clear_preview.deployments for tree in item.cleanup_trees]
+        files = sum(len(tree.files) for tree in trees) + sum(p.file_count for p in clear_preview.quarantines)
         directories = (sum(len(tree.entries) - len(tree.files) + 1 for tree in trees)
-                       + sum(p.dir_count for p in preview.quarantines))
-        size = sum(tree.total_bytes for tree in trees) + sum(p.total_bytes for p in preview.quarantines)
-        pending = (f"\n另有 {preview.pending_deployments} 条待处理部署，需先结束或回退。"
-                   if preview.pending_deployments else "")
-        confirmed = self._confirm("清除全部副本和记录",
-                                  f"永久清除全部 {preview.count} 条可清理事务的副本、目录及路径记录。\n"
+                       + sum(p.dir_count for p in clear_preview.quarantines))
+        size = sum(tree.total_bytes for tree in trees) + sum(p.total_bytes for p in clear_preview.quarantines)
+        pending = (f"\n其他 {clear_preview.pending_deployments} 条待处理部署仍需分别确认完成或回退。"
+                   if clear_preview.pending_deployments else "")
+        cleanup_warning = ("\n部分事务副本暂无法安全清理；未删除的副本和记录保留供重试。"
+                           if any(item.cleanup_error for item in clear_preview.deployments) else "")
+        confirmed = self._confirm("确认完成",
+                                  f"保留当前仓库，永久清除本批全部 {preview.count} 条事务的副本、目录及路径记录。\n"
                                   + f"{files} 个文件 · {directories} 个目录 · {format_bytes(size)}"
-                                  + "\n当前仓库保持不变；删除后不可恢复。" + pending, preview.details)
+                                  + "\n删除副本后无法再回退。" + pending + cleanup_warning, preview.details)
         if (confirmed and revision == self._confirmation_revision
                 and not self._global_busy and not self._task_active):
             self.start_task("clear_all", lambda cancel, _progress:
-                            clear_transactions(self.state_dir, preview, cancel))
+                            complete_transactions(self.state_dir, preview, cancel))
         else:
-            self.set_status("清除已取消。")
+            self.set_status("确认完成已取消。")
             self.refresh_actions()
 
     @staticmethod
     def _copy_summary(preview):
+        if preview.cleanup_error:
+            return "副本数量未能完整核验；可查看路径与副本。"
         trees = preview.cleanup_trees
         files = sum(len(tree.files) for tree in trees)
         directories = sum(len(tree.entries) - len(tree.files) + 1 for tree in trees)
@@ -341,19 +358,17 @@ class TransactionsPage(FeaturePage):
         operation = trash.current_operation if kind == "trash" else None
         available = not self._global_busy and not self._task_active
         ended = kind == "deploy" and batch is not None and batch.status in TERMINAL_BATCH_STATUSES
-        clearable = bool(trash._operations) or any(
-            item.status in TERMINAL_BATCH_STATUSES for item in owner._batches)
+        clearable = bool(trash._operations) or bool(owner._batches)
         inspected = (kind == "deploy" and preview is not None and batch is not None
                      and preview.batch_id == batch.batch_id and preview.revision == batch.revision)
-        owner.resolve_button.setVisible(kind == "deploy" and not ended and inspected)
-        owner.rollback_button.setVisible(kind == "deploy" and not ended and inspected)
-        trash.restore_button.setVisible(operation is not None and trash._selected_operation_pending())
+        owner.resolve_button.hide()
+        owner.rollback_button.setVisible(kind == "deploy")
+        trash.restore_button.setVisible(kind == "trash")
         self.clear_button.setVisible(clearable)
         self.clear_button.setEnabled(available and clearable and self._clear_preview is None
                                      and not owner._recovery_blocked and not trash._recovery_blocked
-                                     and (kind != "deploy" or inspected)
-                                     and not (inspected and preview.cleanup_error))
-        self.clear_button.setToolTip("一次清除全部已结束部署和隔离事务的副本及记录。")
+                                     and (kind != "deploy" or inspected))
+        self.clear_button.setToolTip("保留当前仓库；确认一次结束所选事务，并清除全部可清理事务的副本和记录。")
         self.details_button.setVisible(inspected or operation is not None)
         self.details_button.setEnabled(available)
         self.details.setVisible((inspected or operation is not None) and self.details_button.isChecked())
@@ -361,18 +376,19 @@ class TransactionsPage(FeaturePage):
             self.summary.setText("正在自动检查…" if self._inspection_pending or self._task_active else
                                  "检查未完成，点击刷新重试。")
         elif inspected:
-            text = (("事务已结束，可清除副本和记录；当前仓库保持不变。\n" if ended else
-                     "保留现状会结束本事务并保留全部副本，不代表同步完整成功；也可保全后回退。\n")
+            text = (("确认完成将清除副本和记录，当前仓库保持不变。\n" if ended else
+                     "确认完成将保留仓库现状并清理副本和记录；确认回退将恢复旧内容。\n")
                     + self._copy_summary(preview))
             if preview.cleanup_error:
-                text += "\n副本无法验证，暂不可清除；可查看详情。"
+                text += ("\n副本无法验证；确认完成仍可处理其他事务，未清理的副本和记录保留供重试。" if ended else
+                         "\n副本无法验证；确认完成可结束事务，未清理的副本和记录保留供重试。")
             if not ended and preview.rollback_error:
                 text += "\n暂不可回退：" + preview.rollback_error
             self.summary.setText(text)
         elif operation is not None:
-            self.summary.setText(("可恢复至空 .trash，或清除副本和记录。\n"
+            self.summary.setText(("确认回退将恢复至空 .trash；确认完成将清理副本和记录。\n"
                                   if trash.restore_button.isEnabled() else
-                                  "可清除副本和记录；当前仓库保持不变。\n") + self._trash_summary(operation))
+                                  "确认完成将清理副本和记录，当前仓库保持不变。\n") + self._trash_summary(operation))
         else:
             self.summary.clear()
         errors = [controller.batch_status.text() if controller is owner else controller.operation_status.text()

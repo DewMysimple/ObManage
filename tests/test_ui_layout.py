@@ -77,7 +77,13 @@ def test_recovery_workbench_is_readable_and_actions_reachable(application, tmp_p
         assert page.inspect_button.isHidden()
         assert page.resolve_confirm.isHidden()
         assert page.preserve_confirm.isHidden()
-        for control in (transactions.details_button, page.resolve_button, page.rollback_button):
+        assert page.resolve_button.isHidden()
+        assert transactions.clear_button.text() == "确认完成"
+        assert page.rollback_button.text() == "确认回退"
+        assert transactions.clear_button.isVisible()
+        assert page.rollback_button.isVisible()
+        assert window.pages["trash_cleanup"].restore_button.isHidden()
+        for control in (transactions.details_button, transactions.clear_button, page.rollback_button):
             scroll.ensureWidgetVisible(control)
             settle(application)
             position = control.mapTo(scroll.viewport(), QPoint())
@@ -430,6 +436,10 @@ def test_legacy_trash_recovery_actions_fit_and_are_scroll_reachable(
         page = window.pages["trash_cleanup"]
         settle(application)
         assert page.legacy_recovery_panel.isHidden()
+        assert page.restore_button.text() == "确认回退"
+        assert window.pages["transactions"].clear_button.text() == "确认完成"
+        assert window.pages["comsync"].resolve_button.isHidden()
+        assert window.pages["comsync"].rollback_button.isHidden()
         assert scroll.horizontalScrollBar().maximum() == 0
         for control in (page.restore_button, window.pages["transactions"].clear_button):
             scroll.ensureWidgetVisible(control)

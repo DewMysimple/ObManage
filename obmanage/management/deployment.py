@@ -515,6 +515,14 @@ def _same_or_contains(first: str, second: str) -> bool:
         return False
 
 
+def _path_keys_overlap(first_key: str, second_key: str) -> bool:
+    """Compare already normalized paths without repeating canonicalization."""
+    try:
+        return os.path.commonpath((first_key, second_key)) in (first_key, second_key)
+    except ValueError:
+        return False
+
+
 def _find_case_child(parent: str, name: str) -> str | None:
     """Find one Windows-equivalent child and reject ambiguous case aliases."""
     try:
@@ -1115,16 +1123,20 @@ class DeploymentEngine:
                 source_authorization_roots.append(source_authorization_root)
                 target_roots.append(target_root)
                 logical_targets.append(desired_target)
-            self._check_state_location(
-                (*source_paths, *source_authorization_roots), target_roots
-            )
-            for index, target_path in enumerate(logical_targets):
-                for source_root in (*source_paths, *source_authorization_roots):
-                    if (_same_or_contains(source_root, target_path)
-                            or _same_or_contains(target_path, source_root)):
+            # Each source appears once per selected target/component. Keep the
+            # same bidirectional boundary checks, but normalize it only once
+            # instead of repeating filesystem-independent work for every pair.
+            source_roots = tuple(dict.fromkeys((*source_paths, *source_authorization_roots)))
+            self._check_state_location(source_roots, dict.fromkeys(target_roots))
+            source_keys = {_path_key(root) for root in source_roots}
+            target_keys = tuple(_path_key(path) for path in logical_targets)
+            for index, target_key in enumerate(target_keys):
+                _cancelled(cancel)
+                for source_key in source_keys:
+                    if _path_keys_overlap(source_key, target_key):
                         raise DeploymentError("组件来源与任一限定目标不能相同或互相包含。")
-                for other in logical_targets[index + 1:]:
-                    if _same_or_contains(target_path, other) or _same_or_contains(other, target_path):
+                for other_key in target_keys[index + 1:]:
+                    if _path_keys_overlap(target_key, other_key):
                         raise DeploymentError("多个限定目标不能相同或互相包含。")
             source_cache: dict[str, FrozenTree] = {}
             target_plans: list[DeploymentTargetPlan] = []
