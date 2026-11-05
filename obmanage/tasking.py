@@ -8,6 +8,7 @@ from typing import Any, Callable
 from PySide6.QtCore import QThread, Signal, Slot
 
 from .models import Progress, SyncCancelled
+from .scanning.metrics import scan_task, outcome
 
 
 FeatureOperation = Callable[[threading.Event, Callable[[Progress], None]], Any]
@@ -42,11 +43,14 @@ class FeatureWorker(QThread):
             self.progress.emit(event)
 
     @Slot()
+    @scan_task("management_task")
     def run(self) -> None:
         try:
             value = self.operation(self.cancel_event, self._progress)
             self.completed.emit(("ok", value))
         except SyncCancelled:
+            outcome("cancelled")
             self.completed.emit(("cancelled", None))
         except Exception as exc:
+            outcome("failed")
             self.completed.emit(("error", f"{type(exc).__name__}: {exc}"))

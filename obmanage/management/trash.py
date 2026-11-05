@@ -9,6 +9,9 @@ changed; new cleanup operations never create backups or journals.
 """
 from __future__ import annotations
 
+from ..scanning.io import scandir
+from ..scanning.metrics import measured, scan_task
+
 import hashlib
 import hmac
 import json
@@ -337,6 +340,7 @@ def _directory_digest(children: list[tuple[str, str, int, str]]) -> str:
     return digest.hexdigest()
 
 
+@measured("trash_tree")
 def _scan_content(root: str, cancel: Event | None = None,
                   progress: ProgressCallback = None, vault_root: str = "") -> tuple[tuple[TrashEntry, ...], str]:
     root = canonical(root)
@@ -349,7 +353,7 @@ def _scan_content(root: str, cancel: Event | None = None,
         _check_cancel(cancel)
         directory_before = _read_snapshot(directory, "dir")
         try:
-            with os.scandir(native(directory)) as iterator:
+            with scandir(native(directory)) as iterator:
                 names = sorted((entry.name for entry in iterator), key=lambda value: (value.casefold(), value))
         except OSError as exc:
             raise TrashSafetyError(f"无法扫描回收站目录：{directory}（{exc}）") from exc
@@ -701,7 +705,7 @@ def _copy_entries(source_root: str, destination_root: str, entries: tuple[TrashE
         if _read_snapshot(destination_root, "dir").kind != "dir":
             raise TrashSafetyError(f"恢复目标不是目录：{destination_root}")
         try:
-            with os.scandir(native(destination_root)) as iterator:
+            with scandir(native(destination_root)) as iterator:
                 if next(iterator, None) is not None:
                     raise TrashSafetyError(f"恢复目标已有内容，拒绝覆盖：{destination_root}")
         except OSError as exc:
@@ -838,7 +842,7 @@ def _clear_preview(preview: TrashVaultPreview, cancel: Event | None,
         message = "回收站已清空并保留目录。" if not failures else "部分项目未能移除；已删除的项目无法恢复。"
 
     try:
-        remaining = tuple(os.scandir(native(preview.trash_path)))
+        remaining = tuple(scandir(native(preview.trash_path)))
     except OSError as exc:
         failures.append(TrashFailure(preview.vault_root, preview.trash_path, "verify", str(exc)))
         if status == "success":
@@ -969,6 +973,7 @@ class TrashCleanupEngine:
         lock = _StateFileLock(self._lock_path)
         return lock if lock.acquire() else None
 
+    @scan_task("trash")
     def analyze(self, vault_roots: Iterable[str | Path], *, cancel: Event | None = None,
                 progress: ProgressCallback = None) -> TrashPlan:
         if not _TRASH_TASK_LOCK.acquire(blocking=False):
@@ -1065,7 +1070,7 @@ class TrashCleanupEngine:
             _read_snapshot(directory, "dir")
             assert_plain_chain(directory)
             try:
-                with os.scandir(native(directory)) as iterator:
+                with scandir(native(directory)) as iterator:
                     if next(iterator, None) is not None:
                         return True
             except OSError as exc:
@@ -1311,7 +1316,7 @@ class TrashCleanupEngine:
             current = _read_snapshot(operation_root, "dir")
             if not _same_identity(current, operation_anchor):
                 return
-            with os.scandir(native(operation_root)) as iterator:
+            with scandir(native(operation_root)) as iterator:
                 if next(iterator, None) is not None:
                     return
             os.rmdir(native(operation_root))
@@ -1328,7 +1333,7 @@ class TrashCleanupEngine:
         current = _read_snapshot(path, "dir")
         if not _same_identity(current, expected):
             raise TrashSafetyError("隔离操作根目录已被替换，拒绝移除。")
-        with os.scandir(native(path)) as iterator:
+        with scandir(native(path)) as iterator:
             if next(iterator, None) is not None:
                 raise TrashSafetyError("全部备份已清理，但操作根目录仍含未知项目。")
         os.rmdir(native(path))
@@ -1360,7 +1365,7 @@ class TrashCleanupEngine:
         assert_plain_chain(self._backup_base)
         _read_snapshot(self._backup_base, "dir")
         try:
-            with os.scandir(native(self._backup_base)) as iterator:
+            with scandir(native(self._backup_base)) as iterator:
                 names = sorted(entry.name for entry in iterator)
         except OSError as exc:
             raise TrashSafetyError(f"无法枚举旧版隔离备份：{exc}") from exc
@@ -1384,7 +1389,7 @@ class TrashCleanupEngine:
             assert_plain_chain(self._journal_base)
             _read_snapshot(self._journal_base, "dir")
             try:
-                with os.scandir(native(self._journal_base)) as iterator:
+                with scandir(native(self._journal_base)) as iterator:
                     journal_names = sorted(entry.name for entry in iterator)
             except OSError as exc:
                 raise TrashSafetyError(f"无法枚举隔离记录：{exc}") from exc
@@ -1981,7 +1986,7 @@ class TrashCleanupEngine:
             if int(value["freed_bytes"]) > preview.total_bytes - remaining:
                 raise TrashSafetyError("隔离备份出现已清理内容回流，拒绝继续。")
         if verified is not None:
-            with os.scandir(native(verified[0])) as iterator:
+            with scandir(native(verified[0])) as iterator:
                 if {entry.name for entry in iterator} != expected_names:
                     raise TrashSafetyError("隔离事务目录包含未知项目，拒绝清除。")
         return TrashClearPreview(self._operation_from_data(data),

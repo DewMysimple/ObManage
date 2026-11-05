@@ -8,7 +8,12 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable, Mapping
 
-from ..engine import SyncEngine
+from ..engine import SyncEngine, _require_manifest
+from ..scanning.metrics import scan_task, phase, count
+from ..scanning.session import ScanSession
+from ..scanning.collection import collect_collection
+from ..store import BaselineStore
+from contextlib import ExitStack
 from ..models import Progress, SyncCancelled, SyncError, SyncPlan, SyncResult
 from ..paths import (
     canonical, checked_child, revalidate_roots, snapshot,
@@ -112,11 +117,13 @@ class IncrementalEngine:
     def __init__(self, state_dir: str | Path):
         self.state_dir = Path(state_dir)
 
+    @scan_task("incremental")
     def analyze(self, local_root: str, portable_root: str, *, deep: bool = False,
                 cancel: threading.Event | None = None,
                 progress: ProgressCallback = None) -> IncrementalAnalysis:
         if not _TASK_LOCK.acquire(blocking=False):
             raise SyncError("已有仓库增量任务运行中。")
+        resources = ExitStack()
         try:
             started = time.monotonic()
             _cancelled(cancel)
@@ -125,8 +132,10 @@ class IncrementalEngine:
                 raise SyncError("请先选择已存在的移动硬盘仓库集合目录。")
             local_root, portable_root = context["source"], context["target"]
             validate_state_separation(self.state_dir, (local_root, portable_root))
-            catalogs = [discover_vaults(root, cancel=cancel, progress=progress)
-                        for root in (local_root, portable_root)]
+            session = resources.enter_context(ScanSession(cancel, capture=True))
+            collections = [collect_collection(root, session, progress=progress)
+                           for root in (local_root, portable_root)]
+            catalogs = [collection.catalog for collection in collections]
             issues = [f"{issue.path or ''}：{issue.message}"
                       for catalog in catalogs for issue in catalog.issues]
             indexed = []
@@ -139,10 +148,19 @@ class IncrementalEngine:
                         issues.append(f"对应路径存在歧义：{relative}")
                     paths[key] = (relative, vault.path)
                 indexed.append(paths)
-            engine = SyncEngine(self.state_dir)
+            all_pairs = []
             pairs = []
             identical = 0
             keys = sorted(indexed[0].keys() | indexed[1].keys())
+            count("vaults", len(keys))
+            # Discovery may run for minutes. Bind and recheck the physical
+            # state location immediately before opening the shared database.
+            state_dir = (validate_state_separation(self.state_dir, (local_root, portable_root))
+                         if keys else self.state_dir)
+            engine = SyncEngine(state_dir)
+            store = BaselineStore(state_dir) if keys else None
+            if store is not None:
+                resources.callback(store.close)
             for index, key in enumerate(keys):
                 _cancelled(cancel)
                 local, portable = indexed[0].get(key), indexed[1].get(key)
@@ -160,29 +178,78 @@ class IncrementalEngine:
                 def report(event: Progress) -> None:
                     if progress:
                         progress(replace(event, phase="incremental_scan",
-                                         message=f"{index + 1}/{len(keys)} · {relative} · {event.message}"))
+                                         message=f"{index + 1}/{len(keys)} · {relative} · {event.message}",
+                                         completed_files=index, total_files=len(keys)))
                 if not errors:
+                    local_view = collections[0].view(local_path) if local else session.manifest(local_path)
+                    portable_view = collections[1].view(portable_path) if portable else session.manifest(portable_path)
                     if local and portable:
-                        plans["local"], plans["portable"] = engine.analyze_pair(
-                            local_path, portable_path, deep=deep, cancel=cancel, progress=report)
+                        forward = engine._analyze(local_path, portable_path, deep=deep, cancel=cancel,
+                            progress=report, views=(local_view, portable_view), shared_store=store, defer_final=True)
+                        plans["local"], plans["portable"] = engine._reverse_plan(
+                            forward, cancel=cancel, defer_final=True)
                     else:
-                        side, source, target = (("local", local_path, portable_path) if local
-                                                else ("portable", portable_path, local_path))
-                        plans[side] = engine.analyze(source, target, deep=deep,
-                                                     cancel=cancel, progress=report)
+                        side, source, target, views = (("local", local_path, portable_path, (local_view, portable_view))
+                            if local else ("portable", portable_path, local_path, (portable_view, local_view)))
+                        plans[side] = engine._analyze(source, target, deep=deep, cancel=cancel,
+                            progress=report, views=views, shared_store=store, defer_final=True)
+                    for plan in plans.values():
+                        plan.context.pop("validated", None)
                     for plan in plans.values():
                         errors.extend(plan.errors)
                 pair = VaultPair(key, relative, local_path, portable_path,
                                  plans.get("local"), plans.get("portable"), tuple(errors))
-                if errors or any(plan.has_changes for plan in plans.values()):
-                    pairs.append(pair)
-                else:
-                    identical += 1
+                all_pairs.append(pair)
+            # Observe the real collection again after ALL comparisons. This also
+            # covers new/moved markers and nested boundaries outside vault views.
+            if progress:
+                progress(Progress("incremental_scan", "正在复核两端集合与完整清单",
+                                  completed_files=max(0, len(keys) - 1), total_files=len(keys)))
+            with phase("final_revalidation"), ScanSession(cancel, capture=True) as final_session:
+                final_collections = [collect_collection(root, final_session)
+                                     for root in (local_root, portable_root)]
+                for initial, final in zip(collections, final_collections):
+                    if initial.catalog_signature() != final.catalog_signature():
+                        issues.append("分析期间仓库集合、标记或扫描问题发生变化，请重新扫描。")
+                for pair in all_pairs:
+                    _cancelled(cancel)
+                    errors = list(pair.errors)
+                    for plan in (pair.local_plan, pair.portable_plan):
+                        if plan is None or plan.errors:
+                            continue
+                        try:
+                            for side, path, entries in (("源端", plan.source, plan.context["source_entries"]),
+                                                        ("目标端", plan.target, plan.context["target_entries"])):
+                                collection = final_collections[0] if path == pair.local_path else final_collections[1]
+                                key_path = os.path.normcase(path)
+                                # A missing target must remain missing, not become an
+                                # unrecognized ordinary directory during comparison.
+                                if key_path in collection.manifests:
+                                    view = collection.view(path).require_complete()
+                                else:
+                                    view = final_session.manifest(path).require_complete()
+                                    if view.root_state is not None:
+                                        raise SyncError("对应位置已出现非仓库目录，请重新扫描。")
+                                _require_manifest(entries, view.dictionaries()[0], root=path, side=side,
+                                    message="分析期间目录内容发生变化，请重新分析差异。")
+                            revalidate_roots(plan.context)
+                            plan.context["validated"] = True
+                        except (OSError, SyncError, ValueError) as exc:
+                            plan.errors.append(str(exc))
+                            errors.append(str(exc))
+                    pair = replace(pair, errors=tuple(dict.fromkeys(errors)))
+                    if errors or any(p.has_changes for p in (pair.local_plan, pair.portable_plan) if p):
+                        pairs.append(pair)
+                    else:
+                        identical += 1
             revalidate_roots(context)
             return IncrementalAnalysis(local_root, portable_root, tuple(pairs), identical,
                                        tuple(issues), context, time.monotonic() - started, deep)
         finally:
-            _TASK_LOCK.release()
+            try:
+                resources.close()
+            finally:
+                _TASK_LOCK.release()
 
     def _check_recovery(self) -> None:
         terminal = {"finalized", "rolled_back", "rolled_back_with_residuals",

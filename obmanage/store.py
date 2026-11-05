@@ -7,28 +7,36 @@ import os
 import sqlite3
 from pathlib import Path
 
+from .scanning.metrics import count, measured
+
 
 class BaselineStore:
+    @measured("sqlite_open")
     def __init__(self, state_dir: str | Path):
+        count("sqlite_connections")
         directory = Path(state_dir)
         directory.mkdir(parents=True, exist_ok=True)
         self.connection = sqlite3.connect(directory / "baselines.sqlite3", timeout=30)
-        self.connection.execute("PRAGMA journal_mode=WAL")
-        self.connection.execute("PRAGMA synchronous=NORMAL")
-        self._paths_by_pair: dict[str, dict[str, set[str]]] = {}
-        self.connection.executescript("""
-            CREATE TABLE IF NOT EXISTS baselines (
-                pair_id TEXT NOT NULL, relative_path TEXT NOT NULL,
-                source_state TEXT NOT NULL, target_state TEXT NOT NULL,
-                digest TEXT NOT NULL,
-                PRIMARY KEY (pair_id, relative_path)
-            );
-            CREATE TABLE IF NOT EXISTS owned_temps (
-                path TEXT PRIMARY KEY, pair_id TEXT NOT NULL, identity TEXT NOT NULL
-            );
-        """)
-        self.connection.commit()
-        self._data_version = self.connection.execute("PRAGMA data_version").fetchone()[0]
+        try:
+            self.connection.execute("PRAGMA journal_mode=WAL")
+            self.connection.execute("PRAGMA synchronous=NORMAL")
+            self._paths_by_pair: dict[str, dict[str, set[str]]] = {}
+            self.connection.executescript("""
+                CREATE TABLE IF NOT EXISTS baselines (
+                    pair_id TEXT NOT NULL, relative_path TEXT NOT NULL,
+                    source_state TEXT NOT NULL, target_state TEXT NOT NULL,
+                    digest TEXT NOT NULL,
+                    PRIMARY KEY (pair_id, relative_path)
+                );
+                CREATE TABLE IF NOT EXISTS owned_temps (
+                    path TEXT PRIMARY KEY, pair_id TEXT NOT NULL, identity TEXT NOT NULL
+                );
+            """)
+            self.connection.commit()
+            self._data_version = self.connection.execute("PRAGMA data_version").fetchone()[0]
+        except BaseException:
+            self.connection.close()
+            raise
 
     @staticmethod
     def _relative_key(path: str) -> str:
@@ -71,6 +79,7 @@ class BaselineStore:
     def close(self) -> None:
         self.connection.close()
 
+    @measured("sqlite_read")
     def records(self, pair_id: str) -> dict[str, tuple[dict, dict, str]]:
         self._refresh_external_changes()
         rows = list(self.connection.execute(
@@ -84,6 +93,7 @@ class BaselineStore:
         return {path: (json.loads(src), json.loads(dst), digest)
                 for path, src, dst, digest in rows}
 
+    @measured("sqlite_write")
     def save(self, pair_id: str, path: str, source: dict, target: dict, digest: str) -> None:
         relative_key = self._relative_key(path)
         with self._write_transaction():
@@ -106,6 +116,7 @@ class BaselineStore:
         # Commit each verified file: cancellation or a crash must not discard
         # previously completed first-adoption hash work.
 
+    @measured("sqlite_write")
     def invalidate(self, records: list[tuple[str, str]]) -> None:
         """Atomically remove equivalence claims, including case-only aliases."""
         requested = {(pair_id, self._relative_key(path)) for pair_id, path in records}

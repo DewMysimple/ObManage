@@ -9,6 +9,9 @@ persistent journal.
 """
 from __future__ import annotations
 
+from ..scanning.io import scandir
+from ..scanning.metrics import measured, scan_task
+
 import hashlib
 import json
 import os
@@ -526,7 +529,7 @@ def _path_keys_overlap(first_key: str, second_key: str) -> bool:
 def _find_case_child(parent: str, name: str) -> str | None:
     """Find one Windows-equivalent child and reject ambiguous case aliases."""
     try:
-        with os.scandir(native(parent)) as iterator:
+        with scandir(native(parent)) as iterator:
             matches = [entry.name for entry in iterator if entry.name.casefold() == name.casefold()]
     except OSError as exc:
         raise DeploymentError(f"无法检查目录路径：{parent}（{exc}）") from exc
@@ -653,6 +656,7 @@ def _hash_file(path: str, expected: EntrySnapshot,
     return digest
 
 
+@measured("deployment_tree")
 def _scan_tree(root: str, cancel: threading.Event | None,
                progress: ProgressCallback = None, *, hash_files: bool = True,
                progress_values: dict[str, Any] | None = None) -> FrozenTree:
@@ -676,7 +680,7 @@ def _scan_tree(root: str, cancel: threading.Event | None,
         if folder_before is None or folder_before.kind != "dir":
             raise DeploymentError(f"扫描期间目录被移除或替换：{folder}")
         try:
-            with os.scandir(native(folder)) as iterator:
+            with scandir(native(folder)) as iterator:
                 entries = sorted(tuple(iterator), key=lambda item: (item.name.casefold(), item.name))
         except OSError as exc:
             raise DeploymentError(f"无法完整扫描目录：{folder}（{exc}）") from exc
@@ -727,7 +731,7 @@ def _scan_tree(root: str, cancel: threading.Event | None,
         if not _directory_guard_matches(final_before, expected_folder):
             raise DeploymentError(f"扫描期间目录发生变化：{folder}")
         try:
-            with os.scandir(native(folder)) as iterator:
+            with scandir(native(folder)) as iterator:
                 final_entries = sorted(
                     tuple(iterator), key=lambda item: (item.name.casefold(), item.name)
                 )
@@ -1070,6 +1074,7 @@ class DeploymentEngine:
             if _same_or_contains(root, self.state_dir) or _same_or_contains(self.state_dir, root):
                 raise DeploymentError("部署事务状态目录必须与来源和目标仓库分离。")
 
+    @scan_task("deployment")
     def analyze(self, request: DeploymentRequest, cancel: threading.Event | None = None,
                 progress: ProgressCallback = None) -> DeploymentPlan:
         if not self._lock.acquire(blocking=False):

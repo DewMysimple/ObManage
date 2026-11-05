@@ -5,6 +5,9 @@ when it contains a real, readable, ordinary ``.obsidian`` directory.
 """
 from __future__ import annotations
 
+from ..scanning.io import scandir
+from ..scanning.metrics import measured, scan_task
+
 import json
 import os
 import stat
@@ -13,6 +16,7 @@ from pathlib import Path
 from threading import Event
 
 from ..models import Progress, SyncCancelled, SyncError
+from ..scanning.session import ScanSession, ScanPathError
 from ..paths import assert_plain_chain, canonical, is_reparse, native, snapshot
 from .models import ManagementIssue, OpenedVaultCandidates, VaultCatalogResult, VaultInfo
 
@@ -92,7 +96,7 @@ def _marker_state(directory: str) -> tuple[str, ManagementIssue | None]:
         assert_plain_chain(marker)
         # Opening the directory is intentional: a marker that merely has readable
         # metadata but cannot be enumerated is not a usable vault marker.
-        with os.scandir(native(marker)):
+        with scandir(native(marker)):
             pass
     except (OSError, SyncError) as exc:
         return "unreadable", ManagementIssue(
@@ -297,7 +301,8 @@ def _read_vault_candidates(
     return OpenedVaultCandidates(paths=paths, issues=tuple(sorted(issues, key=_issue_sort_key)))
 
 
-def discover_vaults(
+@measured("discovery")
+def _discover_vaults(
     roots: Iterable[str | Path] | str | Path,
     *,
     include_opened: bool = False,
@@ -306,6 +311,7 @@ def discover_vaults(
     cancel: Event | None = None,
     progress: ProgressCallback | None = None,
     recursive: bool = True,
+    _session: ScanSession,
 ) -> VaultCatalogResult:
     """Discover unique physical vaults beneath one or more search roots."""
     root_values = _coerce_roots(roots)
@@ -337,78 +343,82 @@ def discover_vaults(
     while stack:
         _cancelled(cancel)
         current = stack.pop()
-        physical, issue = _physical_plain_directory(current)
-        if issue is not None:
-            issues.append(issue)
-            continue
-        assert physical is not None
+        # Prepared roots are physical paths. Descendants use names returned by
+        # their physical parent, so they cannot introduce an 8.3 alias. The live
+        # chain and directory identity are checked by observe below; resolving
+        # the identical physical path again at every depth adds no protection.
+        physical = current
         key = _path_key(physical)
         if key in scanned:
             continue
         scanned.add(key)
         completed_dirs += 1
 
-        marker_status, marker_issue = _marker_state(physical)
+        observation = None
+        if recursive:
+            try:
+                observation = _session.observe(physical, full=False, snapshotter=snapshot)
+            except ScanPathError as exc:
+                issues.append(ManagementIssue(exc.code, str(exc), exc.path))
+                continue
+            except (OSError, SyncError) as exc:
+                issues.append(ManagementIssue("directory_unreadable", f"无法读取目录：{exc}", physical))
+        # Enumerated names avoid an absent-marker query for every ordinary folder.
+        # Exact registered roots keep the old narrow marker-only check.
+        candidate = observation is None or any(_same_name(e.name, ".obsidian") for e in observation.entries)
+        marker_status, marker_issue = _marker_state(physical) if candidate else ("absent", None)
+        _session.markers[key] = (marker_status, marker_issue)
         if marker_issue is not None:
             issues.append(marker_issue)
         if marker_status == "valid":
             found.setdefault(key, physical)
-
+            _session.vault_roots.add(key)
         if progress is not None:
-            progress(Progress(
-                phase="catalog",
-                message="正在发现 Obsidian 仓库",
-                relative_path=physical,
-                completed_files=completed_dirs,
-            ))
-
-        if not recursive:
+            progress(Progress(phase="catalog", message="正在发现 Obsidian 仓库",
+                              relative_path=physical, completed_files=completed_dirs))
+        if not recursive or observation is None:
             continue
-
-        try:
-            with os.scandir(native(physical)) as iterator:
-                entries = list(iterator)
-        except OSError as exc:
-            issues.append(ManagementIssue("directory_unreadable", f"无法读取目录：{exc}", physical))
-            continue
-
-        children: list[str] = []
-        for entry in entries:
+        _session.discovery_keys.add(key)
+        issues.extend(ManagementIssue(i.code, i.message, i.path) for i in observation.issues)
+        issues.extend(ManagementIssue("ambiguous_name", "存在 Windows 无法区分的大小写重名路径。",
+            os.path.join(physical, name)) for name in observation.name_conflicts())
+        if _session.capture and _session.inside_vault(physical):
+            try:
+                observation = _session.observe(physical, snapshotter=snapshot,
+                    chain_validated=True, folder_state=observation.state)
+            except (OSError, SyncError) as exc:
+                issues.append(ManagementIssue("directory_unreadable", f"无法读取目录：{exc}", physical))
+                continue
+        children = []
+        for entry in observation.entries:
             _cancelled(cancel)
             if _same_name(entry.name, ".obsidian"):
                 continue
-            if (marker_status in ("valid", "unreadable")
-                    and _same_name(entry.name, ".trash")):
-                # A vault's root trash contains deleted material, not active
-                # child vaults or safe deployment targets.
+            if marker_status in ("valid", "unreadable") and _same_name(entry.name, ".trash"):
                 continue
-            if any(entry.name.casefold().startswith(prefix)
-                   for prefix in _RESERVED_DIRECTORY_PREFIXES):
-                # Pending same-volume deployment stages/backups are internal
-                # transaction artifacts, never repository candidates.
+            if any(entry.name.casefold().startswith(prefix) for prefix in _RESERVED_DIRECTORY_PREFIXES):
                 continue
             child = canonical(os.path.join(physical, entry.name))
-            try:
-                state = entry.stat(follow_symlinks=False)
-            except FileNotFoundError:
-                issues.append(ManagementIssue(
-                    "path_changed", "路径在发现期间消失。", child, "warning"
-                ))
+            if entry.state is None:
                 continue
-            except OSError as exc:
-                issues.append(ManagementIssue("path_unreadable", f"无法检查路径：{exc}", child))
-                continue
-            if is_reparse(state):
-                issues.append(ManagementIssue(
-                    "unsafe_item", "已跳过链接、重解析点或特殊项。", child
-                ))
-            elif stat.S_ISDIR(state.st_mode):
+            if entry.state["kind"] == "dir":
                 children.append(child)
-            elif not stat.S_ISREG(state.st_mode):
-                issues.append(ManagementIssue(
-                    "unsafe_item", "已跳过链接、重解析点或特殊项。", child
-                ))
+            elif entry.state["kind"] != "file":
+                issues.append(ManagementIssue("unsafe_item", "已跳过链接、重解析点或特殊项。", child))
         stack.extend(reversed(sorted(children, key=_sort_key)))
 
     vaults = _with_parents(found.values())
     return VaultCatalogResult(vaults=vaults, issues=tuple(sorted(issues, key=_issue_sort_key)))
+
+
+@scan_task("catalog")
+def discover_vaults(roots, *, include_opened=False, obsidian_config_path=None,
+                    environ=None, cancel=None, progress=None, recursive=True,
+                    _session=None) -> VaultCatalogResult:
+    """Discover live roots; an optional task session shares initial observations."""
+    arguments = dict(include_opened=include_opened, obsidian_config_path=obsidian_config_path,
+                     environ=environ, cancel=cancel, progress=progress, recursive=recursive)
+    if _session is not None:
+        return _discover_vaults(roots, _session=_session, **arguments)
+    with ScanSession(cancel) as session:
+        return _discover_vaults(roots, _session=session, **arguments)

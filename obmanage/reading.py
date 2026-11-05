@@ -11,6 +11,7 @@ import time
 from typing import BinaryIO, Callable
 
 from .models import SyncError
+from .scanning.metrics import current, measured
 from .paths import assert_plain_chain, lexical_child_path, snapshot
 
 BUFFER_LIMIT = 4 * 1024 * 1024
@@ -55,10 +56,14 @@ def buffer_size(expected_size: int, limit: int = BUFFER_LIMIT) -> int:
     return min(limit, max(1, int(expected_size)))
 
 
+@measured("hash")
 def hash_stream(stream: BinaryIO, expected_size: int, *,
                 check_cancel: Callable[[], None],
                 progress: Callable[[int], None] | None = None) -> tuple[int, str]:
     """Read through EOF with bounded reusable storage, including short reads."""
+    metrics = current()
+    if metrics:
+        metrics.add("hash_files")
     buffer = bytearray(buffer_size(expected_size))
     view = memoryview(buffer)
     digest = hashlib.sha256()
@@ -70,6 +75,8 @@ def hash_stream(stream: BinaryIO, expected_size: int, *,
             break
         digest.update(view[:count])
         completed += count
+        if metrics:
+            metrics.add("hash_bytes", count)
         if progress is not None:
             progress(completed)
     return completed, digest.hexdigest()

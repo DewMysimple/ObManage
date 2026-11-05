@@ -6,6 +6,9 @@ have succeeded and the complete source has been scanned again.
 """
 from __future__ import annotations
 
+from .scanning.io import scandir
+from .scanning.metrics import count, measured, scan_task
+
 import hashlib
 import json
 import os
@@ -17,6 +20,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import FIRST_EXCEPTION, Future, ThreadPoolExecutor, TimeoutError, wait
+from contextvars import copy_context
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
@@ -111,6 +115,7 @@ def _require_manifest(expected: dict[str, dict], current: dict[str, dict], *,
         + "。这是路径或元数据变化，不代表已确认正文变化；请停止相关编辑或自动写入后重新扫描。")
 
 
+@measured("inventory")
 def _scan(root: str, cancel: threading.Event | None, progress: ProgressCallback, *,
           mode: str = SYNC_MODE_MIRROR) -> tuple[dict[str, dict], dict[str, dict]]:
     if mode not in _SYNC_MODES:
@@ -129,7 +134,7 @@ def _scan(root: str, cancel: threading.Event | None, progress: ProgressCallback,
         folder, prefix = stack.pop()
         assert_plain_chain(folder)
         try:
-            with os.scandir(native(folder)) as iterator:
+            with scandir(native(folder)) as iterator:
                 for entry in iterator:
                     _cancelled(cancel)
                     relative = prefix + entry.name
@@ -306,11 +311,11 @@ def _hash_pair(source_path: str, source_expected: dict,
         futures: list[Future[str]] = []
         try:
             futures.append(executor.submit(
-                _hash_file, source_path, source_expected, worker_cancel,
+                copy_context().run, _hash_file, source_path, source_expected, worker_cancel,
                 remember_progress(0), relative_path
             ))
             futures.append(executor.submit(
-                _hash_file, target_path, target_expected, worker_cancel,
+                copy_context().run, _hash_file, target_path, target_expected, worker_cancel,
                 remember_progress(1), relative_path
             ))
         except BaseException:
@@ -455,14 +460,20 @@ class SyncEngine:
             validate_state_separation(self.state_dir, (source, target))
         )
 
+    @scan_task("mirror")
     def analyze(self, source: str, target: str, *, deep: bool = False,
                 mode: str = SYNC_MODE_MIRROR,
                 cancel: threading.Event | None = None, progress: ProgressCallback = None) -> SyncPlan:
+        return self._analyze(source, target, deep=deep, mode=mode, cancel=cancel, progress=progress)
+
+    def _analyze(self, source, target, *, deep=False, mode=SYNC_MODE_MIRROR,
+                 cancel=None, progress=None, views=None, shared_store=None,
+                 defer_final=False):
         if not self._lock.acquire(blocking=False):
             raise SyncError("已有同步任务运行中。")
         plan = SyncPlan(source=str(source), target=str(target), mode=mode)
-        store: BaselineStore | None = None
-        hash_pool: ThreadPoolExecutor | None = None
+        store = shared_store
+        owns_store = shared_store is None
         try:
             _cancelled(cancel)
             context = validate_roots(str(source), str(target))
@@ -479,12 +490,60 @@ class SyncEngine:
             plan.source, plan.target = context["source"], context["target"]
             plan.pair_id = context["pair_id"]
             plan.context = context
-            source_entries, source_excluded = _scan(
-                plan.source, cancel, progress, mode=mode
-            )
-            target_entries, target_excluded = _scan(
-                plan.target, cancel, progress, mode=mode
-            )
+            if views is None:
+                source_entries, source_excluded = _scan(plan.source, cancel, progress, mode=mode)
+                target_entries, target_excluded = _scan(plan.target, cancel, progress, mode=mode)
+            else:
+                source_view, target_view = views
+                if source_view.epoch != target_view.epoch:
+                    raise SyncError("清单来自不同扫描会话。")
+                for side, view in (("source", source_view), ("target", target_view)):
+                    view.require_complete()
+                    if (view.root != context[side] or view.policy != mode
+                            or identity(view.root_state) != identity(context[side + "_root"])):
+                        raise SyncError("扫描清单范围、模式或根身份不匹配。")
+                source_entries, source_excluded = source_view.dictionaries()
+                target_entries, target_excluded = target_view.dictionaries()
+            if store is None:
+                store = BaselineStore(self.state_dir)
+            self._plan_from_manifests(plan, source_entries, target_entries,
+                source_excluded, target_excluded, store, deep=deep, cancel=cancel, progress=progress)
+            _cancelled(cancel)
+            if not defer_final:
+                revalidate_roots(context)
+                self._validate_analysis_manifests(plan, cancel)
+                context["validated"] = True
+            _emit(progress, "done" if not defer_final else "compare",
+                  message="差异分析完成" if not defer_final else "内容比较完成，等待集合复核",
+                  completed_files=len(plan.items), total_files=len(plan.items))
+        except SyncCancelled:
+            raise
+        except (OSError, SyncError, ValueError, sqlite3.Error) as exc:
+            plan.errors.append(str(exc))
+            plan.items.append(PlanItem("error", "", reason=str(exc)))
+        finally:
+            try:
+                if owns_store and store is not None:
+                    store.close()
+            finally:
+                self._lock.release()
+        return plan
+
+    @measured("final_revalidation")
+    def _validate_analysis_manifests(self, plan, cancel):
+        for side, root, entries in (("源端", plan.source, plan.context["source_entries"]),
+                                   ("目标端", plan.target, plan.context["target_entries"])):
+            _require_manifest(entries, _scan(root, cancel, None, mode=plan.mode)[0],
+                root=root, side=side, message="分析期间目录内容发生变化，请重新分析差异。")
+
+    @measured("planning")
+    def _plan_from_manifests(self, plan, source_entries, target_entries,
+                             source_excluded, target_excluded, store, *,
+                             deep=False, cancel=None, progress=None):
+        """Compare this epoch's metadata. Never grants final validation itself."""
+        context = plan.context
+        hash_pool = None
+        try:
             context["source_entries"] = source_entries
             context["target_entries"] = target_entries
             context["target_names"] = {_key(path): path for path in target_entries}
@@ -497,7 +556,6 @@ class SyncEngine:
             plan.excluded_target_bytes = sum(
                 state["size"] for state in target_excluded.values()
             )
-            store = BaselineStore(self.state_dir)
             baselines = store.records(plan.pair_id)
             # Equality of two verified file versions is symmetric. Keep each
             # direction's records separate, but reuse the opposite direction
@@ -579,12 +637,14 @@ class SyncEngine:
                     item = PlanItem("add", relative, src["size"], "目标中不存在")
                 elif (not deep and _key(relative) in baseline_keys
                       and baseline_keys[_key(relative)][1][:2] == (src, dst)):
+                    count("baseline_hits")
                     item = PlanItem("skip", relative, src["size"], "两端与上次校验记录一致")
                 elif (not deep and _key(target_name) in reverse_keys
                       and reverse_keys[_key(target_name)][1][:2] == (dst, src)):
                     # The opposite direction already durably owns this exact
                     # equality claim. Do not duplicate N records/commits merely
                     # because the user switches direction; both are read each run.
+                    count("baseline_hits")
                     item = PlanItem("skip", relative, src["size"], "两端与反向同步的已校验记录一致")
                 elif src["size"] != dst["size"]:
                     item = PlanItem("update", relative, src["size"], "文件大小不同，以源端为准")
@@ -624,29 +684,9 @@ class SyncEngine:
                     _emit(progress, "compare", relative_path=relative,
                           message="目标多余项目", completed_files=len(plan.items), total_files=total)
             plan.items.extend(excluded_items)
-            _cancelled(cancel)
-            revalidate_roots(context)
-            # A manifest scan is metadata-only, including for large unchanged
-            # videos. It makes a preview generated during a write fail closed.
-            for side, root, entries in (("源端", plan.source, source_entries),
-                                        ("目标端", plan.target, target_entries)):
-                _require_manifest(entries, _scan(root, cancel, None, mode=mode)[0],
-                                  root=root, side=side,
-                                  message="分析期间目录内容发生变化，请重新分析差异。")
-            context["validated"] = True
-            _emit(progress, "done", message="差异分析完成", completed_files=total, total_files=total)
-        except SyncCancelled:
-            raise
-        except (OSError, SyncError, ValueError, sqlite3.Error) as exc:
-            plan.errors.append(str(exc))
-            plan.items.append(PlanItem("error", "", reason=str(exc)))
         finally:
             if hash_pool is not None:
                 hash_pool.shutdown(wait=True, cancel_futures=True)
-            if store is not None:
-                store.close()
-            self._lock.release()
-        return plan
 
     def analyze_pair(self, source: str, target: str, *, deep: bool = False,
                      cancel: threading.Event | None = None,
@@ -658,13 +698,17 @@ class SyncEngine:
         Both plans retain independent root bindings and execution preflights.
         """
         forward = self.analyze(source, target, deep=deep, cancel=cancel, progress=progress)
+        return self._reverse_plan(forward, cancel=cancel)
+
+    def _reverse_plan(self, forward, *, cancel=None, defer_final=False):
         backward = SyncPlan(forward.target, forward.source)
         if forward.errors:
             backward.errors = list(forward.errors)
             return forward, backward
         _cancelled(cancel)
         context = validate_roots(backward.source, backward.target)
-        revalidate_roots(forward.context)
+        if not defer_final:
+            revalidate_roots(forward.context)
         # analyze_pair is for two existing vaults, never a missing source.
         if (identity(context["source_root"]) != identity(forward.context["target_root"])
                 or identity(context["target_root"]) != identity(forward.context["source_root"])):
@@ -1024,7 +1068,7 @@ class SyncEngine:
         # happened; never delete/replace the original to achieve a name change.
         parent = os.path.dirname(new_path)
         desired = os.path.basename(new_path)
-        with os.scandir(native(parent)) as entries:
+        with scandir(native(parent)) as entries:
             exact = any(entry.name == desired for entry in entries)
         if not exact:
             _require_state(old_path, state, "大小写改名前目标项目已改变")

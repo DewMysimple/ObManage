@@ -13,6 +13,7 @@ import stat
 from pathlib import Path
 
 from .models import SyncError
+from .scanning.metrics import count
 
 
 def native(path: str | Path) -> str:
@@ -38,6 +39,7 @@ def is_reparse(st: os.stat_result) -> bool:
 
 
 def snapshot(path: str | Path) -> dict | None:
+    count("metadata_queries")
     try:
         st = os.lstat(native(path))
     except FileNotFoundError:

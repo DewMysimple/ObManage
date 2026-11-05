@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
 )
 
 from ..management import collect_vault_statistics, discover_vaults
+from ..scanning.session import ScanSession
 from ..management.models import FileTypeStatistics, VaultStatistics, VaultStatisticsResult
 from .common import FeaturePage, PathPicker, format_bytes, panel
 
@@ -331,14 +332,16 @@ class StatisticsPage(FeaturePage):
         include_trash = self.include_trash.isChecked()
 
         def operation(cancel, progress):
-            catalog = discover_vaults(root, cancel=cancel, progress=progress)
-            return collect_vault_statistics(
-                catalog,
-                count_characters=count_characters,
-                include_trash=include_trash,
-                cancel=cancel,
-                progress=progress,
-            )
+            with ScanSession(cancel, capture=True) as session:
+                catalog = discover_vaults(root, cancel=cancel, progress=progress, _session=session)
+                return collect_vault_statistics(
+                    catalog,
+                    _session=session,
+                    count_characters=count_characters,
+                    include_trash=include_trash,
+                    cancel=cancel,
+                    progress=progress,
+                )
 
         self.start_task("statistics", operation)
 

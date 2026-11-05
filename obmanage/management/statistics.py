@@ -1,19 +1,24 @@
 """Streaming, read-only statistics for active Obsidian vault content."""
 from __future__ import annotations
 
+from ..scanning.io import scandir
+from ..scanning.metrics import count, measured, phase, scan_task
+
 import codecs
 import os
 import stat
 import time
 from collections.abc import Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
+from contextvars import copy_context
 from itertools import groupby
 from pathlib import Path
 from threading import Event, Lock
 
 from ..file_types import VIDEO_EXTENSIONS
 from ..models import Progress, SyncCancelled, SyncError
+from ..scanning.session import ScanSession
 from ..reading import buffer_size
 from ..paths import assert_plain_chain, canonical, native, snapshot
 from .catalog import _marker_state, _physical_plain_directory, _same_name, _sort_key
@@ -211,6 +216,7 @@ def _read_utf8_characters(
             block = os.read(descriptor, read_size)
             if not block:
                 break
+            count("markdown_bytes", len(block))
             characters += len(decoder.decode(block, final=False))
             on_bytes(len(block))
         characters += len(decoder.decode(b"", final=True))
@@ -226,6 +232,7 @@ def _read_utf8_characters(
     return characters, current
 
 
+@scan_task("statistics")
 def collect_vault_statistics(
     vaults: VaultCatalogResult | Iterable[VaultInfo | str | Path] | VaultInfo | str | Path,
     *,
@@ -233,6 +240,7 @@ def collect_vault_statistics(
     include_trash: bool = False,
     cancel: Event | None = None,
     progress: ProgressCallback | None = None,
+    _session: ScanSession | None = None,
 ) -> VaultStatisticsResult:
     """Collect read-only content and file-type statistics for supplied vaults.
 
@@ -244,6 +252,10 @@ def collect_vault_statistics(
     file; each result then has ``characters_counted == False``.  Categories are
     inferred from filename extensions; unknown types remain visible as other.
     """
+    if _session is None:
+        with ScanSession(cancel) as session:
+            return collect_vault_statistics(vaults, count_characters=count_characters,
+                include_trash=include_trash, cancel=cancel, progress=progress, _session=session)
     issues: list[ManagementIssue] = (
         list(vaults.issues) if isinstance(vaults, VaultCatalogResult) else []
     )
@@ -256,7 +268,10 @@ def collect_vault_statistics(
             issues.append(issue)
             continue
         assert physical is not None
-        marker_status, marker_issue = _marker_state(physical)
+        marker_status, marker_issue = _session.markers.get(
+            os.path.normcase(physical), (None, None))
+        if marker_status is None:
+            marker_status, marker_issue = _marker_state(physical)
         if marker_issue is not None:
             issues.append(marker_issue)
         if marker_status != "valid":
@@ -268,6 +283,9 @@ def collect_vault_statistics(
         prepared.setdefault(os.path.normcase(physical), physical)
 
     results: list[VaultStatistics] = []
+    verified_directories = set()
+    nested_boundaries = {}
+    count("vaults", len(prepared))
     completed_files = 0
     completed_bytes = 0
     last_progress = 0.0
@@ -330,8 +348,18 @@ def collect_vault_statistics(
                 folder_before = snapshot(current)
                 if folder_before is None or folder_before["kind"] != "dir":
                     raise OSError("目录在统计期间被移除或替换")
-                with os.scandir(native(current)) as iterator:
-                    entries = sorted(tuple(iterator), key=lambda entry: (entry.name.casefold(), entry.name))
+                observed = _session.observe(current, snapshotter=snapshot,
+                    chain_validated=True, folder_state=folder_before)
+                entries = observed.entries
+                issues.extend(ManagementIssue("ambiguous_name", "存在 Windows 无法区分的大小写重名路径。",
+                    os.path.join(current, name)) for name in observed.name_conflicts())
+                for issue in observed.issues:
+                    if issue.code == "directory_changed":
+                        mark_directory_changed(issue.path, issue.message)
+                    elif issue.code != "path_changed":
+                        issues.append(ManagementIssue(issue.code, issue.message, issue.path))
+                if _state_epoch(dict(observed.state)) != _state_epoch(folder_before):
+                    mark_directory_changed(current, "目录在采集清单后发生变化，统计结果不完整。")
             except (OSError, SyncError) as exc:
                 issues.append(ManagementIssue("directory_unreadable", f"无法读取目录：{exc}", current))
                 continue
@@ -341,11 +369,7 @@ def collect_vault_statistics(
             for entry in entries:
                 _cancelled(cancel)
                 child = canonical(os.path.join(current, entry.name))
-                try:
-                    state = snapshot(child)
-                except OSError as exc:
-                    issues.append(ManagementIssue("path_unreadable", f"无法检查路径：{exc}", child))
-                    continue
+                state = dict(entry.state) if entry.state is not None else None
                 if state is None:
                     issues.append(ManagementIssue("path_changed", "路径在统计期间消失。", child))
                     direct_children.append((entry.name, True, None))
@@ -367,10 +391,22 @@ def collect_vault_statistics(
                             entry.name, False, _state_epoch(state, content_sensitive=False)
                         ))
                         continue
-                    nested_status, nested_issue = _marker_state(child)
+                    nested_status, nested_issue = _session.markers.get(os.path.normcase(child), (None, None))
+                    if nested_status is None:
+                        try:
+                            child_observed = _session.observe(child, snapshotter=snapshot)
+                            candidate = any(_same_name(item.name, ".obsidian") for item in child_observed.entries)
+                            nested_status, nested_issue = _marker_state(child) if candidate else ("absent", None)
+                        except (OSError, SyncError):
+                            # Let the normal traversal report its original directory error.
+                            nested_status, nested_issue = _marker_state(child)
+                        _session.markers[os.path.normcase(child)] = (nested_status, nested_issue)
                     if nested_issue is not None:
                         issues.append(nested_issue)
                     if nested_status in ("valid", "unreadable"):
+                        if nested_status == "valid":
+                            marker = snapshot(os.path.join(child, ".obsidian"))
+                            nested_boundaries[child] = _state_epoch(marker, content_sensitive=False)
                         # A plain but unreadable marker is conservatively treated
                         # as a nested-vault boundary rather than traversed.
                         direct_children.append((
@@ -434,6 +470,7 @@ def collect_vault_statistics(
             stack.extend((child, False) for child in reversed(child_dirs))
 
         if count_characters and markdown_candidates:
+            read_context = copy_context()
             def read_candidate(
                 candidate: _MarkdownCandidate,
             ) -> tuple[_MarkdownCandidate, int | None, dict | None, Exception | None]:
@@ -483,7 +520,7 @@ def collect_vault_statistics(
                         continue
 
                     outcomes = executor.map(
-                        read_candidate,
+                        lambda candidate: read_context.copy().run(read_candidate, candidate),
                         group,
                         buffersize=worker_count * 2,
                     )
@@ -519,47 +556,49 @@ def collect_vault_statistics(
         # Re-enumerate every traversed directory after all content reads.  This
         # catches late additions/removals and replacements that a single scandir
         # snapshot would otherwise omit from an apparently exact result.
-        for directory, expected_folder, expected_children in directory_guards:
-            _cancelled(cancel)
-            try:
-                assert_plain_chain(directory)
-                final_before = snapshot(directory)
-                if _state_epoch(final_before) != _state_epoch(expected_folder):
-                    mark_directory_changed(
-                        directory, "目录在统计期间发生变化，统计结果不完整。"
-                    )
+        with phase("final_revalidation"):
+            for directory, expected_folder, expected_children in directory_guards:
+                _cancelled(cancel)
+                try:
+                    assert_plain_chain(directory)
+                    final_before = snapshot(directory)
+                    if _state_epoch(final_before) != _state_epoch(expected_folder):
+                        mark_directory_changed(
+                            directory, "目录在统计期间发生变化，统计结果不完整。"
+                        )
+                        continue
+                    with scandir(native(directory)) as iterator:
+                        final_entries = sorted(
+                            tuple(iterator), key=lambda entry: (entry.name.casefold(), entry.name)
+                        )
+                    final_children: list[tuple[str, dict | None]] = []
+                    for entry in final_entries:
+                        child = canonical(os.path.join(directory, entry.name))
+                        final_children.append((entry.name, snapshot(child)))
+                    final_after = snapshot(directory)
+                except (OSError, SyncError) as exc:
+                    issues.append(ManagementIssue(
+                        "directory_unreadable", f"无法复核目录：{exc}", directory
+                    ))
                     continue
-                with os.scandir(native(directory)) as iterator:
-                    final_entries = sorted(
-                        tuple(iterator), key=lambda entry: (entry.name.casefold(), entry.name)
+
+                changed = _state_epoch(final_after) != _state_epoch(final_before)
+                if len(final_children) != len(expected_children):
+                    changed = True
+                elif not changed:
+                    for (actual_name, actual_state), (expected_name, sensitive, expected_state) in zip(
+                        final_children, expected_children
+                    ):
+                        if (actual_name != expected_name
+                                or _state_epoch(actual_state, content_sensitive=sensitive) != expected_state):
+                            changed = True
+                            break
+                if changed:
+                    mark_directory_changed(
+                        directory, "目录在统计期间的项目或身份已变化，统计结果不完整。"
                     )
-                final_children: list[tuple[str, dict | None]] = []
-                for entry in final_entries:
-                    child = canonical(os.path.join(directory, entry.name))
-                    final_children.append((entry.name, snapshot(child)))
-                final_after = snapshot(directory)
-            except (OSError, SyncError) as exc:
-                issues.append(ManagementIssue(
-                    "directory_unreadable", f"无法复核目录：{exc}", directory
-                ))
-                continue
-
-            changed = _state_epoch(final_after) != _state_epoch(final_before)
-            if len(final_children) != len(expected_children):
-                changed = True
-            elif not changed:
-                for (actual_name, actual_state), (expected_name, sensitive, expected_state) in zip(
-                    final_children, expected_children
-                ):
-                    if (actual_name != expected_name
-                            or _state_epoch(actual_state, content_sensitive=sensitive) != expected_state):
-                        changed = True
-                        break
-            if changed:
-                mark_directory_changed(
-                    directory, "目录在统计期间的项目或身份已变化，统计结果不完整。"
-                )
-
+                else:
+                    verified_directories.add(os.path.normcase(directory))
         report(vault_path, "", force=True)
         results.append(VaultStatistics(
             vault_path=vault_path,
@@ -574,6 +613,23 @@ def collect_vault_statistics(
             complete=len(issues) == vault_issues_start,
         ))
 
+    final_issue_count = len(issues)
+    with phase("final_revalidation"):
+        for child, expected_marker in nested_boundaries.items():
+            _cancelled(cancel)
+            try:
+                status, issue = _marker_state(child)
+                marker = snapshot(os.path.join(child, ".obsidian"))
+                if status != "valid" or _state_epoch(marker, content_sensitive=False) != expected_marker:
+                    issues.append(issue or ManagementIssue("nested_boundary_changed",
+                        "嵌套仓库标记在统计期间改变，统计范围不完整。", child))
+            except (OSError, SyncError) as exc:
+                issues.append(ManagementIssue("nested_boundary_changed", f"无法复核嵌套仓库边界：{exc}", child))
+        issues.extend(ManagementIssue(i.code, i.message, i.path)
+                      for i in _session.verify_discovery(verified_directories))
+    if len(issues) != final_issue_count:
+        results = [replace(result, complete=False) for result in results]
+    _cancelled(cancel)
     return VaultStatisticsResult(
         statistics=tuple(results),
         issues=tuple(sorted(issues, key=_issue_sort_key)),

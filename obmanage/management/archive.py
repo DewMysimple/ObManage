@@ -1,6 +1,9 @@
 """Read-only vault snapshots published as verified ZIPs outside the source tree."""
 from __future__ import annotations
 
+from ..scanning.io import scandir
+from ..scanning.metrics import measured, scan_task
+
 import os
 import shutil
 import stat
@@ -111,6 +114,7 @@ def _read_entry(source, entry, cancel, destination=None, progress=None, *, reads
     return digest
 
 
+@measured("archive_inventory")
 def _inventory(source, exclude_videos, cancel):
     rows = []
     stack = [(source, "")]
@@ -123,7 +127,7 @@ def _inventory(source, exclude_videos, cancel):
         before = snapshot(folder)
         if before is None or before["kind"] != "dir":
             raise SyncError(f"目录已改变：{folder}")
-        with os.scandir(native(folder)) as iterator:
+        with scandir(native(folder)) as iterator:
             children = sorted(iterator, key=lambda e: e.name.casefold())
         for child in children:
             _cancel(cancel)
@@ -173,6 +177,7 @@ class ArchiveEngine:
     def __init__(self, state_dir):
         self.state_dir = Path(state_dir)
 
+    @scan_task("archive")
     def analyze(self, source, output_dir, *, filename="", level=1, exclude_videos=False, cancel=None, progress=None):
         if type(level) is not int or not 0 <= level <= 9:
             raise SyncError("压缩级别必须为 0 至 9。")
@@ -218,6 +223,7 @@ class ArchiveEngine:
         self._validate(plan, cancel)
         return plan
 
+    @measured("final_revalidation")
     def _validate(self, plan, cancel):
         validate_state_separation(self.state_dir, (plan.source,))
         for path, state, volume in ((plan.source, plan.source_state, plan.source_volume),
