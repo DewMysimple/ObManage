@@ -92,6 +92,8 @@ def test_directory_change_while_enumerating_is_explicit(tmp_path):
 
 
 def test_observe_reuses_only_the_adjacent_checked_leaf(tmp_path, monkeypatch):
+    from obmanage import paths
+
     checked, enumerated = [], []
     real_lstat, real_scan = os.lstat, os.scandir
 
@@ -105,6 +107,14 @@ def test_observe_reuses_only_the_adjacent_checked_leaf(tmp_path, monkeypatch):
 
     monkeypatch.setattr(os, "lstat", lstat)
     monkeypatch.setattr(os, "scandir", scandir)
+    if paths._get_file_attributes is not None:
+        real_attributes = paths._get_file_attributes
+
+        def attributes(path):
+            checked.append(canonical(path))
+            return real_attributes(path)
+
+        monkeypatch.setattr(paths, "_get_file_attributes", attributes)
     for _ in range(2):
         with ScanSession() as session:
             session.observe(tmp_path)
@@ -138,7 +148,8 @@ def test_metadata_diagnostics_count_each_query_once_and_hide_paths(tmp_path, mon
     assert counts["lstat_errors"] == counts["direntry_stat_calls"] == counts["directory_enumerations"] == 1
     assert counts["metadata_upgrades"] == 1
     assert counts["snapshot_calls"] == counts["lstat_calls"] == counts["final_revalidation_snapshot_calls"]
-    assert counts["metadata_queries"] == counts["lstat_calls"] + counts["direntry_stat_calls"]
+    assert counts["metadata_queries"] == sum(counts[name] for name in
+                                            ("lstat_calls", "direntry_stat_calls", "file_attributes_calls"))
     assert counts["final_revalidation_directory_enumerations"] == 1
     assert all(metrics.seconds[key] > 0 for key in ("lstat", "plain_chain", "direntry_stat", "final_revalidation"))
     assert "private" not in str(metrics.report())

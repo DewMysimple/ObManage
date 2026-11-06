@@ -54,8 +54,10 @@ def _cleanup(parent, parent_identity, child, child_identity, marker_identity, ru
 
 
 @contextmanager
-def sandbox(path=None):
+def sandbox(path=None, *, validate=None):
     parent, parent_identity = test_parent(path if path is not None else Path(tempfile.gettempdir()))
+    if validate is not None:
+        validate(parent)
     run_id = uuid4().hex.encode("ascii")
     child = Path(tempfile.mkdtemp(prefix=f"obmanage-scan-{run_id.decode()}-", dir=native(parent)))
     # Use the ordinary absolute path for tools and long-path normalization.
@@ -63,6 +65,8 @@ def sandbox(path=None):
     if _plain_directory(parent) != parent_identity:
         raise RuntimeError(f"Benchmark parent changed. Inspect the isolated directory manually: {child}")
     child_identity = _plain_directory(child)
+    if validate is not None:
+        validate(child)
     marker = child / MARKER
     with open(native(marker), "xb") as handle:
         handle.write(run_id)
@@ -70,4 +74,6 @@ def sandbox(path=None):
     try:
         yield child
     finally:
+        if validate is not None:
+            validate(child)
         _cleanup(parent, parent_identity, child, child_identity, marker_identity, run_id)

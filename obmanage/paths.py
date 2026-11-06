@@ -16,6 +16,15 @@ from .models import SyncError
 from .scanning.metrics import current, measured
 
 
+try:
+    _get_file_attributes = ctypes.windll.kernel32.GetFileAttributesW if os.name == "nt" else None
+except (AttributeError, OSError):
+    _get_file_attributes = None
+if _get_file_attributes is not None:
+    _get_file_attributes.argtypes = [ctypes.c_wchar_p]
+    _get_file_attributes.restype = ctypes.c_uint32
+
+
 def native(path: str | Path) -> str:
     value = os.path.abspath(os.fspath(path))
     if os.name != "nt" or value.startswith("\\\\?\\"):
@@ -66,7 +75,8 @@ def identity(state: dict | None) -> tuple | None:
 
 
 @measured("plain_chain", calls=True)
-def assert_plain_chain(path: str | Path, *, leaf_snapshotter=None) -> dict | None:
+def assert_plain_chain(path: str | Path, *, leaf_snapshotter=None,
+                       attributes_only_ancestors=False) -> dict | None:
     """Check the live chain through the leaf and return that leaf's snapshot."""
     leaf = value = canonical(path)
     parents = []
@@ -76,7 +86,20 @@ def assert_plain_chain(path: str | Path, *, leaf_snapshotter=None) -> dict | Non
             break
         parents.append(parent)
         value = parent
+    attributes = _get_file_attributes if attributes_only_ancestors else None
+    metrics = current() if attributes is not None else None
     for part in reversed(parents):
+        if attributes is not None and len(part) > 3 and part[1:3] == ":\\":
+            # Ordinary local ancestors need only a live kind check. The API
+            # reports attributes of the link itself, including mount points.
+            # Everything except a plain directory takes the original path,
+            # preserving missing-path and filesystem error handling.
+            extended = "\\\\?\\" + part
+            flags = (attributes(extended) if metrics is None else
+                     metrics.query("file_attributes", attributes, extended))
+            if flags & (stat.FILE_ATTRIBUTE_DIRECTORY | stat.FILE_ATTRIBUTE_REPARSE_POINT
+                        | stat.FILE_ATTRIBUTE_DEVICE) == stat.FILE_ATTRIBUTE_DIRECTORY:
+                continue
         state = snapshot(part)
         if state is not None and state["kind"] != "dir":
             raise SyncError(f"路径包含链接或非目录，无法安全同步：{part}")

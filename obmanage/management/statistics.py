@@ -349,7 +349,8 @@ def collect_vault_statistics(
             _cancelled(cancel)
             current, is_root = stack.pop()
             try:
-                folder_before = assert_plain_chain(current, leaf_snapshotter=snapshot)
+                folder_before = assert_plain_chain(current, leaf_snapshotter=snapshot,
+                                                   attributes_only_ancestors=True)
                 if folder_before is None or folder_before["kind"] != "dir":
                     raise OSError("目录在统计期间被移除或替换")
                 observed = _session.observe(current, snapshotter=snapshot,
@@ -570,7 +571,8 @@ def collect_vault_statistics(
             for directory, expected_folder, expected_children in directory_guards:
                 _cancelled(cancel)
                 try:
-                    final_before = assert_plain_chain(directory, leaf_snapshotter=snapshot)
+                    final_before = assert_plain_chain(directory, leaf_snapshotter=snapshot,
+                                                      attributes_only_ancestors=True)
                     if _state_epoch(final_before) != _state_epoch(expected_folder):
                         mark_directory_changed(
                             directory, "目录在统计期间发生变化，统计结果不完整。"

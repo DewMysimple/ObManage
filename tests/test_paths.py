@@ -181,3 +181,61 @@ def test_state_directory_cannot_hide_inside_vault_using_windows_short_alias(tmp_
     rejected(SyncEngine(state), source, target)
 
     assert not (source / "app-state").exists()
+@pytest.mark.skipif(os.name != "nt", reason="Windows live attribute probe")
+def test_scan_chain_keeps_live_ancestor_and_leaf_checks(tmp_path, monkeypatch):
+    from obmanage import paths
+
+    parent = tmp_path / "中文" / "ordinary"
+    leaf = parent / "leaf"
+    leaf.mkdir(parents=True)
+    original = paths._get_file_attributes
+    calls = []
+
+    def attributes(path):
+        calls.append(paths.canonical(path))
+        return original(path)
+
+    monkeypatch.setattr(paths, "_get_file_attributes", attributes)
+    assert paths.assert_plain_chain(leaf, attributes_only_ancestors=True) == paths.snapshot(leaf)
+    assert str(parent) in calls and str(leaf) not in calls
+    assert paths.assert_plain_chain(parent / "missing", attributes_only_ancestors=True) is None
+
+    import _winapi
+
+    target = tmp_path / "target"
+    (target / "leaf").mkdir(parents=True)
+    leaf.rmdir()
+    parent.rmdir()
+    _winapi.CreateJunction(str(target), str(parent))
+    with pytest.raises(SyncError):
+        paths.assert_plain_chain(leaf, attributes_only_ancestors=True)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows live attribute probe")
+def test_scan_chain_unknown_attributes_preserve_permission_failure(tmp_path, monkeypatch):
+    from obmanage import paths
+
+    parent = tmp_path / "parent"
+    leaf = parent / "leaf"
+    leaf.mkdir(parents=True)
+    original = paths.snapshot
+    monkeypatch.setattr(paths, "_get_file_attributes", lambda _path: 0xFFFFFFFF)
+
+    def denied(path):
+        if Path(path) == parent:
+            raise PermissionError("unreadable ancestor")
+        return original(path)
+
+    monkeypatch.setattr(paths, "snapshot", denied)
+    with pytest.raises(PermissionError, match="unreadable ancestor"):
+        paths.assert_plain_chain(leaf, attributes_only_ancestors=True)
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows extended-length attribute path")
+def test_scan_chain_preserves_long_unicode_leaf_snapshot(tmp_path):
+    from obmanage import paths
+
+    leaf = tmp_path.joinpath(*(["中文目录" * 8] * 8), "叶")
+    Path(paths.native(leaf)).mkdir(parents=True)
+    assert len(str(leaf)) > 260
+    assert paths.assert_plain_chain(leaf, attributes_only_ancestors=True) == paths.assert_plain_chain(leaf)

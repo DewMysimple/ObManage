@@ -183,7 +183,8 @@ class ScanSession:
         try:
             before = folder_state
             if not chain_validated:
-                checked = assert_plain_chain(directory, leaf_snapshotter=read_state if before is None else None)
+                checked = assert_plain_chain(directory, leaf_snapshotter=read_state if before is None else None,
+                                             attributes_only_ancestors=True)
                 if before is None:
                     before = checked
             elif before is None:

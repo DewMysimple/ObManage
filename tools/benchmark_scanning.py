@@ -101,12 +101,14 @@ def write_report(output, report):
 
 
 @contextmanager
-def reference_package(ref="c56a6885d2f5f4d08d7d548e7955c40dcd560de2"):
+def reference_package(ref="c56a6885d2f5f4d08d7d548e7955c40dcd560de2", *, work_dir=None):
     """Load immutable Git source under another package name, never change checkout."""
     commit = subprocess.check_output(["git", "rev-parse", "--verify", "--end-of-options", ref + "^{commit}"],
                                      cwd=ROOT, text=True).strip()
     raw = subprocess.check_output(["git", "archive", commit, "obmanage"], cwd=ROOT)
-    with tempfile.TemporaryDirectory(prefix="obmanage-reference-") as temp:
+    location = (tempfile.TemporaryDirectory(prefix="obmanage-reference-")
+                if work_dir is None else nullcontext(work_dir))
+    with location as temp:
         destination = Path(temp) / "scan_reference"
         destination.mkdir()
         with tarfile.open(fileobj=io.BytesIO(raw)) as archive:
@@ -215,6 +217,12 @@ def observations(modules, metrics):
         for target, attribute, replacement in ((os, "scandir", Directory), (os, "lstat", lstat),
                 (os, "stat", stat), (stats_module, "_read_utf8_characters", read)):
             stack.enter_context(patch.object(target, attribute, replacement))
+        attributes = getattr(modules["paths"], "_get_file_attributes", None)
+        if attributes is not None:
+            def file_attributes(path):
+                return query("observed_file_attributes", attributes, path)
+
+            stack.enter_context(patch.object(modules["paths"], "_get_file_attributes", file_attributes))
         # Instrument the immutable reference's phase boundaries, without changing logic.
         if "metrics" not in modules:
             from obmanage.scanning.metrics import measured
