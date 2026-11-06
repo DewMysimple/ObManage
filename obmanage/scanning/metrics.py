@@ -1,6 +1,7 @@
 """Optional aggregate diagnostics. No paths or file names leave this module."""
 from __future__ import annotations
 
+import heapq
 import logging
 import threading
 import time
@@ -21,6 +22,7 @@ class ScanMetrics:
     seconds: Counter = field(default_factory=Counter)
     status: str = "running"
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _slow_vaults: list = field(default_factory=list, repr=False)
 
     def add(self, name: str, amount: int = 1) -> None:
         with self._lock:
@@ -52,10 +54,27 @@ class ScanMetrics:
         with self._lock:
             return {name: self.counts[name] for name in names}
 
+    def record_vault(self, ordinal, seconds, files, directories, size, complete, *, stage="statistics"):
+        """Retain bounded, anonymous per-vault measurements for this task."""
+        with self._lock:
+            entry = (seconds, ordinal, files, directories, size, complete, stage)
+            if len(self._slow_vaults) < 5:
+                heapq.heappush(self._slow_vaults, entry)
+            else:
+                heapq.heappushpop(self._slow_vaults, entry)
+
     def report(self) -> dict:
         with self._lock:
-            return dict(task=self.task, status=self.status,
-                        counts=dict(self.counts), seconds=dict(self.seconds))
+            report = dict(task=self.task, status=self.status,
+                          counts=dict(self.counts), seconds=dict(self.seconds))
+            if self._slow_vaults:
+                report["slow_vaults"] = [
+                    dict(ordinal=ordinal, seconds=seconds, files=files,
+                         directories=dirs, bytes=size, complete=complete, stage=stage)
+                    for seconds, ordinal, files, dirs, size, complete, stage
+                    in sorted(self._slow_vaults, reverse=True)
+                ]
+            return report
 
     @contextmanager
     def activate(self):
@@ -75,6 +94,14 @@ class ScanMetrics:
 
 def current() -> ScanMetrics | None:
     return _CURRENT.get()
+
+
+def debug_metrics(name):
+    return ScanMetrics(name) if _LOG.isEnabledFor(logging.DEBUG) else None
+
+
+def log_metrics(metrics):
+    _LOG.debug("scan %s", metrics.report())
 
 
 def count(name: str, amount: int = 1) -> None:
@@ -99,6 +126,9 @@ def phase(name: str, *, tallies=()):
     before = metrics.tally(tallies) if tallies else {}
     try:
         yield
+    except Exception:
+        metrics.add(f"{name}_exceptions")
+        raise
     finally:
         metrics.elapsed(name, time.perf_counter() - started)
         if before:
@@ -133,13 +163,13 @@ def scan_task(name: str):
                 return result
             if current() is not None:
                 return execute()
-            if not _LOG.isEnabledFor(logging.DEBUG):
+            metrics = debug_metrics(name)
+            if metrics is None:
                 return function(*args, **kwargs)
-            metrics = ScanMetrics(name)
             try:
                 with metrics.activate():
                     return execute()
             finally:
-                _LOG.debug("scan %s", metrics.report())
+                log_metrics(metrics)
         return wrapped
     return decorate

@@ -8,7 +8,7 @@ from typing import Any, Callable
 from PySide6.QtCore import QThread, Signal, Slot
 
 from .models import Progress, SyncCancelled
-from .scanning.metrics import scan_task, outcome
+from .scanning.metrics import current, scan_task, outcome
 
 
 FeatureOperation = Callable[[threading.Event, Callable[[Progress], None]], Any]
@@ -20,14 +20,18 @@ class FeatureWorker(QThread):
     progress = Signal(object)
     completed = Signal(object)
 
-    def __init__(self, operation: FeatureOperation) -> None:
+    def __init__(self, operation: FeatureOperation, *, cancellable=True) -> None:
         super().__init__()
         self.operation = operation
         self.cancel_event = threading.Event()
+        self.cancellable = cancellable
+        self._cancel_requested_at = None
         self._last_progress: float | None = None
         self._last_phase = ""
 
     def request_cancel(self) -> None:
+        if self._cancel_requested_at is None:
+            self._cancel_requested_at = time.perf_counter()
         self.cancel_event.set()
 
     def _progress(self, event: Progress) -> None:
@@ -45,6 +49,9 @@ class FeatureWorker(QThread):
     @Slot()
     @scan_task("management_task")
     def run(self) -> None:
+        metrics = current()
+        if metrics is not None:
+            metrics.add("cancellable", int(self.cancellable))
         try:
             value = self.operation(self.cancel_event, self._progress)
             self.completed.emit(("ok", value))
@@ -54,3 +61,6 @@ class FeatureWorker(QThread):
         except Exception as exc:
             outcome("failed")
             self.completed.emit(("error", f"{type(exc).__name__}: {exc}"))
+        finally:
+            if metrics is not None and self._cancel_requested_at is not None:
+                metrics.elapsed("cancel_latency", time.perf_counter() - self._cancel_requested_at)

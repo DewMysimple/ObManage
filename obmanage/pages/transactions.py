@@ -1,7 +1,7 @@
 """One transaction list with completion and rollback actions."""
 from pathlib import Path
 
-from PySide6.QtCore import QSignalBlocker, QTimer, Qt
+from PySide6.QtCore import QSignalBlocker, QTimer, Qt, Signal
 from PySide6.QtWidgets import QComboBox, QHBoxLayout, QLabel, QMessageBox, QPushButton
 
 from .common import FeaturePage, format_bytes, panel
@@ -12,6 +12,7 @@ from ..management.transactions import complete_transactions, inspect_transaction
 
 class TransactionsPage(FeaturePage):
     page_key = "transactions"
+    records_changed = Signal()
 
     def __init__(self, state_dir: Path, distribution, trash):
         super().__init__("事务处理", "确认完成会保留仓库现状并清理事务副本和记录；确认回退会恢复旧内容。")
@@ -25,6 +26,7 @@ class TransactionsPage(FeaturePage):
         self._selecting = False
         self._clear_preview = None
         self._clear_revision = 0
+        self._records_identity = None
         self._clear_confirm_timer = QTimer(self)
         self._clear_confirm_timer.setSingleShot(True)
         self._clear_confirm_timer.timeout.connect(self._confirm_clear)
@@ -156,7 +158,18 @@ class TransactionsPage(FeaturePage):
         self._selecting = True
         try:
             self.distribution._reload_persistent_batches()
-            self.owners[1]._reload_operations()
+            trash = self.owners[1]
+            trash._reload_operations()
+            records_identity = (
+                self.distribution._recovery_blocked, trash._recovery_blocked,
+                tuple(sorted((batch.batch_id, batch.revision, batch.status)
+                             for batch in self.distribution._batches)),
+                tuple(sorted((operation.operation_id, tuple(record.status for record in operation.records))
+                             for operation in trash._operations)),
+            )
+            if records_identity != self._records_identity:
+                self._records_identity = records_identity
+                self.records_changed.emit()
             choices = []
             for batch in self.distribution._batches:
                 choices.append((batch.status in TERMINAL_BATCH_STATUSES, -batch.updated_at,

@@ -23,12 +23,81 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from obmanage.scanning.metrics import ScanMetrics, phase
-from obmanage.paths import assert_plain_chain
+from obmanage.paths import native, snapshot
+from tools.benchmark_sandbox import sandbox, test_parent
 
-BASELINE = "2bb5c3e0f42e6b9583f171cf79777783df6a799b"
+BASELINE = "678b112ee1322330e545d6d2c691fb393fa8786f"
 SCENARIOS = ("first", "unchanged", "changed", "deep", "statistics_metadata", "statistics_utf8",
              "archive", "cancel", "error", "error_partial", "new_vault", "final_change")
 FAULTS = ("error", "error_partial", "new_vault", "final_change")
+
+
+def volume_info(path):
+    info = {"filesystem": "unknown", "drive_type": "unknown", "physical_bus": "unverified"}
+    if os.name == "nt":
+        import ctypes
+
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        mount = ctypes.create_unicode_buffer(32768)
+        if kernel.GetVolumePathNameW(ctypes.c_wchar_p(str(path)), mount, len(mount)):
+            fs = ctypes.create_unicode_buffer(261)
+            if kernel.GetVolumeInformationW(mount, None, 0, None, None, None, fs, len(fs)):
+                info["filesystem"] = fs.value
+            info["drive_type"] = {
+                2: "removable", 3: "fixed", 4: "network", 5: "optical", 6: "ramdisk",
+            }.get(kernel.GetDriveTypeW(mount), "unknown")
+    return info
+
+
+def peak_working_set():
+    """Windows process lifetime peak in bytes, including native allocations."""
+    if os.name != "nt":
+        return None
+    import ctypes
+
+    class MemoryCounters(ctypes.Structure):
+        _fields_ = [("cb", ctypes.c_ulong), ("faults", ctypes.c_ulong)] + [
+            (name, ctypes.c_size_t) for name in
+            ("peak_working_set", "working_set", "peak_paged_pool", "paged_pool",
+             "peak_nonpaged_pool", "nonpaged_pool", "pagefile", "peak_pagefile")]
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.GetCurrentProcess.restype = ctypes.c_void_p
+    values = MemoryCounters()
+    values.cb = ctypes.sizeof(values)
+    if kernel.K32GetProcessMemoryInfo(ctypes.c_void_p(kernel.GetCurrentProcess()),
+                                      ctypes.byref(values), values.cb):
+        return values.peak_working_set
+    return None
+
+
+@contextmanager
+def memory_sample(enabled, metrics):
+    if not enabled:
+        yield
+        return
+    import tracemalloc
+
+    tracemalloc.start()
+    try:
+        yield
+    finally:
+        _, peak = tracemalloc.get_traced_memory()
+        tracemalloc.stop()
+        metrics.add("python_traced_peak_bytes", peak)
+        peak_rss = peak_working_set()
+        if peak_rss is not None:
+            metrics.add("process_lifetime_peak_working_set_bytes", peak_rss)
+
+
+def write_report(output, report):
+    output = output.absolute()
+    ancestor = next(path for path in output.parents if snapshot(path) is not None)
+    test_parent(ancestor)
+    output.parent.mkdir(parents=True, exist_ok=True)
+    parent, _ = test_parent(output.parent)
+    with open(native(parent / output.name), "x", encoding="utf-8") as handle:
+        json.dump(report, handle, ensure_ascii=False, indent=2)
 
 
 @contextmanager
@@ -48,7 +117,7 @@ def reference_package(ref="c56a6885d2f5f4d08d7d548e7955c40dcd560de2"):
                         raise ValueError("Unsafe reference archive member")
                     target = destination.joinpath(*parts[1:])
                     target.parent.mkdir(parents=True, exist_ok=True)
-                    source = archive.extractfile(member).read().decode("utf-8")
+                    source = archive.extractfile(member).read().decode("utf-8").replace("\r\n", "\n")
                     # Add timers only: the immutable reference still performs its
                     # original enumeration, comparisons and exception handling.
                     if (member.name.endswith("/management/statistics.py")
@@ -60,7 +129,7 @@ def reference_package(ref="c56a6885d2f5f4d08d7d548e7955c40dcd560de2"):
                             + "\n".join("    " + line for line in block.splitlines()) + source[end:])
                         source = source.replace("from __future__ import annotations",
                             "from __future__ import annotations\nfrom obmanage.scanning.metrics import phase as _reference_phase")
-                    target.write_text(source, encoding="utf-8")
+                    target.write_text(source, encoding="utf-8", newline="")
         spec = importlib.util.spec_from_file_location(
             "scan_reference", destination / "__init__.py",
             submodule_search_locations=[str(destination)])
@@ -283,10 +352,9 @@ def signature(result):
                     plan.context.get("validated"))
                 for plan in (pair.local_plan, pair.portable_plan))) for pair in result.pairs))
     if hasattr(result, "statistics"):
-        return (tuple((s.vault_path, s.total_files, s.total_bytes, s.markdown_files,
-                       s.utf8_characters, s.folders, s.complete,
-                       tuple((t.category, t.files, t.total_bytes, t.extensions) for t in s.file_types))
-                      for s in result.statistics), tuple((i.code, i.path) for i in result.issues))
+        from dataclasses import asdict
+
+        return asdict(result)
     return tuple((v.path, v.parent_path) for v in result.vaults), tuple((i.code, i.path) for i in result.issues)
 
 
@@ -301,6 +369,7 @@ def main():
     parser.add_argument("--test-parent", type=Path,
                         help="Existing dedicated test directory. Only a new temporary child is used.")
     parser.add_argument("--timing-only", action="store_true", help="Measure without diagnostic instrumentation.")
+    parser.add_argument("--memory", action="store_true", help="Trace Python allocations separately from timing runs.")
     args = parser.parse_args()
     if min(args.vaults, args.files, args.repeats) < 1:
         parser.error("counts must be positive")
@@ -311,29 +380,28 @@ def main():
     report = dict(baseline=baseline, candidate_head=git("rev-parse", "HEAD"),
                   candidate_tracked_dirty=bool(git("status", "--porcelain", "-uno")),
                   environment=dict(platform=platform.platform(), python=platform.python_version(),
-                  cpu=platform.processor(), diagnostics=not args.timing_only,
+                  cpu=platform.processor(), diagnostics=not args.timing_only, memory_traced=args.memory,
                   cache="OS cache uncontrolled; alternating versions"),
                   dataset=dict(vaults=args.vaults + 1, files_per_vault=args.files,
                                nested=True, attachment_bytes=262144), samples=[])
     scenarios = [name for name in SCENARIOS if name in args.scenarios]
     if any(s in scenarios for s in ("unchanged", "changed", "deep")) and "first" not in scenarios:
         parser.error("include first when measuring unchanged, changed, or deep")
-    if args.test_parent is not None:
-        assert_plain_chain(args.test_parent)
-        args.test_parent = args.test_parent.resolve(strict=True)
-        if not args.test_parent.is_dir() or args.test_parent.parent == args.test_parent:
-            parser.error("test-parent must be an existing dedicated directory beneath the volume root")
-    external = (tempfile.TemporaryDirectory(prefix="obmanage-test-", dir=args.test_parent)
-                if args.test_parent else nullcontext(None))
-    with reference_package(baseline) as old, external as portable_temp, \
-            tempfile.TemporaryDirectory(prefix="obmanage-scan-") as temporary:
-        base = Path(temporary)
-        local, portable = fixture(base, args.vaults, args.files, Path(portable_temp) if portable_temp else None)
-        report["dataset"].update(files=sum(p.is_file() for p in local.rglob("*")),
-            directories=sum(p.is_dir() for p in local.rglob("*")), mode="mirror/metadata/strict_utf8")
-        versions = {"before": old, "after": api()}
+    external = sandbox(args.test_parent) if args.test_parent is not None else nullcontext(None)
+    with reference_package(baseline) as old, sandbox() as base, external as portable_temp:
+        local, portable = fixture(base, args.vaults, args.files, portable_temp)
+        statistics_root = portable if portable_temp else local
+        report["environment"].update(local=volume_info(local), portable=volume_info(portable),
+            portable_location="explicit_test_parent" if portable_temp else "system_temp",
+            statistics_side="portable" if portable_temp else "local")
         changed = local / "group-0/vault-0/notes/part-0/note-0.md"
         original_body = changed.read_bytes()
+        report["dataset"].update(files=sum(p.is_file() for p in local.rglob("*")),
+            directories=sum(p.is_dir() for p in local.rglob("*")), mode="mirror/metadata/strict_utf8",
+            nested_depth=1, active_markdown_files=(args.vaults + 1) * args.files,
+            active_markdown_bytes_per_file=len(original_body),
+            video_bytes_per_vault=4096, settings_bytes_per_vault=2, trash_bytes_per_vault=10)
+        versions = {"before": old, "after": api()}
         late = local / "new-outer"
         denied_part = "part-1" if args.files > 10 else "part-0"
         for repeat in range(args.repeats):
@@ -384,16 +452,17 @@ def main():
                     injected = (patch.object(os, "scandir", failing_scandir)
                                 if scenario in FAULTS else nullcontext())
                     try:
-                        with injected, observed, active:
+                        with memory_sample(args.memory, metrics), injected, observed, active:
                             started = time.perf_counter()
                             if scenario.startswith("statistics"):
                                 if "session" in modules:
                                     with modules["session"].ScanSession(capture=True) as session:
-                                        catalog = modules["management.catalog"].discover_vaults(local, _session=session)
+                                        catalog = modules["management.catalog"].discover_vaults(
+                                            statistics_root, _session=session)
                                         result = modules["management.statistics"].collect_vault_statistics(
                                             catalog, count_characters=scenario == "statistics_utf8", _session=session)
                                 else:
-                                    catalog = modules["management.catalog"].discover_vaults(local)
+                                    catalog = modules["management.catalog"].discover_vaults(statistics_root)
                                     result = modules["management.statistics"].collect_vault_statistics(
                                         catalog, count_characters=scenario == "statistics_utf8")
                                 assert not result.issues, result.issues
@@ -427,10 +496,11 @@ def main():
                     if scenario in ("new_vault", "final_change"):
                         assert mutated, "fault did not run"
                     if late.exists():
-                        shutil.rmtree(late)
+                        late.rename(base / f"late-{repeat}-{version}")
                     if moved.exists():
                         moved.rename(changed)
                     sample = dict(version=version, repeat=repeat, scenario=scenario, **metrics.report())
+                    sample["slow_vaults"] = own_metrics.report().get("slow_vaults", [])
                     if hasattr(result, "pairs"):
                         sample["result"] = dict(collection_issues=len(result.issues),
                             pair_errors=sum(bool(pair.errors) for pair in result.pairs),
@@ -447,8 +517,7 @@ def main():
         report["medians"][scenario] = {version: statistics.median(
             s["seconds"]["total"] for s in report["samples"] if s["scenario"] == scenario and s["version"] == version)
             for version in ("before", "after")}
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
+    write_report(args.output, report)
     print(json.dumps(report["medians"], indent=2))
 
 

@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Callable, Mapping
 
 from ..engine import SyncEngine, _require_manifest
-from ..scanning.metrics import scan_task, phase, count
+from ..scanning.metrics import count, current as scan_metrics, phase, scan_task
 from ..scanning.session import ScanSession
 from ..scanning.collection import collect_collection
 from ..store import BaselineStore
@@ -133,8 +133,9 @@ class IncrementalEngine:
             local_root, portable_root = context["source"], context["target"]
             validate_state_separation(self.state_dir, (local_root, portable_root))
             session = resources.enter_context(ScanSession(cancel, capture=True))
-            collections = [collect_collection(root, session, progress=progress)
-                           for root in (local_root, portable_root)]
+            with phase("initial_inventory"):
+                collections = [collect_collection(root, session, progress=progress)
+                               for root in (local_root, portable_root)]
             catalogs = [collection.catalog for collection in collections]
             issues = [f"{issue.path or ''}：{issue.message}"
                       for catalog in catalogs for issue in catalog.issues]
@@ -176,8 +177,11 @@ class IncrementalEngine:
             store = BaselineStore(state_dir) if keys else None
             if store is not None:
                 resources.callback(store.close)
+            metrics = scan_metrics()
             for index, key in enumerate(keys):
                 _cancelled(cancel)
+                if metrics is not None:
+                    pair_started = time.perf_counter()
                 local, portable = indexed[0].get(key), indexed[1].get(key)
                 relative = (local or portable)[0]
                 local_path = local[1] if local else (
@@ -213,6 +217,20 @@ class IncrementalEngine:
                 pair = VaultPair(key, relative, local_path, portable_path,
                                  plans.get("local"), plans.get("portable"), tuple(errors))
                 all_pairs.append(pair)
+                if metrics is not None:
+                    elapsed = time.perf_counter() - pair_started
+                    files = directories = size = 0
+                    if plans:
+                        for view in (local_view, portable_view):
+                            directories += int(view.root_state is not None)
+                            for state in view.entries.values():
+                                if state["kind"] == "file":
+                                    files += 1
+                                    size += state["size"]
+                                elif state["kind"] == "dir":
+                                    directories += 1
+                    metrics.record_vault(index + 1, elapsed, files, directories, size,
+                                         not errors, stage="incremental_comparison")
             # Observe the real collection again after ALL comparisons. This also
             # covers new/moved markers and nested boundaries outside vault views.
             verified_plans = []

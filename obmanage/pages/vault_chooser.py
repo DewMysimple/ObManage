@@ -16,6 +16,7 @@ class VaultSourceDialog(QDialog):
 
     source_chosen = Signal(str)
     browse_requested = Signal()
+    first_painted = Signal()
 
     def __init__(self, result: VaultCatalogResult, parent=None, *, running=False) -> None:
         super().__init__(parent)
@@ -40,12 +41,9 @@ class VaultSourceDialog(QDialog):
         layout.addWidget(self.search)
         self.model = QStandardItemModel(0, 2, self)
         self.model.setHorizontalHeaderLabels(("仓库", "完整位置"))
-        for vault in result.vaults:
-            items = [QStandardItem(vault.name), QStandardItem(vault.path)]
-            for item in items:
-                item.setToolTip(vault.path)
-                item.setEditable(False)
-            self.model.appendRow(items)
+        self._selectable = True
+        self._deferred = False
+        self._painted = False
         self.proxy = QSortFilterProxyModel(self)
         self.proxy.setSourceModel(self.model)
         self.proxy.setFilterKeyColumn(-1)
@@ -64,17 +62,20 @@ class VaultSourceDialog(QDialog):
         self.summary = QLabel()
         self.summary.setObjectName("Muted")
         layout.addWidget(self.summary)
-        if result.issues:
-            issues = QLabel(f"有 {len(result.issues)} 个读取问题：{result.issues[0].message}")
-            issues.setWordWrap(True)
-            issues.setObjectName("TargetEffect")
-            issues.setToolTip("\n".join(f"{i.message} {i.path or ''}" for i in result.issues))
-            layout.addWidget(issues)
+        self.freshness = QLabel()
+        self.freshness.setWordWrap(True)
+        self.freshness.setObjectName("TargetEffect")
+        layout.addWidget(self.freshness)
+        self.freshness.hide()
+        self.issues = QLabel()
+        self.issues.setWordWrap(True)
+        self.issues.setObjectName("TargetEffect")
+        layout.addWidget(self.issues)
         actions = QHBoxLayout()
-        browse = QPushButton("浏览文件夹…")
-        browse.setIcon(action_icon("folder"))
-        browse.clicked.connect(self._browse)
-        actions.addWidget(browse)
+        self.browse_button = QPushButton("浏览文件夹…")
+        self.browse_button.setIcon(action_icon("folder"))
+        self.browse_button.clicked.connect(self._browse)
+        actions.addWidget(self.browse_button)
         actions.addStretch()
         cancel = QPushButton("取消")
         cancel.clicked.connect(self.reject)
@@ -88,7 +89,44 @@ class VaultSourceDialog(QDialog):
         self.search.textChanged.connect(self._filter)
         self.table.selectionModel().selectionChanged.connect(self._update_choice)
         self.table.doubleClicked.connect(self._choose)
-        self._filter("")
+        self.set_result(result)
+
+    def set_result(self, result, selected=None):
+        self.model.removeRows(0, self.model.rowCount())
+        for vault in result.vaults:
+            items = [QStandardItem(vault.name), QStandardItem(vault.path)]
+            for item in items:
+                item.setToolTip(vault.path)
+                item.setEditable(False)
+            self.model.appendRow(items)
+        self.issues.setVisible(bool(result.issues))
+        if result.issues:
+            self.issues.setText(f"有 {len(result.issues)} 个读取问题：{result.issues[0].message}")
+            self.issues.setToolTip("\n".join(f"{i.message} {i.path or ''}" for i in result.issues))
+        self._filter(self.search.text())
+        if selected is not None:
+            for row in range(self.proxy.rowCount()):
+                if self.proxy.index(row, 1).data() == selected:
+                    self.table.selectRow(row)
+                    break
+
+    def set_freshness(self, text, *, selectable=True, deferred=False):
+        self.freshness.setText(text)
+        self.freshness.setVisible(bool(text))
+        self._selectable = selectable
+        self._deferred = deferred
+        self.browse_button.setEnabled(not deferred)
+        self._update_choice()
+
+    def selected_path(self):
+        rows = self.table.selectionModel().selectedRows()
+        return self.proxy.index(rows[0].row(), 1).data() if rows else None
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if not self._painted and self.model.rowCount():
+            self._painted = True
+            self.first_painted.emit()
 
     def _filter(self, text: str) -> None:
         self.proxy.setFilterFixedString(text.strip())
@@ -100,14 +138,15 @@ class VaultSourceDialog(QDialog):
         self._update_choice()
 
     def _update_choice(self, *_args) -> None:
-        self.choose_button.setEnabled(bool(self.table.selectionModel().selectedRows()))
+        self.choose_button.setEnabled(self._selectable and self.selected_path() is not None)
 
     def _choose(self, *_args) -> None:
-        rows = self.table.selectionModel().selectedRows()
-        if rows:
-            path = self.proxy.index(rows[0].row(), 1).data()
+        path = self.selected_path()
+        if self._selectable and path:
+            deferred = self._deferred
             self.source_chosen.emit(path)
-            self.accept()
+            if not deferred:
+                self.accept()
 
     def _browse(self) -> None:
         self.reject()

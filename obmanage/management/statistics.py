@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from ..scanning.io import scandir
-from ..scanning.metrics import count, measured, phase, scan_task
+from ..scanning.metrics import count, current as scan_metrics, measured, phase, scan_task
 
 import codecs
 import os
@@ -182,6 +182,7 @@ def _coerce_vaults(
     return list(vaults)
 
 
+@measured("statistics_worker_read")
 def _read_utf8_characters(
     path: str,
     expected: dict,
@@ -191,6 +192,7 @@ def _read_utf8_characters(
     parent_validated: bool = False,
 ) -> tuple[int, dict]:
     """Decode one stable regular file incrementally and return code-point count."""
+    _cancelled(cancel)
     if not parent_validated:
         assert_plain_chain(os.path.dirname(path))
     flags = os.O_RDONLY | getattr(os, "O_BINARY", 0)
@@ -314,8 +316,11 @@ def collect_vault_statistics(
                 completed_files=completed_files,
             ))
 
-    for vault_path in sorted(prepared.values(), key=_sort_key):
+    metrics = scan_metrics()
+    for ordinal, vault_path in enumerate(sorted(prepared.values(), key=_sort_key), 1):
         _cancelled(cancel)
+        if metrics is not None:
+            vault_started = time.perf_counter()
         vault_issues_start = len(issues)
         total_files = 0
         total_bytes = 0
@@ -468,6 +473,8 @@ def collect_vault_statistics(
                 directory_guards.append((current, folder_after, direct_children))
             stack.extend((child, False) for child in reversed(child_dirs))
 
+        if metrics is not None:
+            metrics.elapsed("statistics_inventory", time.perf_counter() - vault_started)
         if count_characters and markdown_candidates:
             read_context = copy_context()
             def read_candidate(
@@ -488,9 +495,13 @@ def collect_vault_statistics(
                 return candidate, characters, stable_state, None
 
             worker_count = min(_MAX_CHARACTER_WORKERS, len(markdown_candidates))
-            with ThreadPoolExecutor(
+            if metrics is not None:
+                metrics.add("statistics_pools")
+            initializer = (lambda: metrics.add("statistics_workers_started")) if metrics is not None else None
+            with phase("statistics_utf8"), ThreadPoolExecutor(
                 max_workers=worker_count,
                 thread_name_prefix="obmanage-statistics",
+                initializer=initializer,
             ) as executor:
                 grouped = groupby(markdown_candidates, key=lambda item: item.parent_path)
                 for parent_path, candidate_group in grouped:
@@ -598,6 +609,10 @@ def collect_vault_statistics(
                 else:
                     verified_directories.add(os.path.normcase(directory))
         report(vault_path, "", force=True)
+        complete = len(issues) == vault_issues_start
+        if metrics is not None:
+            metrics.record_vault(ordinal, time.perf_counter() - vault_started,
+                                 total_files, folders + 1, total_bytes, complete)
         results.append(VaultStatistics(
             vault_path=vault_path,
             total_files=total_files,
@@ -608,7 +623,7 @@ def collect_vault_statistics(
             folders=folders,
             file_types=_freeze_file_types(file_type_accumulators),
             characters_counted=count_characters,
-            complete=len(issues) == vault_issues_start,
+            complete=complete,
         ))
 
     final_issue_count = len(issues)

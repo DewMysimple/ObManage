@@ -66,7 +66,7 @@ from .pages.backup import VaultBackupPage
 from .pages.archive import ArchivePage
 from .pages.common import FeaturePage, PathPicker
 from .pages.controls import DropDownCombo
-from .pages.vault_selection import VaultSelection
+from .pages.vault_selection import CatalogPresentationCache, VaultSelection
 from .pages.icons import action_icon
 from .pages.incremental import IncrementalPage
 from .pages.distribution import ComSyncPage
@@ -480,6 +480,7 @@ class MainWindow(QMainWindow):
         self._feature_worker: FeatureWorker | None = None
         self._feature_page: FeaturePage | None = None
         self._feature_outcome: tuple[str, Any] | None = None
+        self._catalog_display = CatalogPresentationCache()
         self._cancel_event = threading.Event()
         self._pending_outcome: tuple[str, Any] | None = None
         self._operation = ""
@@ -964,6 +965,8 @@ class MainWindow(QMainWindow):
             page.message_logged.connect(lambda message, key=feature.key: self._log(message, feature=key))
             for picker in page.findChildren(PathPicker):
                 selection = picker.selection
+                selection.cache = self._catalog_display
+                selection.cancel_requested.connect(self.cancel_operation)
                 selection.task_requested.connect(
                     lambda operation, current=selection: self._start_feature_task(current, operation))
                 selection.status_changed.connect(page.set_status)
@@ -978,6 +981,7 @@ class MainWindow(QMainWindow):
             self.page_stack.addWidget(page_scroll)
 
         self.pages["transactions"].refresh_button.clicked.connect(self._refresh_actions)
+        self.pages["transactions"].records_changed.connect(self._catalog_display.invalidate)
         selected = self.settings_document.selected_page
         self._show_page(selected if selected in self.pages else "mirror", persist=False)
 
@@ -1003,8 +1007,12 @@ class MainWindow(QMainWindow):
         if current is self.mirror_page and page is not current:
             # A destructive acknowledgment never survives leaving its context.
             self.confirm_direction_checkbox.setChecked(False)
+            self.local_selection.dismiss()
+            self.portable_selection.dismiss()
         elif isinstance(current, FeaturePage) and page is not current:
             current.invalidate_confirmation()
+            for selection in current.findChildren(VaultSelection):
+                selection.dismiss()
         self.page_stack.setCurrentWidget(self.page_containers[key])
         self._current_page_key = key
         self.navigation_buttons[key].setChecked(True)
@@ -1049,6 +1057,9 @@ class MainWindow(QMainWindow):
 
     def _vault_selection_buttons(self, layout, accept, browse, roots):
         selection = VaultSelection(self, accept, browse, roots)
+        selection.cache = self._catalog_display
+        selection.cancel_requested.connect(self.cancel_operation)
+        selection.preview_stale.connect(self._invalidate_plan)
         browse_button = layout.itemAt(layout.count() - 1).widget()
         selection.buttons = []
         for text, icon, running in (("仓库列表", "search", False),
@@ -1074,7 +1085,11 @@ class MainWindow(QMainWindow):
             page.set_status("已有任务正在运行，请等待完成或先取消。", "warning")
             page.refresh_actions()
             return
-        worker = FeatureWorker(operation)
+        if not isinstance(page, VaultSelection) and page._task_kind in {
+                "execute", "archive", "clear", "clear_all", "finalize", "resolve", "restore", "rollback"}:
+            # A failed or cancelled writer can still have changed the filesystem.
+            self._catalog_display.invalidate()
+        worker = FeatureWorker(operation, cancellable=page.task_cancellable())
         worker.progress.connect(page.task_progress)
         worker.completed.connect(self._on_feature_completed)
         worker.finished.connect(self._feature_thread_finished)
@@ -1116,6 +1131,12 @@ class MainWindow(QMainWindow):
         self._feature_page = None
         self._feature_outcome = None
         if page is not None:
+            if isinstance(page, VaultSelection):
+                self.pages["transactions"].refresh_records()
+                if self._exit_requested:
+                    page.dismiss()
+                if worker is not None and worker.cancel_event.is_set():
+                    outcome = ("cancelled", None)
             status, payload = outcome
             page.task_finished(status, payload)
             if status == "error":
@@ -1123,7 +1144,7 @@ class MainWindow(QMainWindow):
             elif status == "cancelled":
                 self._log("管理任务已取消。", level="cancelled")
         self._end_log_task(log_context, outcome)
-        if page is not self.pages["transactions"]:
+        if not isinstance(page, VaultSelection) and page is not self.pages["transactions"]:
             self.pages["transactions"].refresh_records()
         self._refresh_actions()
         if self._exit_requested:
@@ -1222,6 +1243,8 @@ class MainWindow(QMainWindow):
             return
         self.settings.set_endpoints(self.local_edit.text().strip(), self.portable_combo.currentText().strip())
         self.settings.set_direction(direction)
+        self.local_selection.dismiss()
+        self.portable_selection.dismiss()
         self._invalidate_plan()
         self.pause_schedule()
         self._refresh_direction_text()
@@ -1580,6 +1603,8 @@ class MainWindow(QMainWindow):
         self._cancel_event = threading.Event()
         self._pending_outcome = None
         self._operation = operation
+        if operation == "execute":
+            self._catalog_display.invalidate()
         self._scheduled = scheduled
         self._job_started = time.monotonic()
         self._begin_log_task("mirror", operation)

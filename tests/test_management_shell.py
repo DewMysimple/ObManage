@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import json
 import time
 from datetime import datetime, timedelta
 from threading import Event
@@ -20,6 +21,7 @@ from obmanage.management.deployment import (
 )
 from obmanage.management.trash import TrashCleanupEngine
 from obmanage.models import PlanItem, SyncCancelled, SyncPlan
+from obmanage.paths import canonical
 from obmanage.pages.backup import VaultBackupPage
 from obmanage.pages.incremental import IncrementalPage
 import obmanage.pages.distribution as distribution_page
@@ -131,6 +133,198 @@ def test_all_path_selectors_share_three_choices_and_runtime_uses_single_task_slo
     finally:
         release.set()
         dispose(application, window)
+
+
+@pytest.fixture
+def picker_catalog(application, tmp_path):
+    root = (tmp_path / "collection").resolve()
+    vault = root / "Pick Me"
+    (vault / ".obsidian").mkdir(parents=True)
+    config = tmp_path / "obsidian.json"
+    config.write_text(json.dumps({"vaults": {}}), encoding="utf-8")
+    window = MainWindow(tmp_path / "state")
+    window.local_edit.setText(str(root))
+    first = window.local_selection
+    stats = window.pages["statistics"].root_picker
+    stats.set_value(str(root))
+    second = stats.selection
+    first.config_path = second.config_path = config
+    try:
+        first.start()
+        assert first.dialog is None
+        wait_until(application, lambda: not window.busy)
+        assert "已实时确认" in first.dialog.freshness.text()
+        assert first.dialog.model.rowCount() == 1
+        first.dialog.reject()
+        window._show_page("statistics", persist=False)
+        yield window, stats, first, second, root, vault, config
+    finally:
+        dispose(application, window)
+
+
+def hold_picker_refresh(monkeypatch, failure=None):
+    from obmanage.pages import vault_selection
+
+    original = vault_selection.discover_vaults
+    entered, release = Event(), Event()
+
+    def blocked(*args, **kwargs):
+        if kwargs.get("recursive", True):
+            entered.set()
+            while not release.wait(0.005):
+                if kwargs["cancel"].is_set():
+                    raise SyncCancelled()
+            if failure is not None:
+                raise failure
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(vault_selection, "discover_vaults", blocked)
+    return entered, release
+
+
+def test_history_click_waits_for_real_refresh_and_uses_the_shared_slot(
+        application, picker_catalog, monkeypatch):
+    window, stats, _first, selection, root, vault, _config = picker_catalog
+    entered, release = hold_picker_refresh(monkeypatch)
+    catalogs = []
+    selection.catalog_ready.connect(catalogs.append)
+    try:
+        selection.start()
+        wait_until(application, entered.is_set)
+        assert window.busy and not window.analyze_button.isEnabled()
+        dialog = selection.dialog
+        assert "上次扫描结果" in dialog.freshness.text() and dialog.isVisible()
+        assert dialog.proxy.index(0, 1).data() == canonical(vault)
+        dialog.search.setText("Pick")
+        dialog.table.selectRow(0)
+        dialog.choose_button.click()
+        assert dialog.isVisible() and not dialog.choose_button.isEnabled()
+        assert stats.value == str(root) and not catalogs
+        release.set()
+        wait_until(application, lambda: not window.busy)
+        assert stats.value == canonical(vault)
+        assert len(catalogs) == 1 and not dialog.isVisible()
+    finally:
+        release.set()
+
+
+def test_replaced_cached_marker_invalidates_existing_mirror_preview(application, picker_catalog):
+    window, _stats, selection, _second, root, vault, _config = picker_catalog
+    window._show_page("mirror", persist=False)
+    window.plan = SyncPlan(str(root), str(root.with_name("other")), [PlanItem("add", "a.md")])
+    window.confirm_direction_checkbox.setChecked(True)
+    assert window.confirm_direction_checkbox.isChecked()
+    (vault / ".obsidian").rename(vault / "moved-marker")
+    (vault / ".obsidian").mkdir()
+    selection.start()
+    wait_until(application, lambda: not window.busy)
+    assert window.local_edit.text() == str(root)
+    assert window.plan is None and not window.confirm_direction_checkbox.isChecked()
+
+
+@pytest.mark.parametrize("change", ("root", "vault", "marker", "registry", "removed", "junction"))
+def test_replaced_identity_cannot_accept_a_pending_history_choice(
+        application, picker_catalog, monkeypatch, change):
+    from test_benchmark_scanning import link_directory
+
+    window, stats, _first, selection, root, vault, config = picker_catalog
+    entered, release = hold_picker_refresh(monkeypatch)
+    try:
+        selection.start()
+        wait_until(application, entered.is_set)
+        dialog = selection.dialog
+        dialog.table.selectRow(0)
+        dialog.choose_button.click()
+        if change == "marker":
+            (vault / ".obsidian").rename(vault / "old-marker")
+            (vault / ".obsidian").mkdir()
+        elif change == "registry":
+            config.write_text(json.dumps({"vaults": {"added": {"path": str(vault)}}}),
+                              encoding="utf-8")
+        elif change == "root":
+            other = root.with_name("moved-root")
+            root.rename(other)
+            root.mkdir()
+            (other / vault.name).rename(vault)
+        else:
+            moved = root.with_name("moved-vault")
+            vault.rename(moved)
+            if change == "vault":
+                (vault / ".obsidian").mkdir(parents=True)
+            elif change == "junction":
+                link_directory(vault, moved)
+        release.set()
+        wait_until(application, lambda: not window.busy)
+        assert stats.value == str(root)
+        assert dialog.isVisible() and not dialog.choose_button.isEnabled()
+        assert "重新选择" in dialog.freshness.text()
+    finally:
+        release.set()
+
+
+@pytest.mark.parametrize("reason", ("exception", "cancel", "leave", "incomplete"))
+def test_failed_refresh_cannot_replace_last_complete_display(
+        application, picker_catalog, monkeypatch, reason):
+    window, stats, _first, selection, root, vault, _config = picker_catalog
+    entered, release = hold_picker_refresh(monkeypatch, OSError("injected") if reason == "exception" else None)
+    try:
+        selection.start()
+        wait_until(application, entered.is_set)
+        dialog = selection.dialog
+        display = selection.cache.get(selection._query)
+        if reason == "cancel":
+            window.cancel_operation()
+        elif reason == "leave":
+            window._show_page("mirror", persist=False)
+        elif reason == "incomplete":
+            (vault / ".obsidian").rename(vault / "old")
+            (vault / ".obsidian").write_text("invalid", encoding="utf-8")
+        release.set()
+        wait_until(application, lambda: not window.busy)
+        assert selection.cache.get(selection._query) is display
+        assert stats.value == str(root)
+        if reason == "leave":
+            assert selection.dialog is None
+        else:
+            assert "已实时确认" not in dialog.freshness.text()
+            assert not dialog.choose_button.isEnabled()
+    finally:
+        release.set()
+
+
+@pytest.mark.parametrize("scope_change", ("root", "registry_source", "transform", "running", "writer", "recovery"))
+def test_history_is_scoped_and_dropped_after_writes_or_recovery_changes(
+        application, picker_catalog, monkeypatch, scope_change):
+    window, stats, first, selection, root, _vault, config = picker_catalog
+    if scope_change == "root":
+        other = root.with_name("different")
+        other.mkdir()
+        stats.set_value(str(other))
+    elif scope_change == "registry_source":
+        selection.config_path = config.with_name("other.json")
+        selection.config_path.write_bytes(config.read_bytes())
+    elif scope_change == "transform":
+        selection.catalog_transform = lambda catalog, cancel: catalog
+    elif scope_change == "writer":
+        page = window.pages["vault_backup"]
+        page.start_task("execute", lambda *_: (_ for _ in ()).throw(OSError("injected write failure")))
+        wait_until(application, lambda: not window.busy)
+        assert first.cache.get(first._query) is None
+    elif scope_change == "recovery":
+        def unreadable(*_):
+            raise OSError("injected journal failure")
+
+        monkeypatch.setattr(DeploymentEngine, "list_batches", unreadable)
+        window.pages["transactions"].refresh_records()
+        assert first.cache.get(first._query) is None
+    if scope_change == "running":
+        from obmanage.pages import vault_selection
+
+        monkeypatch.setattr(vault_selection, "read_running_vaults",
+                            lambda *_args, **_kwargs: VaultCatalogResult())
+    selection.start(scope_change == "running")
+    assert selection.dialog is None
+    wait_until(application, lambda: not window.busy)
 
 
 def test_leaving_mirror_revokes_only_confirmation_and_persists_page(application, tmp_path):

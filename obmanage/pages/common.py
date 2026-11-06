@@ -72,6 +72,7 @@ class PathPicker(QWidget):
         outer.addWidget(self.actions_widget)
         self._inline_actions = False
         self.selection = VaultSelection(self, self.set_value, self._browse, lambda: (self.value,))
+        self.selection.preview_stale.connect(lambda: self.changed.emit(self.value))
         self.vault_list.clicked.connect(lambda: self.selection.start(False))
         self.running_vault.clicked.connect(lambda: self.selection.start(True))
         self.edit.textChanged.connect(self.changed)
