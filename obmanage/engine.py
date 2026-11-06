@@ -7,7 +7,7 @@ have succeeded and the complete source has been scanned again.
 from __future__ import annotations
 
 from .scanning.io import scandir
-from .scanning.metrics import count, measured, scan_task
+from .scanning.metrics import count, measured, phase, scan_task
 
 import hashlib
 import json
@@ -20,6 +20,7 @@ import threading
 import time
 import uuid
 from concurrent.futures import FIRST_EXCEPTION, Future, ThreadPoolExecutor, TimeoutError, wait
+from contextlib import ExitStack, nullcontext
 from contextvars import copy_context
 from dataclasses import dataclass
 from pathlib import Path
@@ -30,8 +31,9 @@ from .reading import ReadScope, hash_stream
 from .file_types import is_video_filename
 from .models import PlanItem, Progress, SyncCancelled, SyncError, SyncPlan, SyncResult
 from .paths import (assert_plain_chain, canonical, checked_child, checked_child_snapshot,
-                    identity, native, revalidate_roots, snapshot, validate_roots,
-                    validate_state_separation)
+                    discard_windows_stage, hold_windows_directory, identity, native, open_windows_stage,
+                    publish_windows_stage, revalidate_roots, set_windows_stage_times, snapshot,
+                    validate_roots, validate_state_separation)
 from .store import BaselineStore
 
 HASH_PROGRESS_INTERVAL = 0.08
@@ -70,6 +72,7 @@ class _PendingCopy:
     digest: str = ""
     source_atime_ns: int = 0
     temp_state: dict | None = None
+    create_only: bool = False
 
 
 def _cancelled(cancel: threading.Event | None) -> None:
@@ -234,11 +237,11 @@ def _require_state(path: str, expected: dict | None, message: str) -> None:
 
 
 def _hash_file(path: str, expected: dict, cancel: threading.Event | None,
-               progress: ProgressCallback, relative_path: str) -> str:
+               progress: ProgressCallback, relative_path: str, *, stage=None) -> str:
     """Hash only a stable version of the file, never silently adopt a new version."""
     _cancelled(cancel)
     _require_state(path, expected, "校验前文件已改变")
-    with open(native(path), "rb") as stream:
+    with (open(native(path), "rb") if stage is None else nullcontext(stage)) as stream:
         opened = os.fstat(stream.fileno())
         if (opened.st_ino, opened.st_dev, opened.st_size, opened.st_mtime_ns) != (
                 expected["inode"], expected["device"], expected["size"], expected["mtime_ns"]):
@@ -756,7 +759,7 @@ class SyncEngine:
     def _start_copy(self, plan: SyncPlan, item: PlanItem, store: BaselineStore,
                     cancel: threading.Event | _CombinedCancel | None,
                     root_checkpoint: Callable[[bool], None],
-                    executor: ThreadPoolExecutor | None) -> _PendingCopy:
+                    executor: ThreadPoolExecutor | None, *, create_only: bool = False) -> _PendingCopy:
         """Validate and register one temp before its inline or dispatched write."""
         relative = item.relative_path
         expected = plan.context["source_entries"][relative]
@@ -786,6 +789,7 @@ class SyncEngine:
                 temp_path=temp_path,
                 temp_identity=temp_identity,
                 temp_fd=temp_fd,
+                create_only=create_only,
             )
             store.register_temp(plan.pair_id, temp_path, temp_identity)
             if executor is None:
@@ -795,7 +799,7 @@ class SyncEngine:
                 pending.future = Future()
                 pending.future.set_result(written)
             else:
-                pending.future = executor.submit(self._write_copy_temp, pending, cancel)
+                pending.future = executor.submit(copy_context().run, self._write_copy_temp, pending, cancel)
             return pending
         except BaseException:
             if pending is not None:
@@ -808,12 +812,16 @@ class SyncEngine:
                 try:
                     assert_plain_chain(os.path.dirname(canonical(temp_path)))
                     if identity(snapshot(temp_path)) == temp_identity:
-                        os.unlink(temp_path)
+                        if create_only:
+                            discard_windows_stage(temp_path, temp_identity)
+                        else:
+                            os.unlink(temp_path)
                 except (OSError, SyncError):
                     pass
             raise
 
     @staticmethod
+    @measured("source_to_stage")
     def _write_copy_temp(pending: _PendingCopy,
                          cancel: threading.Event | _CombinedCancel | None) -> tuple[int, str, int]:
         """Write and hash a source; small same-volume files may run inline."""
@@ -943,25 +951,39 @@ class SyncEngine:
                 total_files=total_copy_files,
             )
 
-        if _hash_file(temp_path, temp_state, cancel, verify_progress, relative) != pending.digest:
-            raise SyncError(f"写入后内容校验失败：{relative}")
-        # Copy only timestamps; carrying a read-only mode onto a staging file
-        # would complicate cancellation cleanup and future overwrites.
-        os.utime(temp_path, ns=(pending.source_atime_ns, expected["mtime_ns"]))
-        staged_state = snapshot(temp_path)
-        _cancelled(cancel)
-        root_checkpoint(False)
-        checked_target, target_state = checked_child_snapshot(plan.target, relative)
-        if checked_target != pending.target_path or target_state != pending.target_expected:
-            raise SyncError(f"提交前目标文件已改变，请重新分析差异：{pending.target_path}")
-        _require_state(pending.source_path, expected, "提交前源文件已改变")
-        _mutate_target_file(
-            pending.target_path,
-            pending.target_expected,
-            "提交前目标文件已改变",
-            lambda: os.replace(temp_path, native(pending.target_path)),
-            _WINDOWS_REPLACE_READONLY_ERRORS,
-        )
+        owner = (open_windows_stage(temp_path, pending.temp_identity) if pending.create_only
+                 else nullcontext((None, None)))
+        with owner as (stage, handle):
+            with phase("staged_sha256", tallies=("hash_bytes",)):
+                if _hash_file(temp_path, temp_state, cancel, verify_progress, relative,
+                              **({"stage": stage} if pending.create_only else {})) != pending.digest:
+                    raise SyncError(f"写入后内容校验失败：{relative}")
+            # Copy only timestamps; carrying a read-only mode onto a staging
+            # file would complicate cancellation cleanup and future overwrites.
+            with phase("set_timestamps"):
+                if pending.create_only:
+                    set_windows_stage_times(handle, pending.source_atime_ns, expected["mtime_ns"])
+                else:
+                    os.utime(temp_path, ns=(pending.source_atime_ns, expected["mtime_ns"]))
+            staged_state = snapshot(temp_path)
+            _cancelled(cancel)
+            root_checkpoint(False)
+            checked_target, target_state = checked_child_snapshot(plan.target, relative)
+            if checked_target != pending.target_path or target_state != pending.target_expected:
+                raise SyncError(f"提交前目标文件已改变，请重新分析差异：{pending.target_path}")
+            _require_state(pending.source_path, expected, "提交前源文件已改变")
+            with phase("atomic_publish"):
+                if pending.create_only:
+                    publish_windows_stage(handle, pending.target_path)
+                else:
+                    _mutate_target_file(
+                        pending.target_path,
+                        pending.target_expected,
+                        "提交前目标文件已改变",
+                        lambda: os.replace(temp_path, native(pending.target_path)),
+                        _WINDOWS_REPLACE_READONLY_ERRORS,
+                    )
+        count("published_files")
         result.copied_files += 1
         result.copied_bytes += pending.copied
         dst_state = snapshot(pending.target_path)
@@ -971,19 +993,16 @@ class SyncEngine:
         # FAT-family filesystems can issue a new file ID when a directory
         # entry is renamed. Verify the stable final path by content before
         # accepting any identity or timestamp change.
-        if (identity(dst_state) != identity(staged_state)
-                or dst_state["mtime_ns"] != staged_state["mtime_ns"]):
-            if _hash_file(pending.target_path, dst_state, cancel, None, relative) != pending.digest:
-                raise SyncError(f"提交后目标文件发生变化：{relative}")
+        with phase("postwrite_recheck", tallies=("hash_bytes",)):
+            if (identity(dst_state) != identity(staged_state)
+                    or dst_state["mtime_ns"] != staged_state["mtime_ns"]):
+                if _hash_file(pending.target_path, dst_state, cancel, None, relative) != pending.digest:
+                    raise SyncError(f"提交后目标文件发生变化：{relative}")
         _require_state(pending.source_path, expected, "提交后源文件已改变")
-        store.finalize_copy(
-            plan.pair_id,
-            relative,
-            expected,
-            dst_state,
-            pending.digest,
-            temp_path,
-        )
+        with phase("copy_baseline"):
+            store.finalize_copy(
+                plan.pair_id, relative, expected, dst_state, pending.digest, temp_path,
+            )
         pending.temp_path = ""
         _emit(
             progress,
@@ -1017,7 +1036,10 @@ class SyncEngine:
         try:
             assert_plain_chain(os.path.dirname(canonical(temp_path)))
             if identity(snapshot(temp_path)) == pending.temp_identity:
-                os.unlink(temp_path)
+                if pending.create_only:
+                    discard_windows_stage(temp_path, pending.temp_identity)
+                else:
+                    os.unlink(temp_path)
             if snapshot(temp_path) is None:
                 store.unregister_temp(temp_path)
         except (OSError, SyncError, sqlite3.Error):
@@ -1149,6 +1171,7 @@ class SyncEngine:
                 continue
         return [item for item in deletions if _key(item.relative_path) not in recovered]
 
+    @measured("execute_preflight")
     def _validate_plan(self, plan: SyncPlan, cancel: threading.Event | None,
                        progress: ProgressCallback) -> None:
         """Read-only preflight shared by single-vault and batch execution."""
@@ -1178,7 +1201,22 @@ class SyncEngine:
         finally:
             self._lock.release()
 
-    def execute(self, plan: SyncPlan, *, allow_empty: bool = False,
+    @staticmethod
+    def require_new_target(plan: SyncPlan) -> None:
+        """A first-copy plan must publish exactly the entire ordinary source tree."""
+        context = plan.context
+        entries = context["source_entries"]
+        actions = {item.relative_path: (item.action, item.size) for item in plan.items}
+        if (os.name != "nt" or plan.mode != SYNC_MODE_MIRROR
+                or context["target_root"] is not None or context["target_entries"]
+                or plan.excluded_source_files or plan.excluded_target_files
+                or any(state["kind"] not in ("file", "dir") for state in entries.values())
+                or len(actions) != len(plan.items)
+                or actions != {name: ("mkdir" if state["kind"] == "dir" else "add", state["size"])
+                               for name, state in entries.items()}):
+            raise SyncError("首次复制只接受不存在的目标和完整的新增计划。")
+
+    def execute(self, plan: SyncPlan, *, allow_empty: bool = False, create_only: bool = False,
                 cancel: threading.Event | None = None, progress: ProgressCallback = None) -> SyncResult:
         started = time.monotonic()
         result = SyncResult(status="failed")
@@ -1186,9 +1224,14 @@ class SyncEngine:
             result.errors.append("已有同步任务运行中。")
             return result
         store: BaselineStore | None = None
+        pinned = ExitStack()
         try:
             self._validate_plan(plan, cancel, progress)
             context = plan.context
+            if create_only:
+                self.require_new_target(plan)
+                if allow_empty:
+                    raise SyncError("首次复制不能授权清空目标。")
             deletions = [item for item in plan.items if item.action in ("delete", "rmdir")]
             if plan.source_empty and deletions and not allow_empty:
                 raise SyncError("源目录为空。清空目标前必须在界面手动确认。")
@@ -1203,7 +1246,15 @@ class SyncEngine:
             _cancelled(cancel)
             if context["target_root"] is None:
                 revalidate_roots(context)
-                os.makedirs(native(plan.target), exist_ok=False)
+                with phase("target_mkdir"):
+                    if create_only:
+                        parent = os.path.dirname(plan.target)
+                        pinned.enter_context(hold_windows_directory(parent, identity(snapshot(parent))))
+                        revalidate_roots(context)
+                        pinned.enter_context(hold_windows_directory(plan.target, create=True))
+                    else:
+                        os.makedirs(native(plan.target), exist_ok=False)
+                count("created_directories")
             target_root = snapshot(plan.target)
             for item in sorted((item for item in plan.items if item.action == "rename"),
                                key=lambda item: (context["source_entries"][item.relative_path]["kind"] != "dir",
@@ -1216,7 +1267,12 @@ class SyncEngine:
                 directory = checked_child(plan.target, item.relative_path)
                 if snapshot(directory) is not None:
                     raise SyncError(f"目标目录在预览后已出现：{item.relative_path}")
-                os.mkdir(native(directory))
+                with phase("target_mkdir"):
+                    if create_only:
+                        pinned.enter_context(hold_windows_directory(directory, create=True))
+                    else:
+                        os.mkdir(native(directory))
+                count("created_directories")
                 expected_targets[_key(item.relative_path)] = snapshot(directory)
             copy_items = [
                 item for item in plan.items if item.action in ("add", "update")
@@ -1267,6 +1323,7 @@ class SyncEngine:
                 pending = self._start_copy(
                     plan, item, store, pipeline_cancel, root_checkpoint,
                     copy_pool if dispatch else None,
+                    **({"create_only": True} if create_only else {}),
                 )
                 pending_copies.append(pending)
                 return pending
@@ -1335,12 +1392,13 @@ class SyncEngine:
                         )
             # No deletion at all unless all writes succeeded and the entire
             # source is still exactly the snapshot that was previewed.
-            root_checkpoint(True)
-            _require_manifest(context["source_entries"],
-                              _scan(plan.source, cancel, progress, mode=plan.mode)[0],
-                              root=plan.source, side="源端",
-                              message="源目录在同步期间发生变化，已停止删除；请重新分析差异。")
-            self._verify_target(plan, expected_targets, cancel)
+            with phase("final_barrier"):
+                root_checkpoint(True)
+                _require_manifest(context["source_entries"],
+                                  _scan(plan.source, cancel, progress, mode=plan.mode)[0],
+                                  root=plan.source, side="源端",
+                                  message="源目录在同步期间发生变化，已停止删除；请重新分析差异。")
+                self._verify_target(plan, expected_targets, cancel)
             if deletions:
                 for item in sorted(
                         deletions,
@@ -1403,6 +1461,7 @@ class SyncEngine:
             result.status = "failed"
             result.errors.append(str(exc))
         finally:
+            pinned.close()
             if store is not None:
                 store.close()
             self.__dict__.pop("_execution_target_states", None)

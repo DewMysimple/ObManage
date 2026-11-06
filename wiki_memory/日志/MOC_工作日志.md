@@ -3,7 +3,7 @@ type: moc
 status: active
 kind: process
 importance: high
-updated: 2026-11-06
+updated: 2026-11-07
 topic: work-log-index
 source_logs: []
 supersedes: null
@@ -15,6 +15,7 @@ supersedes: null
 
 | 时间 | 类型 | 目标 | 状态 | 主题 | 日志 |
 | --- | --- | --- | --- | --- | --- |
+| 2026-11-07 | feature | - | archived | real-initial-one-way-sync-experiment | [真实首次单向同步实验](./2026-11-07-真实首次单向同步实验.md) |
 | 2026-11-06 | maintenance | - | archived | real-device-readonly-scanning | [真实介质扫描诊断与优化](./2026-11-06-真实介质扫描诊断与优化.md) |
 | 2026-11-06 | maintenance | - | archived | incremental-scan-refinement | [增量异常快退与实时复核精修](./2026-11-06-增量异常快退与实时复核精修.md) |
 | 2026-11-06 | maintenance | - | archived | catalog-presentation-and-benchmark-safety | [仓库列表响应与安全性能基准](./2026-11-06-仓库列表响应与安全性能基准.md) |

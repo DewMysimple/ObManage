@@ -308,7 +308,7 @@ class IncrementalEngine:
             raise SyncError("存在待处理旧版回收站批次，已阻止仓库增量写入。")
 
     def execute(self, analysis: IncrementalAnalysis, choices: Mapping[str, str], *,
-                allow_empty: bool = False, cancel: threading.Event | None = None,
+                allow_empty: bool = False, create_only: bool = False, cancel: threading.Event | None = None,
                 progress: ProgressCallback = None) -> IncrementalResult:
         result = IncrementalResult()
         if not _TASK_LOCK.acquire(blocking=False):
@@ -317,6 +317,11 @@ class IncrementalEngine:
         try:
             choices = dict(choices)
             selected = selected_plans(analysis, choices)
+            if create_only:
+                if allow_empty or set(choices.values()) != {"local"}:
+                    raise SyncError("首次复制只允许电脑端作为来源。")
+                for _, plan in selected:
+                    SyncEngine.require_new_target(plan)
             if ((analysis.local_root, analysis.portable_root)
                     != (analysis.context.get("source"), analysis.context.get("target"))):
                 raise SyncError("集合路径已改变，请重新分析。")
@@ -354,7 +359,8 @@ class IncrementalEngine:
                                          completed_bytes=reported_bytes, total_bytes=total_bytes,
                                          completed_files=index, total_files=len(selected)))
 
-                outcome = engine.execute(plan, allow_empty=allow_empty, cancel=cancel, progress=report)
+                outcome = engine.execute(plan, allow_empty=allow_empty, cancel=cancel, progress=report,
+                                         **({"create_only": True} if create_only else {}))
                 result.outcomes.append(VaultOutcome(pair.key, plan.source, plan.target, outcome))
                 if outcome.status != "success":
                     result.status = outcome.status

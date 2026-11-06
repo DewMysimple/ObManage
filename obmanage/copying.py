@@ -2,8 +2,10 @@
 from __future__ import annotations
 
 import hashlib
+import time
 from typing import BinaryIO, Callable
 from .reading import BUFFER_LIMIT, buffer_size
+from .scanning.metrics import current
 
 
 COPY_BUFFER_SIZE = BUFFER_LIMIT
@@ -27,21 +29,35 @@ def copy_stream_and_hash(
     view = memoryview(buffer)
     digest = hashlib.sha256()
     copied = 0
+    metrics = current()
     while True:
         check_cancel()
-        count = source.readinto(buffer)
+        if metrics is None:
+            count = source.readinto(buffer)
+        else:
+            started = time.perf_counter()
+            count = source.readinto(buffer)
+            metrics.elapsed("source_read", time.perf_counter() - started)
+            metrics.add("source_read_bytes", count)
         if not count:
             break
         block = view[:count]
         offset = 0
         while offset < count:
             check_cancel()
-            written = destination.write(block[offset:])
+            if metrics is None:
+                written = destination.write(block[offset:])
+            else:
+                started = time.perf_counter()
+                written = destination.write(block[offset:])
+                metrics.elapsed("stage_write", time.perf_counter() - started)
             if written is None:
                 written = count - offset
             if written <= 0:
                 raise OSError("写入流未接受任何数据。")
             offset += written
+            if metrics is not None:
+                metrics.add("stage_write_bytes", written)
         digest.update(block)
         copied += count
         if progress is not None:

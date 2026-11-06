@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import stat
+from contextlib import contextmanager
 from pathlib import Path
 
 from .models import SyncError
@@ -72,6 +73,152 @@ def identity(state: dict | None) -> tuple | None:
     if state is None:
         return None
     return state["kind"], state["device"], state["inode"]
+
+
+def _create_windows_directory(path, share):
+    """Create a new directory and obtain its non-deletable handle in one call."""
+    from ctypes import wintypes as w
+
+    class UnicodeString(ctypes.Structure):
+        _fields_ = (("length", w.USHORT), ("capacity", w.USHORT), ("text", w.LPWSTR))
+
+    class ObjectAttributes(ctypes.Structure):
+        _fields_ = (("length", w.ULONG), ("root", w.HANDLE),
+                    ("name", ctypes.POINTER(UnicodeString)), ("flags", w.ULONG),
+                    ("security", w.LPVOID), ("quality", w.LPVOID))
+
+    dll = ctypes.WinDLL("ntdll")
+    create = dll.NtCreateFile
+    create.argtypes = (ctypes.POINTER(w.HANDLE), w.ULONG, ctypes.POINTER(ObjectAttributes),
+                       w.LPVOID, w.LPVOID, w.ULONG, w.ULONG, w.ULONG, w.ULONG, w.LPVOID, w.ULONG)
+    create.restype = w.LONG
+    convert = dll.RtlNtStatusToDosError
+    convert.argtypes = (w.LONG,)
+    convert.restype = w.ULONG
+    name = "\\??\\" + native(path)[4:]
+    length = len(name.encode("utf-16-le"))
+    name_buffer = ctypes.create_unicode_buffer(name)
+    text = UnicodeString(length, length + 2, ctypes.cast(name_buffer, w.LPWSTR))
+    attributes = ObjectAttributes(ctypes.sizeof(ObjectAttributes), None, ctypes.pointer(text),
+                                  0x1040, None, None)  # DONT_REPARSE | CASE_INSENSITIVE
+    status_block = (ctypes.c_size_t * 2)()
+    handle = w.HANDLE()
+    # FILE_CREATE (exclusive) and FILE_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT.
+    status = create(ctypes.byref(handle), 0x100081, ctypes.byref(attributes), status_block,
+                    None, 0, share, 2, 0x21, None, 0)
+    if status < 0:
+        raise ctypes.WinError(convert(status))
+    return handle
+
+
+@contextmanager
+def hold_windows_directory(path: str | Path, expected: tuple | None = None, *, create=False):
+    """Pin one ordinary directory while creating children through its path."""
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    create_file = kernel.CreateFileW
+    create_file.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD,
+                            wintypes.LPVOID, wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
+    create_file.restype = wintypes.HANDLE
+    close = kernel.CloseHandle
+    close.argtypes = (wintypes.HANDLE,)
+    # LIST_DIRECTORY | READ_ATTRIBUTES, share read/write (no delete), OPEN_EXISTING,
+    # BACKUP_SEMANTICS | OPEN_REPARSE_POINT.
+    if create:
+        handle = _create_windows_directory(path, 3)
+    else:
+        handle = create_file(native(path), 0x81, 3, None, 3, 0x02200000, None)
+        if handle == ctypes.c_void_p(-1).value:
+            raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        actual = identity(snapshot(path))
+        if (not actual or actual[0] != "dir" or not actual[2]
+                or (not create and actual != expected)):
+            raise SyncError(f"无法固定新增范围内的目录身份：{path}")
+        yield actual
+    finally:
+        close(handle)
+
+
+@contextmanager
+def open_windows_stage(path: str, expected: tuple):
+    """Keep readback, attribute changes and publication on the owned temp handle."""
+    import msvcrt
+    from ctypes import wintypes as w
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    create = kernel.CreateFileW
+    create.argtypes = (w.LPCWSTR, w.DWORD, w.DWORD, w.LPVOID, w.DWORD, w.DWORD, w.HANDLE)
+    create.restype = w.HANDLE
+    close = kernel.CloseHandle
+    close.argtypes = (w.HANDLE,)
+    # GENERIC_READ | DELETE | WRITE_ATTRIBUTES, share read only,
+    # OPEN_EXISTING | OPEN_REPARSE_POINT.
+    handle = create(native(path), 0x80010100, 1, None, 3, 0x00200000, None)
+    if handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        fd = msvcrt.open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
+    except BaseException:
+        close(handle)
+        raise
+    try:
+        with os.fdopen(fd, "rb", closefd=False) as stream:
+            state = os.fstat(fd)
+            if (("file", state.st_dev, state.st_ino) != expected or is_reparse(state)
+                    or not stat.S_ISREG(state.st_mode)):
+                raise SyncError(f"暂存文件所有权已改变：{path}")
+            yield stream, handle
+    finally:
+        os.close(fd)
+
+
+def set_windows_stage_times(handle, access_ns, modification_ns):
+    from ctypes import wintypes as w
+
+    def file_time(nanoseconds):
+        ticks = nanoseconds // 100 + 116444736000000000
+        return w.FILETIME(ticks & 0xFFFFFFFF, ticks >> 32)
+
+    set_time = ctypes.WinDLL("kernel32", use_last_error=True).SetFileTime
+    set_time.argtypes = (w.HANDLE, ctypes.POINTER(w.FILETIME),
+                         ctypes.POINTER(w.FILETIME), ctypes.POINTER(w.FILETIME))
+    set_time.restype = w.BOOL
+    access, modification = file_time(access_ns), file_time(modification_ns)
+    if not set_time(handle, None, ctypes.byref(access), ctypes.byref(modification)):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _set_windows_file_information(handle, kind, buffer, size):
+    from ctypes import wintypes as w
+
+    setter = ctypes.WinDLL("kernel32", use_last_error=True).SetFileInformationByHandle
+    setter.argtypes = (w.HANDLE, ctypes.c_int, w.LPVOID, w.DWORD)
+    setter.restype = w.BOOL
+    if not setter(handle, kind, buffer, size):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def publish_windows_stage(handle, target):
+    """Rename the already-open file with ReplaceIfExists disabled."""
+    from ctypes import wintypes as w
+
+    class RenameInfo(ctypes.Structure):
+        _fields_ = (("flags", w.DWORD), ("root", w.HANDLE), ("length", w.DWORD), ("name", w.WCHAR))
+
+    name = native(target).encode("utf-16-le")
+    buffer = ctypes.create_string_buffer(max(ctypes.sizeof(RenameInfo), RenameInfo.name.offset + len(name) + 2))
+    info = RenameInfo.from_buffer(buffer)
+    info.length = len(name)
+    ctypes.memmove(ctypes.addressof(buffer) + RenameInfo.name.offset, name, len(name))
+    _set_windows_file_information(handle, 3, buffer, ctypes.sizeof(buffer))  # FileRenameInfo
+
+
+def discard_windows_stage(path, expected):
+    with open_windows_stage(path, expected) as (_, handle):
+        delete = ctypes.c_int(1)
+        _set_windows_file_information(handle, 4, ctypes.byref(delete), ctypes.sizeof(delete))  # FileDispositionInfo
 
 
 @measured("plain_chain", calls=True)
