@@ -49,8 +49,7 @@ def _physical_plain_directory(path: str | Path) -> tuple[str | None, ManagementI
     """Resolve aliases only after the selected chain has been proven link-free."""
     selected = canonical(path)
     try:
-        assert_plain_chain(selected)
-        state = snapshot(selected)
+        state = assert_plain_chain(selected, leaf_snapshotter=snapshot)
     except (OSError, SyncError) as exc:
         return None, ManagementIssue("unsafe_path", f"无法安全检查目录：{exc}", selected)
     if state is None:
@@ -68,8 +67,7 @@ def _physical_plain_directory(path: str | Path) -> tuple[str | None, ManagementI
         physical_state = state
     else:
         try:
-            assert_plain_chain(physical)
-            physical_state = snapshot(physical)
+            physical_state = assert_plain_chain(physical, leaf_snapshotter=snapshot)
         except (OSError, SyncError) as exc:
             return None, ManagementIssue("unsafe_path", f"无法安全检查目录：{exc}", selected)
     if physical_state is None or physical_state["kind"] != "dir":
@@ -77,6 +75,7 @@ def _physical_plain_directory(path: str | Path) -> tuple[str | None, ManagementI
     return physical, None
 
 
+@measured("marker_probe", calls=True)
 def _marker_state(directory: str) -> tuple[str, ManagementIssue | None]:
     """Return absent/valid/unreadable/invalid for a possible marker."""
     marker = canonical(os.path.join(directory, ".obsidian"))

@@ -5,8 +5,8 @@ from threading import Event
 import pytest
 
 from obmanage.models import SyncCancelled, SyncError
-from obmanage.paths import canonical
-from obmanage.scanning.metrics import ScanMetrics, count, measured
+from obmanage.paths import canonical, native, snapshot
+from obmanage.scanning.metrics import ScanMetrics, count, measured, phase
 from obmanage.scanning.session import ScanSession
 
 
@@ -89,6 +89,59 @@ def test_directory_change_while_enumerating_is_explicit(tmp_path):
         observed = session.observe(tmp_path, snapshotter=change)
         assert observed.issues[0].code == "directory_changed"
         assert "枚举期间" in observed.issues[0].message
+
+
+def test_observe_reuses_only_the_adjacent_checked_leaf(tmp_path, monkeypatch):
+    checked, enumerated = [], []
+    real_lstat, real_scan = os.lstat, os.scandir
+
+    def lstat(path, *args, **kwargs):
+        checked.append(canonical(path))
+        return real_lstat(path, *args, **kwargs)
+
+    def scandir(path):
+        enumerated.append(len(checked))
+        return real_scan(path)
+
+    monkeypatch.setattr(os, "lstat", lstat)
+    monkeypatch.setattr(os, "scandir", scandir)
+    for _ in range(2):
+        with ScanSession() as session:
+            session.observe(tmp_path)
+    assert checked.count(str(tmp_path)) == 4  # checked chain leaf + after, in each epoch
+    assert len(enumerated) == 2
+    for position in enumerated:
+        assert checked[position - 2:position + 1] == [str(tmp_path.parent), str(tmp_path), str(tmp_path)]
+
+
+def test_metadata_diagnostics_count_each_query_once_and_hide_paths(tmp_path, monkeypatch):
+    (tmp_path / "private-name.md").write_bytes(b"private body")
+    inaccessible = tmp_path / "private-missing"
+    original = os.lstat
+
+    def lstat(path, *args, **kwargs):
+        if path == native(inaccessible):
+            raise PermissionError(str(inaccessible))
+        return original(path, *args, **kwargs)
+
+    monkeypatch.setattr(os, "lstat", lstat)
+    metrics = ScanMetrics()
+    assert snapshot(tmp_path)["kind"] == "dir"
+    assert not metrics.counts
+    with metrics.activate(), phase("final_revalidation", tallies=("snapshot_calls", "directory_enumerations")):
+        with ScanSession() as session:
+            session.observe(tmp_path, full=False)
+            session.observe(tmp_path)
+        with pytest.raises(PermissionError):
+            snapshot(inaccessible)
+    counts = metrics.counts
+    assert counts["lstat_errors"] == counts["direntry_stat_calls"] == counts["directory_enumerations"] == 1
+    assert counts["metadata_upgrades"] == 1
+    assert counts["snapshot_calls"] == counts["lstat_calls"] == counts["final_revalidation_snapshot_calls"]
+    assert counts["metadata_queries"] == counts["lstat_calls"] + counts["direntry_stat_calls"]
+    assert counts["final_revalidation_directory_enumerations"] == 1
+    assert all(metrics.seconds[key] > 0 for key in ("lstat", "plain_chain", "direntry_stat", "final_revalidation"))
+    assert "private" not in str(metrics.report())
 
 
 def test_windows_discovery_metadata_is_upgraded_before_a_manifest(tmp_path):

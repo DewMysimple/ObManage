@@ -18,7 +18,7 @@ from ..file_types import is_video_filename
 from ..models import SyncCancelled, SyncError
 from ..paths import assert_plain_chain, canonical, is_reparse, native, snapshot
 from .io import scandir
-from .metrics import count, measured
+from .metrics import count, current, measured
 
 
 @dataclass(frozen=True)
@@ -181,9 +181,13 @@ class ScanSession:
             return previous
         read_state = snapshotter or snapshot
         try:
+            before = folder_state
             if not chain_validated:
-                assert_plain_chain(directory)
-            before = folder_state if folder_state is not None else read_state(directory)
+                checked = assert_plain_chain(directory, leaf_snapshotter=read_state if before is None else None)
+                if before is None:
+                    before = checked
+            elif before is None:
+                before = read_state(directory)
         except (OSError, SyncError) as exc:
             raise ScanPathError("unsafe_path", directory, f"无法安全检查目录：{exc}") from exc
         if before is None:
@@ -202,8 +206,10 @@ class ScanSession:
                             state = (entry_snapshotter(path) if entry_snapshotter is not None
                                      else read_state(path))
                         else:
-                            count("metadata_queries")
-                            state = _enumerated_state(entry.stat(follow_symlinks=False))
+                            metrics = current()
+                            value = (entry.stat(follow_symlinks=False) if metrics is None else
+                                     metrics.query("direntry_stat", entry.stat, follow_symlinks=False))
+                            state = _enumerated_state(value)
                     except FileNotFoundError:
                         state = None
                     except OSError as exc:
@@ -218,6 +224,7 @@ class ScanSession:
             if before != previous.state:
                 raise SyncError(f"目录在采集清单前改变：{directory}")
             count("reused_directories")
+            count("metadata_upgrades")
             for entry in previous.entries:
                 _cancel(self.cancel)
                 if entry.state is None:

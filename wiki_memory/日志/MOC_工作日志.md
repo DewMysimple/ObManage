@@ -3,7 +3,7 @@ type: moc
 status: active
 kind: process
 importance: high
-updated: 2026-11-05
+updated: 2026-11-06
 topic: work-log-index
 source_logs: []
 supersedes: null
@@ -15,6 +15,7 @@ supersedes: null
 
 | 时间 | 类型 | 目标 | 状态 | 主题 | 日志 |
 | --- | --- | --- | --- | --- | --- |
+| 2026-11-06 | maintenance | - | archived | incremental-scan-refinement | [增量异常快退与实时复核精修](./2026-11-06-增量异常快退与实时复核精修.md) |
 | 2026-11-05 | maintenance | - | archived | shared-scan-refactor | [共享扫描机制重构](./2026-11-05-共享扫描机制重构.md) |
 | 2026-11-02 | bug | - | archived | comsync-bulk-preview-and-transaction-actions | [.comSync 批量预览与事务简化](./2026-11-02-comSync批量预览与事务简化.md) |
 | 2026-10-31 | feature | - | archived | comsync-obsidian-lifecycle | [.comSync 自动关闭与打开仓库](./2026-10-31-comSync自动关闭与打开仓库.md) |

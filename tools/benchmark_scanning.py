@@ -14,9 +14,8 @@ import subprocess
 import sys
 import tarfile
 import tempfile
-import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from threading import Event
 from unittest.mock import patch
@@ -24,13 +23,16 @@ from unittest.mock import patch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from obmanage.scanning.metrics import ScanMetrics, phase
-from obmanage.scanning.session import ScanSession
+from obmanage.paths import assert_plain_chain
 
-BASELINE = "c56a6885d2f5f4d08d7d548e7955c40dcd560de2"
+BASELINE = "2bb5c3e0f42e6b9583f171cf79777783df6a799b"
+SCENARIOS = ("first", "unchanged", "changed", "deep", "statistics_metadata", "statistics_utf8",
+             "archive", "cancel", "error", "error_partial", "new_vault", "final_change")
+FAULTS = ("error", "error_partial", "new_vault", "final_change")
 
 
 @contextmanager
-def reference_package(ref=BASELINE):
+def reference_package(ref="c56a6885d2f5f4d08d7d548e7955c40dcd560de2"):
     """Load immutable Git source under another package name, never change checkout."""
     commit = subprocess.check_output(["git", "rev-parse", "--verify", "--end-of-options", ref + "^{commit}"],
                                      cwd=ROOT, text=True).strip()
@@ -49,7 +51,8 @@ def reference_package(ref=BASELINE):
                     source = archive.extractfile(member).read().decode("utf-8")
                     # Add timers only: the immutable reference still performs its
                     # original enumeration, comparisons and exception handling.
-                    if member.name.endswith("/management/statistics.py"):
+                    if (member.name.endswith("/management/statistics.py")
+                            and 'with phase("final_revalidation"):' not in source):
                         start = source.index("        for directory, expected_folder, expected_children in directory_guards:")
                         end = source.index('\n        report(vault_path, "", force=True)', start)
                         block = source[start:end]
@@ -73,9 +76,13 @@ def reference_package(ref=BASELINE):
 
 
 def api(package="obmanage"):
-    return {name: importlib.import_module(f"{package}.{name}") for name in (
+    modules = {name: importlib.import_module(f"{package}.{name}") for name in (
         "engine", "management.incremental", "management.catalog",
-        "management.statistics", "management.archive", "reading", "store")}
+        "management.statistics", "management.archive", "reading", "store", "paths")}
+    if importlib.util.find_spec(f"{package}.scanning") is not None:
+        modules["metrics"] = importlib.import_module(f"{package}.scanning.metrics")
+        modules["session"] = importlib.import_module(f"{package}.scanning.session")
+    return modules
 
 
 @contextmanager
@@ -86,16 +93,25 @@ def observations(modules, metrics):
     enumeration buffer. OS-internal operations are not represented as syscalls.
     """
     original_scan, original_lstat, original_stat = os.scandir, os.lstat, os.stat
+    def query(name, function, *args, **kwargs):
+        metrics.add("observed_metadata")
+        metrics.add(name)
+        started = time.perf_counter()
+        try:
+            return function(*args, **kwargs)
+        except OSError:
+            metrics.add(name + "_errors")
+            raise
+        finally:
+            elapsed = time.perf_counter() - started
+            metrics.elapsed("observed_metadata", elapsed)
+            metrics.elapsed(name, elapsed)
+
     class Entry:
         def __init__(self, entry): self.entry = entry
         def __getattr__(self, name): return getattr(self.entry, name)
         def stat(self, *args, **kwargs):
-            metrics.add("observed_metadata")
-            started = time.perf_counter()
-            try:
-                return self.entry.stat(*args, **kwargs)
-            finally:
-                metrics.elapsed("observed_metadata", time.perf_counter() - started)
+            return query("observed_direntry_stat", self.entry.stat, *args, **kwargs)
     class Directory:
         def __init__(self, path):
             metrics.add("observed_enumerations")
@@ -109,19 +125,9 @@ def observations(modules, metrics):
             return Entry(entry)
         def close(self): self.iterator.close()
     def lstat(*args, **kwargs):
-        metrics.add("observed_metadata")
-        started = time.perf_counter()
-        try:
-            return original_lstat(*args, **kwargs)
-        finally:
-            metrics.elapsed("observed_metadata", time.perf_counter() - started)
+        return query("observed_lstat", original_lstat, *args, **kwargs)
     def stat(*args, **kwargs):
-        metrics.add("observed_metadata")
-        started = time.perf_counter()
-        try:
-            return original_stat(*args, **kwargs)
-        finally:
-            metrics.elapsed("observed_metadata", time.perf_counter() - started)
+        return query("observed_stat", original_stat, *args, **kwargs)
     stats_module = modules["management.statistics"]
     original_read = stats_module._read_utf8_characters
     def read(*args, **kwargs):
@@ -141,7 +147,7 @@ def observations(modules, metrics):
                 (os, "stat", stat), (stats_module, "_read_utf8_characters", read)):
             stack.enter_context(patch.object(target, attribute, replacement))
         # Instrument the immutable reference's phase boundaries, without changing logic.
-        if modules["engine"].__name__.startswith("scan_reference"):
+        if "metrics" not in modules:
             from obmanage.scanning.metrics import measured
             discover = measured("discovery")(modules["management.catalog"].discover_vaults)
             stack.enter_context(patch.object(modules["management.catalog"], "discover_vaults", discover))
@@ -159,6 +165,73 @@ def observations(modules, metrics):
                                 ("save", "sqlite_write"), ("invalidate", "sqlite_write")):
                 cls = modules["store"].BaselineStore
                 stack.enter_context(patch.object(cls, name, measured(label)(getattr(cls, name))))
+        else:
+            incremental = modules["management.incremental"]
+            original_phase = incremental.phase
+            final = False
+
+            @contextmanager
+            def incremental_phase(name, **kwargs):
+                nonlocal final
+                counters = ("observed_enumerations", "observed_metadata", "observed_snapshots",
+                            "observed_chains", "observed_hash_bytes", "observed_manifest_comparisons",
+                            "observed_manifest_copies")
+                before = {key: metrics.counts[key] for key in counters}
+                final = name == "final_revalidation"
+                cpu = time.thread_time()
+                try:
+                    with original_phase(name, **kwargs):
+                        yield
+                finally:
+                    if final:
+                        metrics.elapsed("final_thread_cpu", time.thread_time() - cpu)
+                        for key in counters:
+                            metrics.add(f"final_{key}", metrics.counts[key] - before[key])
+                    final = False
+
+            stack.enter_context(patch.object(incremental, "phase", incremental_phase))
+            for target, attribute, counter in (
+                (incremental, "_require_manifest", "observed_manifest_comparisons"),
+                (modules["session"].ManifestView, "dictionaries", "observed_manifest_copies"),
+            ):
+                original = getattr(target, attribute)
+
+                def manifest(*args, _original=original, _counter=counter, **kwargs):
+                    metrics.add(_counter)
+                    cpu = time.thread_time() if final else None
+                    started = time.perf_counter() if final else None
+                    try:
+                        return _original(*args, **kwargs)
+                    finally:
+                        if cpu is not None:
+                            metrics.elapsed("final_manifest_cpu", time.thread_time() - cpu)
+                            metrics.elapsed("final_manifest_work", time.perf_counter() - started)
+
+                stack.enter_context(patch.object(target, attribute, manifest))
+
+        # Wrap each imported binding of these functions once. These are
+        # attribution counters, not additional requests in observed_metadata.
+        paths = modules["paths"]
+        package = paths.__package__
+        for module in tuple(sys.modules.values()):
+            if module is None or not getattr(module, "__name__", "").startswith(package + "."):
+                continue
+            for attribute, name in (("snapshot", "observed_snapshots"),
+                                    ("assert_plain_chain", "observed_chains"),
+                                    ("_marker_state", "observed_marker_probes")):
+                original = getattr(module, attribute, None)
+                if original is None:
+                    continue
+
+                def recorded(*args, _original=original, _name=name, **kwargs):
+                    metrics.add(_name)
+                    started = time.perf_counter()
+                    try:
+                        return _original(*args, **kwargs)
+                    finally:
+                        metrics.elapsed(_name, time.perf_counter() - started)
+
+                stack.enter_context(patch.object(module, attribute, recorded))
         original_open = modules["store"].BaselineStore.__init__
         def opened(*args, **kwargs):
             metrics.add("observed_sqlite_connections")
@@ -179,8 +252,8 @@ def observations(modules, metrics):
         yield
 
 
-def fixture(base, vaults=12, files=40):
-    local, portable = base / "local", base / "portable"
+def fixture(base, vaults=12, files=40, portable_base=None):
+    local, portable = base / "local", (portable_base or base) / "portable"
     for index in range(vaults):
         vault = local / f"group-{index % 3}" / f"vault-{index}"
         for nested in ("", "nested/child") if index == 0 else ("",):
@@ -194,6 +267,8 @@ def fixture(base, vaults=12, files=40):
             (root / "attachment.bin").write_bytes(b"a" * (256 * 1024))
             (root / "clip.mp4").write_bytes(b"v" * 4096)
             (root / "empty").mkdir()
+            (root / ".trash").mkdir()
+            (root / ".trash" / "discarded.md").write_bytes(b"discarded\n")
     shutil.copytree(local, portable)
     return local, portable
 
@@ -204,7 +279,8 @@ def signature(result):
             (pair.key, pair.errors, tuple(
                 None if plan is None else (tuple(sorted(plan.context.get("source_entries", {}).items())),
                     tuple(sorted(plan.context.get("target_entries", {}).items())),
-                    tuple((i.action, i.relative_path, i.size) for i in plan.items), tuple(plan.errors))
+                    tuple((i.action, i.relative_path, i.size) for i in plan.items), tuple(plan.errors),
+                    plan.context.get("validated"))
                 for plan in (pair.local_plan, pair.portable_plan))) for pair in result.pairs))
     if hasattr(result, "statistics"):
         return (tuple((s.vault_path, s.total_files, s.total_bytes, s.markdown_files,
@@ -221,46 +297,98 @@ def main():
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--baseline-ref", default=BASELINE)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--scenarios", nargs="+", choices=SCENARIOS, default=SCENARIOS)
+    parser.add_argument("--test-parent", type=Path,
+                        help="Existing dedicated test directory. Only a new temporary child is used.")
+    parser.add_argument("--timing-only", action="store_true", help="Measure without diagnostic instrumentation.")
     args = parser.parse_args()
     if min(args.vaults, args.files, args.repeats) < 1:
         parser.error("counts must be positive")
-    report = dict(environment=dict(platform=platform.platform(), python=platform.python_version(),
-                  cache="OS cache uncontrolled; alternating versions, no USB claim"),
+    def git(*arguments):
+        return subprocess.check_output(["git", *arguments], cwd=ROOT, text=True).strip()
+
+    baseline = git("rev-parse", "--verify", "--end-of-options", args.baseline_ref + "^{commit}")
+    report = dict(baseline=baseline, candidate_head=git("rev-parse", "HEAD"),
+                  candidate_tracked_dirty=bool(git("status", "--porcelain", "-uno")),
+                  environment=dict(platform=platform.platform(), python=platform.python_version(),
+                  cpu=platform.processor(), diagnostics=not args.timing_only,
+                  cache="OS cache uncontrolled; alternating versions"),
                   dataset=dict(vaults=args.vaults + 1, files_per_vault=args.files,
                                nested=True, attachment_bytes=262144), samples=[])
-    with reference_package(args.baseline_ref) as old, tempfile.TemporaryDirectory(prefix="obmanage-scan-") as temporary:
+    scenarios = [name for name in SCENARIOS if name in args.scenarios]
+    if any(s in scenarios for s in ("unchanged", "changed", "deep")) and "first" not in scenarios:
+        parser.error("include first when measuring unchanged, changed, or deep")
+    if args.test_parent is not None:
+        assert_plain_chain(args.test_parent)
+        args.test_parent = args.test_parent.resolve(strict=True)
+        if not args.test_parent.is_dir() or args.test_parent.parent == args.test_parent:
+            parser.error("test-parent must be an existing dedicated directory beneath the volume root")
+    external = (tempfile.TemporaryDirectory(prefix="obmanage-test-", dir=args.test_parent)
+                if args.test_parent else nullcontext(None))
+    with reference_package(baseline) as old, external as portable_temp, \
+            tempfile.TemporaryDirectory(prefix="obmanage-scan-") as temporary:
         base = Path(temporary)
-        local, portable = fixture(base, args.vaults, args.files)
+        local, portable = fixture(base, args.vaults, args.files, Path(portable_temp) if portable_temp else None)
         report["dataset"].update(files=sum(p.is_file() for p in local.rglob("*")),
             directories=sum(p.is_dir() for p in local.rglob("*")), mode="mirror/metadata/strict_utf8")
         versions = {"before": old, "after": api()}
+        changed = local / "group-0/vault-0/notes/part-0/note-0.md"
+        original_body = changed.read_bytes()
+        late = local / "new-outer"
+        denied_part = "part-1" if args.files > 10 else "part-0"
         for repeat in range(args.repeats):
-            results = {}
-            for version in (("before", "after") if repeat % 2 == 0 else ("after", "before")):
-                modules = versions[version]
-                engine = modules["management.incremental"].IncrementalEngine(base / f"state-{repeat}-{version}")
-                for scenario in ("first", "unchanged", "changed", "statistics_metadata", "statistics_utf8", "archive", "cancel", "error"):
-                    changed = local / "group-0/vault-0/notes/part-0/note-0.md"
-                    if scenario == "changed":
-                        changed.write_text((f"modified-{repeat}" + "x" * 960)[:len(changed.read_bytes())], encoding="utf-8")
+            for scenario in scenarios:
+                results = []
+                if scenario in ("changed", "deep"):
+                    changed.write_bytes(bytes((65 + repeat % 26,)) + original_body[1:])
+                for version in (("before", "after") if repeat % 2 == 0 else ("after", "before")):
+                    modules = versions[version]
+                    state = base / f"state-{repeat}-{version}"
+                    if scenario in FAULTS or scenario == "cancel":
+                        state = state / scenario
+                    engine = modules["management.incremental"].IncrementalEngine(state)
                     metrics = ScanMetrics(scenario)
                     event = Event()
                     progress_calls = 0
+                    cancel_requested = None
+                    final_started = False
+                    mutated = False
+                    moved = local / "group-0/vault-0/notes/part-0/late-rename.md"
                     def progress(update):
-                        nonlocal progress_calls
+                        nonlocal progress_calls, cancel_requested, final_started
                         progress_calls += 1
                         if scenario == "cancel" and progress_calls == 3:
+                            cancel_requested = time.perf_counter()
                             event.set()
+                        final_started = final_started or "正在复核两端集合" in update.message
                     real_scandir = os.scandir
                     def failing_scandir(path):
-                        if scenario == "error" and str(path).rstrip("\\/").endswith("part-1"):
+                        nonlocal mutated
+                        if scenario == "error" and str(path).rstrip("\\/").endswith(denied_part):
                             raise PermissionError("injected benchmark failure")
+                        if (scenario == "error_partial"
+                                and os.path.normcase(str(path)).endswith(os.path.normcase(
+                                    str(Path("local/group-0/vault-0/notes/part-0"))))):
+                            raise PermissionError("injected single-vault benchmark failure")
+                        if final_started and not mutated and scenario in ("new_vault", "final_change"):
+                            mutated = True
+                            if scenario == "new_vault":
+                                (late / "new-vault" / ".obsidian").mkdir(parents=True)
+                            else:
+                                changed.rename(moved)
                         return real_scandir(path)
+                    own_metrics = (modules["metrics"].ScanMetrics(scenario)
+                                   if "metrics" in modules else metrics)
+                    active = own_metrics.activate() if not args.timing_only else nullcontext()
+                    observed = observations(modules, metrics) if not args.timing_only else nullcontext()
+                    injected = (patch.object(os, "scandir", failing_scandir)
+                                if scenario in FAULTS else nullcontext())
                     try:
-                        with metrics.activate(), patch.object(os, "scandir", failing_scandir), observations(modules, metrics):
+                        with injected, observed, active:
+                            started = time.perf_counter()
                             if scenario.startswith("statistics"):
-                                if version == "after":
-                                    with ScanSession(capture=True) as session:
+                                if "session" in modules:
+                                    with modules["session"].ScanSession(capture=True) as session:
                                         catalog = modules["management.catalog"].discover_vaults(local, _session=session)
                                         result = modules["management.statistics"].collect_vault_statistics(
                                             catalog, count_characters=scenario == "statistics_utf8", _session=session)
@@ -273,8 +401,9 @@ def main():
                                 result = modules["management.archive"].ArchiveEngine(base / f"archive-state-{version}").analyze(
                                     str(local), str(base), filename="preview.zip", exclude_videos=True)
                             else:
-                                result = engine.analyze(str(local), str(portable), cancel=event, progress=progress)
-                                if scenario == "error":
+                                result = engine.analyze(str(local), str(portable), deep=scenario == "deep",
+                                                        cancel=event, progress=progress)
+                                if scenario in FAULTS:
                                     assert result.issues or any(p.errors for p in result.pairs)
                                 else:
                                     assert not result.issues and not any(p.errors for p in result.pairs), result
@@ -282,18 +411,36 @@ def main():
                         if scenario != "cancel" or type(exc).__name__ != "SyncCancelled":
                             raise
                         result = None
-                    if scenario == "error": metrics.status = "incomplete"
-                    if scenario == "cancel": assert metrics.status == "cancelled"
-                    # Equal length changes produce identical operation shapes; content is compared above.
-                    results.setdefault(scenario, {})[version] = (signature(result) if scenario not in ("archive", "cancel") else None)
-                    report["samples"].append(dict(version=version, repeat=repeat, scenario=scenario, **metrics.report()))
-                    if scenario == "statistics_utf8":
-                        changed.write_text("shared scan 中文🙂\n" * 40, encoding="utf-8")
-            for scenario, values in results.items():
-                # Rewriting the one mutation changes timestamps; compare content-independent statistics
-                # and matching pair/action paths separately in the dedicated equivalence tests.
-                if scenario.startswith("statistics"):
-                    assert values["before"] == values["after"], scenario
+                    finished = time.perf_counter()
+                    if scenario == "cancel":
+                        assert result is None and cancel_requested is not None
+                    if own_metrics is not metrics:
+                        metrics.counts.update(own_metrics.counts)
+                        metrics.seconds.update(own_metrics.seconds)
+                    metrics.seconds["total"] = finished - started
+                    if cancel_requested is not None:
+                        metrics.seconds["cancel_latency"] = finished - cancel_requested
+                    metrics.status = ("cancelled" if scenario == "cancel" else "incomplete"
+                                      if scenario in FAULTS else "success")
+                    if scenario.startswith("statistics") or scenario in ("first", "unchanged", "changed", "deep"):
+                        results.append(signature(result))
+                    if scenario in ("new_vault", "final_change"):
+                        assert mutated, "fault did not run"
+                    if late.exists():
+                        shutil.rmtree(late)
+                    if moved.exists():
+                        moved.rename(changed)
+                    sample = dict(version=version, repeat=repeat, scenario=scenario, **metrics.report())
+                    if hasattr(result, "pairs"):
+                        sample["result"] = dict(collection_issues=len(result.issues),
+                            pair_errors=sum(bool(pair.errors) for pair in result.pairs),
+                            validated_plans=sum(bool(plan.context.get("validated"))
+                                for pair in result.pairs for plan in (pair.local_plan, pair.portable_plan) if plan))
+                    report["samples"].append(sample)
+                if results:
+                    assert results[0] == results[1], scenario
+                if scenario in ("changed", "deep"):
+                    changed.write_bytes(original_body)
             print(f"repeat {repeat + 1}/{args.repeats} complete", flush=True)
     report["medians"] = {}
     for scenario in {s["scenario"] for s in report["samples"]}:

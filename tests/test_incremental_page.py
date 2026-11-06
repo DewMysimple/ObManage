@@ -121,6 +121,34 @@ def test_deep_mode_is_explicit_and_invalidates_old_plan(application, prepared):
 
 
 @pytest.mark.parametrize("size", [(980, 620), (1140, 920), (2560, 1440)])
+def test_incomplete_worker_result_explains_blocked_batch(application, prepared, monkeypatch, size):
+    from obmanage.paths import canonical
+
+    window, page, local, portable = prepared
+    inaccessible = local / "A"
+    original = os.scandir
+
+    def scandir(path):
+        if not isinstance(path, int) and canonical(path) == str(inaccessible):
+            raise PermissionError("injected directory access")
+        return original(path)
+
+    window.resize(*size)
+    window.show()
+    before = tree(local), tree(portable)
+    with monkeypatch.context() as injected:
+        injected.setattr(os, "scandir", scandir)
+        page._start_scan()
+        wait_until(application, lambda: not window.busy)
+    assert "扫描不完整" in page.summary_label.text()
+    assert "本批无法执行" in page.status_label.text()
+    assert page.issues_label.text().count(str(inaccessible)) == 1
+    assert page.issues_label.isVisible() and not page.execute_button.isEnabled()
+    assert window.page_containers["incremental"].horizontalScrollBar().maximum() == 0
+    assert (tree(local), tree(portable)) == before
+
+
+@pytest.mark.parametrize("size", [(980, 620), (1140, 920), (2560, 1440)])
 def test_stale_preflight_is_zero_write_and_full_diagnostics_are_logged(application, prepared, size):
     window, page, local, portable = prepared
     page._accept_analysis(IncrementalEngine(window.state_dir).analyze(str(local), str(portable)))

@@ -196,13 +196,13 @@ class IncrementalPage(FeaturePage):
                        f"移动硬盘：{pair.portable_path}\n{summary}\n"
                        "按内容与目录结构比较，不以数量或时间判定新旧。")
             for column, value in ((0, pair.relative_path), (1, summary),
-                                  (3, "无法处理" if pair.errors else "待选择")):
+                                  (3, "无法处理" if pair.errors or analysis.issues else "待选择")):
                 item = QTableWidgetItem(value)
                 item.setToolTip("\n".join(pair.errors) if pair.errors and column == 3 else tooltip)
                 self.vault_table.setItem(row, column, item)
             selector = QComboBox()
             selector.addItem("暂不处理", "")
-            if not pair.errors:
+            if not pair.errors and not analysis.issues:
                 for side, label in (("local", "电脑为源"), ("portable", "移动硬盘为源")):
                     selected = pair.plan_for(side)
                     if selected and selected.can_execute and selected.has_changes:
@@ -211,20 +211,23 @@ class IncrementalPage(FeaturePage):
             self.source_selectors[pair.key] = selector
             self.vault_table.setCellWidget(row, 2, selector)
             selector.currentIndexChanged.connect(lambda _index, key=pair.key: self._choice_changed(key))
+        summary = ("扫描不完整，本批无法执行。" if analysis.issues else
+                   f"待查看 {len(analysis.pairs)} 个仓库；已隐藏 {analysis.identical_count} 个一致仓库。")
         self.summary_label.setText(
-            f"待查看 {len(analysis.pairs)} 个仓库；已隐藏 {analysis.identical_count} 个一致仓库。"
-            f"{'完整校验' if analysis.deep else '快速扫描'}耗时 {analysis.duration_seconds:.1f} 秒。"
-        )
+            f"{summary}{'完整校验' if analysis.deep else '快速扫描'}耗时 {analysis.duration_seconds:.1f} 秒。")
         issues = [*analysis.issues, *(error for pair in analysis.pairs for error in pair.errors)]
         self.issues_label.setText("\n".join(issues))
         self.issues_label.setVisible(bool(issues))
         if analysis.pairs:
             self.vault_table.selectRow(0)
             self._current_pair_changed()
-        self.set_status("扫描完成，请逐个选择来源。" if analysis.pairs else "两端对应仓库一致，无需更新。",
-                        "success")
-        if issues:
+        if analysis.issues:
+            self.set_status("扫描不完整，本批无法执行。请查看明细后重新扫描。", "warning")
+        elif issues:
             self.set_status("扫描存在问题；异常仓库不能执行，请查看明细。", "warning")
+        else:
+            self.set_status("扫描完成，请逐个选择来源。" if analysis.pairs else "两端对应仓库一致，无需更新。",
+                            "success")
         self.message_logged.emit(self.summary_label.text())
         self.refresh_actions()
 

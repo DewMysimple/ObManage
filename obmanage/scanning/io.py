@@ -22,6 +22,10 @@ class _MeasuredDirectory:
         try:
             self.context = os.scandir(path)
             self.iterator = None
+        except OSError:
+            if self.metrics:
+                self.metrics.add("directory_errors")
+            raise
         finally:
             if self.metrics:
                 self.metrics.add("directory_enumerations")
@@ -43,6 +47,10 @@ class _MeasuredDirectory:
         started = time.perf_counter() if self.metrics else 0
         try:
             entry = next(self.iterator)
+        except OSError:
+            if self.metrics:
+                self.metrics.add("directory_errors")
+            raise
         finally:
             if self.metrics:
                 self.metrics.elapsed("enumeration", time.perf_counter() - started)

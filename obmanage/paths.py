@@ -13,7 +13,7 @@ import stat
 from pathlib import Path
 
 from .models import SyncError
-from .scanning.metrics import count
+from .scanning.metrics import current, measured
 
 
 def native(path: str | Path) -> str:
@@ -38,10 +38,12 @@ def is_reparse(st: os.stat_result) -> bool:
     return stat.S_ISLNK(st.st_mode) or bool(getattr(st, "st_file_attributes", 0) & 0x400)
 
 
+@measured("snapshot", calls=True)
 def snapshot(path: str | Path) -> dict | None:
-    count("metadata_queries")
+    path = native(path)
+    metrics = current()
     try:
-        st = os.lstat(native(path))
+        st = os.lstat(path) if metrics is None else metrics.query("lstat", os.lstat, path)
     except FileNotFoundError:
         return None
     if is_reparse(st):
@@ -63,22 +65,25 @@ def identity(state: dict | None) -> tuple | None:
     return state["kind"], state["device"], state["inode"]
 
 
-def assert_plain_chain(path: str | Path) -> None:
-    """Reject existing non-directory/reparse ancestors, including the root itself."""
-    value = canonical(path)
-    parts = [value]
+@measured("plain_chain", calls=True)
+def assert_plain_chain(path: str | Path, *, leaf_snapshotter=None) -> dict | None:
+    """Check the live chain through the leaf and return that leaf's snapshot."""
+    leaf = value = canonical(path)
+    parents = []
     while True:
         parent = os.path.dirname(value)
         if parent == value:
             break
-        parts.append(parent)
+        parents.append(parent)
         value = parent
-    for part in reversed(parts):
+    for part in reversed(parents):
         state = snapshot(part)
-        if state is None:
-            continue
-        if state["kind"] != "dir":
+        if state is not None and state["kind"] != "dir":
             raise SyncError(f"路径包含链接或非目录，无法安全同步：{part}")
+    state = (leaf_snapshotter or snapshot)(leaf)
+    if state is not None and state["kind"] != "dir":
+        raise SyncError(f"路径包含链接或非目录，无法安全同步：{leaf}")
+    return state
 
 
 def validate_state_separation(state_dir: str | Path, roots: tuple[str, ...] | list[str]) -> str:
@@ -153,7 +158,10 @@ def existing_anchor(path: str) -> str:
 def volume_identity(path: str) -> str:
     anchor = existing_anchor(path)
     if os.name != "nt":
-        return f"device:{os.stat(native(anchor)).st_dev}"
+        anchor = native(anchor)
+        metrics = current()
+        state = os.stat(anchor) if metrics is None else metrics.query("stat", os.stat, anchor)
+        return f"device:{state.st_dev}"
     from ctypes import wintypes
     kernel = ctypes.WinDLL("kernel32", use_last_error=True)
     get_path = kernel.GetVolumePathNameW

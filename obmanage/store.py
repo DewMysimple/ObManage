@@ -33,6 +33,7 @@ class BaselineStore:
                 );
             """)
             self.connection.commit()
+            count("sqlite_commits")
             self._data_version = self.connection.execute("PRAGMA data_version").fetchone()[0]
         except BaseException:
             self.connection.close()
@@ -60,6 +61,7 @@ class BaselineStore:
                 raise sqlite3.OperationalError("校验记录已被另一个任务修改，请重新分析差异。")
             yield
             self.connection.commit()
+            count("sqlite_commits")
         except BaseException:
             self.connection.rollback()
             raise
@@ -147,10 +149,12 @@ class BaselineStore:
         self.connection.execute("INSERT INTO owned_temps VALUES (?, ?, ?)",
                                 (path, pair_id, json.dumps(identity)))
         self.connection.commit()
+        count("sqlite_commits")
 
     def unregister_temp(self, path: str) -> None:
         self.connection.execute("DELETE FROM owned_temps WHERE path = ?", (path,))
         self.connection.commit()
+        count("sqlite_commits")
 
     def finalize_copy(self, pair_id: str, path: str, source: dict, target: dict,
                       digest: str, temp_path: str) -> None:

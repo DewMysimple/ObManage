@@ -23,7 +23,7 @@ from concurrent.futures import FIRST_EXCEPTION, Future, ThreadPoolExecutor, Time
 from contextvars import copy_context
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Mapping
 
 from .copying import copy_stream_and_hash
 from .reading import ReadScope, hash_stream
@@ -86,7 +86,7 @@ def _key(relative: str) -> str:
     return os.path.normcase(relative)
 
 
-def _require_manifest(expected: dict[str, dict], current: dict[str, dict], *,
+def _require_manifest(expected: Mapping[str, Mapping], current: Mapping[str, Mapping], *,
                       root: str, side: str, message: str) -> None:
     """Explain the exact failed snapshot comparison without rereading or relaxing it."""
     if current == expected:
@@ -719,7 +719,9 @@ class SyncEngine:
         target_entries = forward.context["source_entries"]
         target_names = {_key(path): path for path in target_entries}
         context.update(source_entries=source_entries, target_entries=target_entries,
-                       target_names=target_names, protected_target_directories=set(), validated=True)
+                       target_names=target_names, protected_target_directories=set())
+        if not defer_final:
+            context["validated"] = True
         backward.context = context
         backward.pair_id = context["pair_id"]
         backward.source_empty = not source_entries

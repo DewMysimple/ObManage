@@ -30,6 +30,28 @@ class ScanMetrics:
         with self._lock:
             self.seconds[name] += amount
 
+    def query(self, name, function, *args, **kwargs):
+        """Measure one metadata API request, regardless of its caller."""
+        started = time.perf_counter()
+        failed = False
+        try:
+            return function(*args, **kwargs)
+        except OSError:
+            failed = True
+            raise
+        finally:
+            elapsed = time.perf_counter() - started
+            with self._lock:
+                self.counts["metadata_queries"] += 1
+                self.counts[f"{name}_calls"] += 1
+                if failed:
+                    self.counts[f"{name}_errors"] += 1
+                self.seconds[name] += elapsed
+
+    def tally(self, names):
+        with self._lock:
+            return {name: self.counts[name] for name in names}
+
     def report(self) -> dict:
         with self._lock:
             return dict(task=self.task, status=self.status,
@@ -68,22 +90,31 @@ def outcome(status: str) -> None:
 
 
 @contextmanager
-def phase(name: str):
+def phase(name: str, *, tallies=()):
     metrics = _CURRENT.get()
     if metrics is None:
         yield
         return
     started = time.perf_counter()
+    before = metrics.tally(tallies) if tallies else {}
     try:
         yield
     finally:
         metrics.elapsed(name, time.perf_counter() - started)
+        if before:
+            for counter, amount in metrics.tally(tallies).items():
+                metrics.add(f"{name}_{counter}", amount - before[counter])
 
 
-def measured(name: str):
+def measured(name: str, *, calls=False):
     def decorate(function):
         @wraps(function)
         def wrapped(*args, **kwargs):
+            metrics = _CURRENT.get()
+            if metrics is None:
+                return function(*args, **kwargs)
+            if calls:
+                metrics.add(f"{name}_calls")
             with phase(name):
                 return function(*args, **kwargs)
         return wrapped
