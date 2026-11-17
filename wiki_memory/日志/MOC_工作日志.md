@@ -18,7 +18,7 @@ supersedes: null
 | 2026-11-17 | bug | - | archived | mirror-profile-bounded-terminal-events | [镜像诊断长时间线末次事件保留](./2026-11-17-镜像诊断长时间线末次事件保留.md) |
 | 2026-11-17 | test | - | archived | ordinary-mirror-console-timeout-acceptance | [普通镜像现场确认超时验收](./2026-11-17-普通镜像现场确认超时验收.md) |
 | 2026-11-17 | feature | - | archived | ordinary-mirror-once-diagnostics | [普通镜像单次诊断与真实预览](./2026-11-17-普通镜像单次诊断与真实预览.md) |
-| 2026-11-17 | bug | - | draft | mirror-parent-volume-root-compatibility | [卷根父目录准备兼容与现场续行](./2026-11-17-卷根父目录准备兼容与现场续行.md) |
+| 2026-11-17 | bug | - | archived | mirror-parent-volume-root-compatibility | [卷根父目录准备兼容与现场续行](./2026-11-17-卷根父目录准备兼容与现场续行.md) |
 | 2026-11-07 | feature | - | archived | real-initial-one-way-sync-experiment | [真实首次单向同步实验](./2026-11-07-真实首次单向同步实验.md) |
 | 2026-11-06 | maintenance | - | archived | real-device-readonly-scanning | [真实介质扫描诊断与优化](./2026-11-06-真实介质扫描诊断与优化.md) |
 | 2026-11-06 | maintenance | - | archived | incremental-scan-refinement | [增量异常快退与实时复核精修](./2026-11-06-增量异常快退与实时复核精修.md) |
