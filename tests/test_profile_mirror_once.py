@@ -448,3 +448,16 @@ def test_console_reader_uses_only_local_keys_and_supports_backspace(service, mon
     monkeypatch.setattr(msvcrt, "kbhit", lambda: True)
     monkeypatch.setattr(msvcrt, "getwch", lambda: next(keys))
     assert profile.read_console_phrase("test", profile.time.perf_counter_ns() + 10**9, service.cancel) == "B"
+
+
+def test_long_runs_retain_terminal_stage_events_with_bounded_progress(service):
+    report = service.report
+    for _ in range(1000):
+        report.event("progress_copy", "OBSERVED", files=1)
+    for name in profile.STAGES:
+        report.event(name, "STARTED")
+        report.event(name, "SUCCESS")
+    assert len(report.events) <= 256
+    assert report.data["progress_events_dropped"] > 0
+    assert report.events[-1]["event"] == "post_deep_verify"
+    assert report.events[-1]["state"] == "SUCCESS"

@@ -155,6 +155,14 @@ class Report:
         self.owned[name] = identity(snapshot(path))
 
     def event(self, name, state, **values):
+        # Reserve space for terminal stage events even during long full hashes.
+        progress = name.startswith("progress_")
+        if progress and len(self.events) >= 224:
+            self.data["progress_events_dropped"] = self.data.get("progress_events_dropped", 0) + 1
+            return
+        if len(self.events) >= 256 and not progress:
+            oldest = next((i for i, event in enumerate(self.events) if event["event"].startswith("progress_")), 0)
+            self.events.pop(oldest)
         if len(self.events) < 256:
             self.events.append(dict(event=name, state=state, at=now(),
                 offset_ms=round((time.perf_counter_ns() - self.origin_ns) / 1e6, 3), **values))
