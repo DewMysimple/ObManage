@@ -461,3 +461,131 @@ def test_long_runs_retain_terminal_stage_events_with_bounded_progress(service):
     assert report.data["progress_events_dropped"] > 0
     assert report.events[-1]["event"] == "post_deep_verify"
     assert report.events[-1]["state"] == "SUCCESS"
+
+
+@pytest.mark.parametrize("anchor,child,volume,valid", [
+    ("X:/", "X:/parent", "\\\\?\\volume{01234567-89ab-cdef-0123-456789abcdef}\\:12345678:exFAT", True),
+    ("X:/", "Y:/parent", "\\\\?\\volume{01234567-89ab-cdef-0123-456789abcdef}\\:12345678:exFAT", False),
+    ("X:/nested", "X:/nested/parent", "\\\\?\\volume{01234567-89ab-cdef-0123-456789abcdef}\\:12345678:exFAT", False),
+    ("X:/", "X:/parent", "device:unknown", False),
+    ("X:/", "X:/parent", "\\\\server\\share:12345678:NTFS", False),
+])
+def test_volume_namespace_binding_is_strict_and_has_no_io(anchor, child, volume, valid):
+    if valid:
+        assert profile.volume_bound_child(anchor, child, volume) == volume.rsplit(":", 2)[0] + "parent"
+    else:
+        with pytest.raises(profile.Blocked, match="VOLUME_NAMESPACE"):
+            profile.volume_bound_child(anchor, child, volume)
+
+
+def test_zero_id_volume_root_preparation_uses_guid_and_nonzero_child(service, monkeypatch):
+    put(service.source, "note.md", b"source remains read only")
+    service.target.parent.rmdir()
+    service.create_target_parent = True
+    anchor = service.target.parent.parent
+    real_snapshot = paths.snapshot
+    actual_volume = paths.volume_identity(str(service.report.work))
+    volume_guid = actual_volume.rsplit(":", 2)[0]
+    alias = volume_guid + str(service.target.parent.relative_to(service.target.parent.anchor))
+
+    def snapshot(path):
+        state = real_snapshot(path)
+        if state and Path(paths.canonical(path)) == anchor:
+            state = {**state, "inode": 0}
+        return state
+
+    monkeypatch.setattr(paths, "snapshot", snapshot)
+    monkeypatch.setattr(profile, "snapshot", snapshot)
+    monkeypatch.setattr(profile, "is_volume_root", lambda path: Path(path) == anchor)
+
+    def bound_child(root, child, volume):
+        # Simulated root namespace maps exclusively into this tmp_path. The
+        # actual NT GUID creation and held child identity use real Windows APIs.
+        assert Path(root) == anchor and child == service.target.parent
+        assert not child.exists() and volume == service.context["target_volume"]
+        return alias
+
+    monkeypatch.setattr(profile, "volume_bound_child", bound_child)
+    real_hold = profile.hold_guid_directory
+
+    def mapped_hold(path, volume, created=None):
+        assert volume == service.context["target_volume"]
+        return real_hold(path, actual_volume, created)
+
+    monkeypatch.setattr(profile, "hold_guid_directory", mapped_hold)
+    auto_operator(service, monkeypatch)
+    before = manifest(service.source)
+    with ExitStack() as resources:
+        service.run(resources)
+        assert service.created_parent_identity[2] != 0
+    assert service.report.data["status"] == "SUCCESS_VERIFIED"
+    assert service.report.data["parent_creation_method"] == "VOLUME_GUID_EXCLUSIVE_HANDLE"
+    assert manifest(service.source) == before
+
+
+@pytest.mark.parametrize("kind", ("file", "dir"))
+def test_volume_guid_exclusive_creation_retains_concurrent_objects(tmp_path, kind):
+    child = tmp_path / "already-there"
+    if kind == "dir":
+        child.mkdir()
+        keep = child / "keep.md"
+    else:
+        keep = child
+    keep.write_bytes(b"preserve external data")
+    volume = paths.volume_identity(str(tmp_path))
+    volume_guid = volume.rsplit(":", 2)[0]
+    alias = volume_guid + str(child.relative_to(child.anchor))
+    before = paths.snapshot(child)
+    with pytest.raises(OSError) as error, profile.hold_guid_directory(alias, volume):
+        pytest.fail("Existing object was adopted")
+    assert error.value.winerror in (80, 183)
+    assert paths.snapshot(child) == before
+    assert keep.read_bytes() == b"preserve external data"
+
+
+@pytest.mark.parametrize("field", ("serial", "filesystem"))
+def test_guid_parent_rejects_wrong_volume_before_creation(tmp_path, field):
+    child = tmp_path / "must-not-appear"
+    volume = paths.volume_identity(str(tmp_path))
+    guid, serial, filesystem = volume.rsplit(":", 2)
+    wrong = (guid + ":" + ("00000000" if int(serial, 16) else "00000001") + ":" + filesystem
+             if field == "serial" else guid + ":" + serial + ":other-fs")
+    alias = guid + str(child.relative_to(child.anchor))
+    with pytest.raises(profile.Blocked, match="HANDLE_VOLUME"), profile.hold_guid_directory(alias, wrong):
+        pytest.fail("Wrong volume accepted")
+    assert not child.exists()
+
+
+def test_guid_creation_reports_partial_parent_but_rejects_zero_child_id(tmp_path, monkeypatch):
+    child = tmp_path / "new-parent"
+    volume = paths.volume_identity(str(tmp_path))
+    alias = volume.rsplit(":", 2)[0] + str(child.relative_to(child.anchor))
+    original = profile.snapshot
+
+    def zero_child(path):
+        state = original(path)
+        return {**state, "inode": 0} if str(path) == alias and state else state
+
+    monkeypatch.setattr(profile, "snapshot", zero_child)
+    created = []
+    with pytest.raises(profile.Blocked, match="CREATED_PARENT_ID"), profile.hold_guid_directory(
+            alias, volume, lambda: created.append(True)):
+        pytest.fail("Zero-ID normal directory accepted")
+    assert created == [True]
+    assert child.is_dir() and list(child.iterdir()) == []
+
+
+@pytest.mark.parametrize("intermediate", (False, True))
+def test_guid_parent_rejects_reparse_or_redirected_namespace(tmp_path, intermediate):
+    original = tmp_path / "original"
+    original.mkdir()
+    link = tmp_path / "alias"
+    os.symlink(original, link, target_is_directory=True)
+    if intermediate:
+        (original / "nested").mkdir()
+    child = link / "nested" / "must-not-appear" if intermediate else link / "must-not-appear"
+    volume = paths.volume_identity(str(tmp_path))
+    alias = volume.rsplit(":", 2)[0] + str(child.relative_to(child.anchor))
+    with pytest.raises(profile.Blocked, match="HANDLE_TYPE|HANDLE_NAMESPACE"), profile.hold_guid_directory(alias, volume):
+        pytest.fail("Redirected directory accepted")
+    assert not child.exists()

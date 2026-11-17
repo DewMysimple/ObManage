@@ -12,6 +12,7 @@ import json
 import ntpath
 import os
 import platform
+import re
 import shutil
 import signal
 import subprocess
@@ -19,7 +20,7 @@ import sys
 import time
 import traceback
 from collections import Counter
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from dataclasses import asdict, dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -331,6 +332,139 @@ def require_target_access(path):
         kernel.CloseHandle(handle)
 
 
+def is_volume_root(path):
+    path = Path(path)
+    return path.is_absolute() and path == Path(path.anchor)
+
+
+def volume_bound_child(anchor, child, volume):
+    """Address a root's one child by stable GUID, never by a mutable drive letter.
+
+    Some exFAT roots report inode zero. Do not accept that as an ordinary
+    directory identity: create the new, nonzero-ID parent exclusively through
+    the already verified volume namespace and retain its non-deletable handle.
+    """
+    anchor, child = Path(anchor), Path(child)
+    guid = volume.rsplit(":", 2)[0]
+    if (not is_volume_root(anchor) or child.parent != anchor or not child.name
+            or os.path.isreserved(child.name)
+            or not re.fullmatch(r"\\\\\?\\volume\{[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}\}\\", guid, re.IGNORECASE)):
+        raise Blocked("BLOCKED_PARENT_VOLUME_NAMESPACE")
+    return guid + child.name
+
+
+def verify_guid_handle(kernel, handle, path, volume):
+    """Verify namespace, ordinary-directory type and volume using the open handle."""
+    from ctypes import wintypes as w
+
+    class BasicInfo(ctypes.Structure):
+        _fields_ = (("created", ctypes.c_longlong), ("accessed", ctypes.c_longlong),
+                    ("written", ctypes.c_longlong), ("changed", ctypes.c_longlong),
+                    ("attributes", w.DWORD))
+
+    kernel.GetFileInformationByHandleEx.argtypes = (w.HANDLE, ctypes.c_int, w.LPVOID, w.DWORD)
+    attrs = BasicInfo()
+    # FILE_BASIC_INFO provides the same directory/reparse attribute bits and
+    # also works for exFAT roots that reject FILE_ATTRIBUTE_TAG_INFO (error 87).
+    if not kernel.GetFileInformationByHandleEx(handle, 0, ctypes.byref(attrs), ctypes.sizeof(attrs)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    if not attrs.attributes & 0x10 or attrs.attributes & 0x400:
+        raise Blocked("BLOCKED_PARENT_HANDLE_TYPE")
+    kernel.GetFinalPathNameByHandleW.argtypes = (w.HANDLE, w.LPWSTR, w.DWORD, w.DWORD)
+    final = ctypes.create_unicode_buffer(32768)
+    length = kernel.GetFinalPathNameByHandleW(handle, final, len(final), 1)  # VOLUME_NAME_GUID
+    if not 0 < length < len(final) or os.path.normcase(final.value.rstrip("\\")) != os.path.normcase(path.rstrip("\\")):
+        raise Blocked("BLOCKED_PARENT_HANDLE_NAMESPACE")
+    kernel.GetVolumeInformationByHandleW.argtypes = (
+        w.HANDLE, w.LPWSTR, w.DWORD, ctypes.POINTER(w.DWORD), ctypes.POINTER(w.DWORD),
+        ctypes.POINTER(w.DWORD), w.LPWSTR, w.DWORD)
+    serial, maximum, flags = w.DWORD(), w.DWORD(), w.DWORD()
+    filesystem = ctypes.create_unicode_buffer(128)
+    if not kernel.GetVolumeInformationByHandleW(handle, None, 0, ctypes.byref(serial),
+            ctypes.byref(maximum), ctypes.byref(flags), filesystem, len(filesystem)):
+        raise ctypes.WinError(ctypes.get_last_error())
+    guid, expected_serial, expected_fs = volume.rsplit(":", 2)
+    if (serial.value != int(expected_serial, 16) or filesystem.value.casefold() != expected_fs.casefold()
+            or not os.path.normcase(path).startswith(os.path.normcase(guid))):
+        raise Blocked("BLOCKED_PARENT_HANDLE_VOLUME")
+
+
+@contextmanager
+def verified_guid_directory(path, volume):
+    """Open a read-only parent handle; a volume root may legitimately have ID zero."""
+    from ctypes import wintypes as w
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateFileW.argtypes = (w.LPCWSTR, w.DWORD, w.DWORD, w.LPVOID, w.DWORD, w.DWORD, w.HANDLE)
+    kernel.CreateFileW.restype = w.HANDLE
+    kernel.CloseHandle.argtypes = (w.HANDLE,)
+    handle = kernel.CreateFileW(path, 0x100081, 3, None, 3, 0x02200000, None)
+    if handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        verify_guid_handle(kernel, handle, path, volume)
+        if os.path.normcase(path.rstrip("\\")) != os.path.normcase(volume.rsplit(":", 2)[0].rstrip("\\")):
+            state = identity(snapshot(path))
+            if not state or not state[2]:
+                raise Blocked("BLOCKED_PARENT_DIRECTORY_ID")
+        yield handle
+    finally:
+        kernel.CloseHandle(handle)
+
+
+@contextmanager
+def hold_guid_directory(path, volume, created=None):
+    """Exclusive one-component NT creation relative to a verified parent handle.
+
+    OBJ_DONT_REPARSE is retained on the relative child. Applying it to an
+    absolute GUID path would reject the mount-manager namespace itself.
+    """
+    from ctypes import wintypes as w
+
+    class UnicodeString(ctypes.Structure):
+        _fields_ = (("length", w.USHORT), ("capacity", w.USHORT), ("text", w.LPWSTR))
+
+    class ObjectAttributes(ctypes.Structure):
+        _fields_ = (("length", w.ULONG), ("root", w.HANDLE),
+                    ("name", ctypes.POINTER(UnicodeString)), ("flags", w.ULONG),
+                    ("security", w.LPVOID), ("quality", w.LPVOID))
+
+    parent, name = ntpath.split(path)
+    if not name or os.path.isreserved(name) or name in (".", ".."):
+        raise Blocked("BLOCKED_PARENT_VOLUME_NAMESPACE")
+    # ntpath.split keeps the trailing slash on a GUID volume root.
+    with verified_guid_directory(parent, volume) as parent_handle:
+        dll = ctypes.WinDLL("ntdll")
+        create = dll.NtCreateFile
+        create.argtypes = (ctypes.POINTER(w.HANDLE), w.ULONG, ctypes.POINTER(ObjectAttributes),
+            w.LPVOID, w.LPVOID, w.ULONG, w.ULONG, w.ULONG, w.ULONG, w.LPVOID, w.ULONG)
+        create.restype = w.LONG
+        dll.RtlNtStatusToDosError.argtypes = (w.LONG,)
+        dll.RtlNtStatusToDosError.restype = w.ULONG
+        length = len(name.encode("utf-16-le"))
+        buffer = ctypes.create_unicode_buffer(name)
+        text = UnicodeString(length, length + 2, ctypes.cast(buffer, w.LPWSTR))
+        attributes = ObjectAttributes(ctypes.sizeof(ObjectAttributes), parent_handle,
+            ctypes.pointer(text), 0x1040, None, None)
+        status_block = (ctypes.c_size_t * 2)()
+        child = w.HANDLE()
+        status = create(ctypes.byref(child), 0x100081, ctypes.byref(attributes), status_block,
+                        None, 0, 3, 2, 0x21, None, 0)  # FILE_CREATE; DIRECTORY; no delete sharing
+        if status < 0:
+            raise ctypes.WinError(dll.RtlNtStatusToDosError(status))
+        kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel.CloseHandle.argtypes = (w.HANDLE,)
+        try:
+            if created:
+                created()
+            verify_guid_handle(kernel, child, path, volume)
+            state = identity(snapshot(path))
+            if not state or state[0] != "dir" or not state[2]:
+                raise Blocked("BLOCKED_CREATED_PARENT_ID")
+            yield state
+        finally:
+            kernel.CloseHandle(child)
+
+
 @dataclass
 class Preview:
     plan: SyncPlan
@@ -554,11 +688,23 @@ class MirrorOnce:
         if not self.report.data["operator_confirmed"] or self.parent_intent is None:
             raise Blocked("BLOCKED_PARENT_CREATION_UNCONFIRMED")
         anchor = self.parent_intent["anchor"]
-        resources.enter_context(hold_windows_directory(anchor, self.parent_intent["anchor_identity"]))
-        self.write_gate(preview)
-        # Exactly one exclusive mkdir, never recursive and never remove on failure.
-        os.mkdir(native(self.target.parent))
-        self.created_parent_identity = identity(assert_plain_chain(self.target.parent))
+        if is_volume_root(anchor):
+            bound_path = volume_bound_child(anchor, self.target.parent, self.context["target_volume"])
+            self.write_gate(preview)
+            # FILE_CREATE through the verified GUID cannot be redirected by a
+            # drive-letter reassignment. The helper still requires a nonzero ID
+            # on the newly created directory, and holds it without delete share.
+            self.created_parent_identity = resources.enter_context(hold_guid_directory(
+                bound_path, self.context["target_volume"],
+                lambda: self.report.data.update(target_parent_created=True)))
+            self.report.data["parent_creation_method"] = "VOLUME_GUID_EXCLUSIVE_HANDLE"
+        else:
+            resources.enter_context(hold_windows_directory(anchor, self.parent_intent["anchor_identity"]))
+            self.write_gate(preview)
+            # Exactly one exclusive mkdir, never recursive and never remove on failure.
+            os.mkdir(native(self.target.parent))
+            self.created_parent_identity = identity(assert_plain_chain(self.target.parent))
+            self.report.data["parent_creation_method"] = "PARENT_DIRECTORY_HANDLE"
         self.report.data["target_parent_created"] = True
         self.write_gate(preview)
 
