@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from functools import wraps
 
 _CURRENT: ContextVar[ScanMetrics | None] = ContextVar("scan_metrics", default=None)
+_SCOPES: ContextVar[tuple[str, ...]] = ContextVar("scan_metric_scopes", default=())
 _LOG = logging.getLogger("obmanage.scan")
 
 
@@ -21,12 +22,24 @@ class ScanMetrics:
     counts: Counter = field(default_factory=Counter)
     seconds: Counter = field(default_factory=Counter)
     status: str = "running"
+    # Only explicitly requested diagnostic scopes retain attributed counts and
+    # bounded aggregate span records. Normal production collection is unchanged.
+    detail_phases: frozenset[str] = frozenset()
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _slow_vaults: list = field(default_factory=list, repr=False)
+    _scoped_counts: dict = field(default_factory=dict, repr=False)
+    _spans: dict = field(default_factory=dict, repr=False)
+    _origin_ns: int = field(default_factory=time.perf_counter_ns, repr=False)
+
+    def _add_locked(self, name, amount):
+        self.counts[name] += amount
+        if self.detail_phases:
+            for scope in _SCOPES.get():
+                self._scoped_counts.setdefault(scope, Counter())[name] += amount
 
     def add(self, name: str, amount: int = 1) -> None:
         with self._lock:
-            self.counts[name] += amount
+            self._add_locked(name, amount)
 
     def elapsed(self, name: str, amount: float) -> None:
         with self._lock:
@@ -34,7 +47,7 @@ class ScanMetrics:
 
     def query(self, name, function, *args, **kwargs):
         """Measure one metadata API request, regardless of its caller."""
-        started = time.perf_counter()
+        started = time.perf_counter_ns()
         failed = False
         try:
             return function(*args, **kwargs)
@@ -42,13 +55,26 @@ class ScanMetrics:
             failed = True
             raise
         finally:
-            elapsed = time.perf_counter() - started
+            elapsed = (time.perf_counter_ns() - started) / 1e9
             with self._lock:
-                self.counts["metadata_queries"] += 1
-                self.counts[f"{name}_calls"] += 1
+                self._add_locked("metadata_queries", 1)
+                self._add_locked(f"{name}_calls", 1)
                 if failed:
-                    self.counts[f"{name}_errors"] += 1
+                    self._add_locked(f"{name}_errors", 1)
                 self.seconds[name] += elapsed
+
+    def finish_phase(self, name, started, status):
+        finished = time.perf_counter_ns()
+        with self._lock:
+            self.seconds[name] += (finished - started) / 1e9
+            if name in self.detail_phases:
+                span = self._spans.setdefault(name, dict(
+                    first_offset_ns=started - self._origin_ns,
+                    last_offset_ns=0, calls=0, succeeded=0, failed=0, cancelled=0))
+                span["first_offset_ns"] = min(span["first_offset_ns"], started - self._origin_ns)
+                span["last_offset_ns"] = max(span["last_offset_ns"], finished - self._origin_ns)
+                span["calls"] += 1
+                span[status] += 1
 
     def tally(self, names):
         with self._lock:
@@ -67,6 +93,9 @@ class ScanMetrics:
         with self._lock:
             report = dict(task=self.task, status=self.status,
                           counts=dict(self.counts), seconds=dict(self.seconds))
+            if self.detail_phases:
+                report["scopes"] = {k: dict(v) for k, v in self._scoped_counts.items()}
+                report["spans"] = {k: dict(v) for k, v in self._spans.items()}
             if self._slow_vaults:
                 report["slow_vaults"] = [
                     dict(ordinal=ordinal, seconds=seconds, files=files,
@@ -79,7 +108,8 @@ class ScanMetrics:
     @contextmanager
     def activate(self):
         token = _CURRENT.set(self)
-        started = time.perf_counter()
+        scopes = _SCOPES.set(())
+        started = time.perf_counter_ns()
         try:
             yield self
             if self.status == "running":
@@ -88,7 +118,8 @@ class ScanMetrics:
             self.status = "cancelled" if type(exc).__name__ == "SyncCancelled" else "failed"
             raise
         finally:
-            self.elapsed("total", time.perf_counter() - started)
+            self.elapsed("total", (time.perf_counter_ns() - started) / 1e9)
+            _SCOPES.reset(scopes)
             _CURRENT.reset(token)
 
 
@@ -122,15 +153,20 @@ def phase(name: str, *, tallies=()):
     if metrics is None:
         yield
         return
-    started = time.perf_counter()
+    started = time.perf_counter_ns()
+    token = _SCOPES.set((*_SCOPES.get(), name)) if name in metrics.detail_phases else None
     before = metrics.tally(tallies) if tallies else {}
+    status = "succeeded"
     try:
         yield
-    except Exception:
+    except BaseException as exc:
+        status = "cancelled" if type(exc).__name__ in ("SyncCancelled", "KeyboardInterrupt") else "failed"
         metrics.add(f"{name}_exceptions")
         raise
     finally:
-        metrics.elapsed(name, time.perf_counter() - started)
+        metrics.finish_phase(name, started, status)
+        if token is not None:
+            _SCOPES.reset(token)
         if before:
             for counter, amount in metrics.tally(tallies).items():
                 metrics.add(f"{name}_{counter}", amount - before[counter])

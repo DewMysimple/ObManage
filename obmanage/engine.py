@@ -184,6 +184,17 @@ def _profile_pair_id(pair_id: str, mode: str) -> str:
     ).encode("utf-8")).hexdigest()
 
 
+def _scan_side(name, root, cancel, progress, *, mode):
+    """Attribute a real scan; no cached observations or alternate scanner."""
+    with phase(name):
+        return _scan(root, cancel, progress, mode=mode)
+
+
+def _hash_side(side, *args):
+    with phase(side + "_sha256"):
+        return _hash_file(*args)
+
+
 def _protected_directory_keys(excluded: dict[str, dict]) -> set[str]:
     """Return every directory that must remain because it contains ignored files."""
     protected: set[str] = set()
@@ -294,11 +305,11 @@ def _hash_pair(source_path: str, source_expected: dict,
                 emit_progress()
             return update
 
-        source_digest = _hash_file(
-            source_path, source_expected, cancel, sequential_progress(0), relative_path
+        source_digest = _hash_side(
+            "source", source_path, source_expected, cancel, sequential_progress(0), relative_path
         )
-        target_digest = _hash_file(
-            target_path, target_expected, cancel, sequential_progress(1), relative_path
+        target_digest = _hash_side(
+            "target", target_path, target_expected, cancel, sequential_progress(1), relative_path
         )
     else:
         progress_lock = threading.Lock()
@@ -314,11 +325,11 @@ def _hash_pair(source_path: str, source_expected: dict,
         futures: list[Future[str]] = []
         try:
             futures.append(executor.submit(
-                copy_context().run, _hash_file, source_path, source_expected, worker_cancel,
+                copy_context().run, _hash_side, "source", source_path, source_expected, worker_cancel,
                 remember_progress(0), relative_path
             ))
             futures.append(executor.submit(
-                copy_context().run, _hash_file, target_path, target_expected, worker_cancel,
+                copy_context().run, _hash_side, "target", target_path, target_expected, worker_cancel,
                 remember_progress(1), relative_path
             ))
         except BaseException:
@@ -494,8 +505,8 @@ class SyncEngine:
             plan.pair_id = context["pair_id"]
             plan.context = context
             if views is None:
-                source_entries, source_excluded = _scan(plan.source, cancel, progress, mode=mode)
-                target_entries, target_excluded = _scan(plan.target, cancel, progress, mode=mode)
+                source_entries, source_excluded = _scan_side("source_scan", plan.source, cancel, progress, mode=mode)
+                target_entries, target_excluded = _scan_side("target_scan", plan.target, cancel, progress, mode=mode)
             else:
                 source_view, target_view = views
                 if source_view.epoch != target_view.epoch:
@@ -534,9 +545,9 @@ class SyncEngine:
 
     @measured("final_revalidation")
     def _validate_analysis_manifests(self, plan, cancel):
-        for side, root, entries in (("源端", plan.source, plan.context["source_entries"]),
-                                   ("目标端", plan.target, plan.context["target_entries"])):
-            _require_manifest(entries, _scan(root, cancel, None, mode=plan.mode)[0],
+        for key, side, root, entries in (("source", "源端", plan.source, plan.context["source_entries"]),
+                                       ("target", "目标端", plan.target, plan.context["target_entries"])):
+            _require_manifest(entries, _scan_side("analysis_final_" + key, root, cancel, None, mode=plan.mode)[0],
                 root=root, side=side, message="分析期间目录内容发生变化，请重新分析差异。")
 
     @measured("planning")
@@ -579,6 +590,7 @@ class SyncEngine:
                         or record[:2] != (target_by_key[key], source_by_key[key])):
                     stale_records.append((context["reverse_pair_id"], path))
             invalidated_records = list(stale_records)
+            count("baseline_stale_records", len(set(stale_records)))
             if deep:
                 # Retire old equality claims before reading content. A crash,
                 # cancellation, or later database error therefore cannot make
@@ -845,6 +857,7 @@ class SyncEngine:
                     f"复制前源文件已改变，请重新分析差异：{source_path}"
                 )
             with open(native(source_path), "rb") as source:
+                count("copy_started_files")
                 opened = os.fstat(source.fileno())
                 expected = pending.expected
                 if (opened.st_ino, opened.st_dev, opened.st_size, opened.st_mtime_ns) != (
@@ -1187,7 +1200,7 @@ class SyncEngine:
         for key, side, label in (("source", "源端", "源"), ("target", "目标端", "目标")):
             root = getattr(plan, key)
             _require_manifest(context[key + "_entries"],
-                              _scan(root, cancel, progress, mode=plan.mode)[0],
+                              _scan_side("preflight_" + key, root, cancel, progress, mode=plan.mode)[0],
                               root=root, side=side,
                               message=f"{label}目录在预览后发生变化，请重新分析差异。")
 
@@ -1328,51 +1341,52 @@ class SyncEngine:
                 pending_copies.append(pending)
                 return pending
 
-            try:
-                if copy_items:
-                    # Exactly one source writer may run ahead. While the main
-                    # thread reads back the current target temp, that writer
-                    # stages the next file. This overlaps independent source
-                    # and target I/O without parallel commits or unbounded
-                    # outstanding target mutations.
-                    current = begin_copy(copy_items[0])
-                    for index, item in enumerate(copy_items):
-                        assert current.item is item
-                        self._await_copy_temp(
-                            current,
-                            cancel,
-                            progress,
-                            result,
-                            total_copy_bytes=total_copy_bytes,
-                            total_copy_files=len(copy_items),
-                        )
-                        following = (
-                            begin_copy(copy_items[index + 1])
-                            if (overlap_copy_and_verify
-                                and index + 1 < len(copy_items)) else None
-                        )
-                        copied_state = self._verify_commit_copy(
-                            plan,
-                            current,
-                            store,
-                            cancel,
-                            progress,
-                            result,
-                            root_checkpoint,
-                            total_copy_bytes=total_copy_bytes,
-                            total_copy_files=len(copy_items),
-                        )
-                        expected_targets[_key(item.relative_path)] = copied_state
-                        pending_copies.remove(current)
-                        if not overlap_copy_and_verify and index + 1 < len(copy_items):
-                            following = begin_copy(copy_items[index + 1])
-                        current = following
-            finally:
-                pipeline_abort.set()
-                if copy_pool is not None:
-                    copy_pool.shutdown(wait=True, cancel_futures=True)
-                for pending in pending_copies:
-                    self._cleanup_pending_copy(pending, store)
+            with phase("copy_pipeline"):
+                try:
+                    if copy_items:
+                        # Exactly one source writer may run ahead. While the main
+                        # thread reads back the current target temp, that writer
+                        # stages the next file. This overlaps independent source
+                        # and target I/O without parallel commits or unbounded
+                        # outstanding target mutations.
+                        current = begin_copy(copy_items[0])
+                        for index, item in enumerate(copy_items):
+                            assert current.item is item
+                            self._await_copy_temp(
+                                current,
+                                cancel,
+                                progress,
+                                result,
+                                total_copy_bytes=total_copy_bytes,
+                                total_copy_files=len(copy_items),
+                            )
+                            following = (
+                                begin_copy(copy_items[index + 1])
+                                if (overlap_copy_and_verify
+                                    and index + 1 < len(copy_items)) else None
+                            )
+                            copied_state = self._verify_commit_copy(
+                                plan,
+                                current,
+                                store,
+                                cancel,
+                                progress,
+                                result,
+                                root_checkpoint,
+                                total_copy_bytes=total_copy_bytes,
+                                total_copy_files=len(copy_items),
+                            )
+                            expected_targets[_key(item.relative_path)] = copied_state
+                            pending_copies.remove(current)
+                            if not overlap_copy_and_verify and index + 1 < len(copy_items):
+                                following = begin_copy(copy_items[index + 1])
+                            current = following
+                finally:
+                    pipeline_abort.set()
+                    if copy_pool is not None:
+                        copy_pool.shutdown(wait=True, cancel_futures=True)
+                    for pending in pending_copies:
+                        self._cleanup_pending_copy(pending, store)
             result.skipped_files = plan.counts["skip"]
             _cancelled(cancel)
             # A case-only rename retains content identity. Update its own and
@@ -1395,62 +1409,65 @@ class SyncEngine:
             with phase("final_barrier"):
                 root_checkpoint(True)
                 _require_manifest(context["source_entries"],
-                                  _scan(plan.source, cancel, progress, mode=plan.mode)[0],
+                                  _scan_side("barrier_source", plan.source, cancel, progress, mode=plan.mode)[0],
                                   root=plan.source, side="源端",
                                   message="源目录在同步期间发生变化，已停止删除；请重新分析差异。")
-                self._verify_target(plan, expected_targets, cancel)
+                with phase("barrier_target"):
+                    self._verify_target(plan, expected_targets, cancel)
             if deletions:
-                for item in sorted(
-                        deletions,
-                        key=lambda item: (
-                            item.action == "rmdir", -item.relative_path.count("/")
-                        )):
+                with phase("delete_stage"):
+                    for item in sorted(
+                            deletions,
+                            key=lambda item: (
+                                item.action == "rmdir", -item.relative_path.count("/")
+                            )):
+                        _cancelled(cancel)
+                        revalidate_roots(context, target_root=target_root)
+                        relative = item.relative_path
+                        source_path = checked_child(plan.source, relative)
+                        if snapshot(source_path) is not None:
+                            raise SyncError(f"源端重新出现此项目，已停止删除：{relative}")
+                        target_path = checked_child(plan.target, relative)
+                        expected = context["target_entries"][relative]
+                        actual = snapshot(target_path)
+                        if item.action == "delete":
+                            if actual != expected:
+                                raise SyncError(f"待删除文件在预览后发生变化，已停止删除：{relative}")
+                            _mutate_target_file(
+                                target_path,
+                                expected,
+                                "待删除文件在预览后发生变化",
+                                lambda: os.unlink(native(target_path)),
+                                _WINDOWS_DELETE_READONLY_ERRORS,
+                            )
+                            result.deleted_files += 1
+                            store.remove(plan.pair_id, relative)
+                        else:
+                            if identity(actual) != identity(expected):
+                                raise SyncError(f"待删除文件夹已被替换，已停止删除：{relative}")
+                            # rmdir only removes an empty, individually checked folder.
+                            # Unexpected files inserted by another program are retained.
+                            os.rmdir(native(target_path))
+                            result.deleted_dirs += 1
+                        expected_targets.pop(_key(relative))
+                        _emit(
+                            progress,
+                            "delete",
+                            relative_path=relative,
+                            message="已删除目标多余项目",
+                            completed_bytes=result.copied_bytes,
+                            total_bytes=plan.bytes_to_copy,
+                            completed_files=result.deleted_files + result.deleted_dirs,
+                            total_files=len(deletions),
+                        )
+                with phase("post_delete_revalidation"):
                     _cancelled(cancel)
                     revalidate_roots(context, target_root=target_root)
-                    relative = item.relative_path
-                    source_path = checked_child(plan.source, relative)
-                    if snapshot(source_path) is not None:
-                        raise SyncError(f"源端重新出现此项目，已停止删除：{relative}")
-                    target_path = checked_child(plan.target, relative)
-                    expected = context["target_entries"][relative]
-                    actual = snapshot(target_path)
-                    if item.action == "delete":
-                        if actual != expected:
-                            raise SyncError(f"待删除文件在预览后发生变化，已停止删除：{relative}")
-                        _mutate_target_file(
-                            target_path,
-                            expected,
-                            "待删除文件在预览后发生变化",
-                            lambda: os.unlink(native(target_path)),
-                            _WINDOWS_DELETE_READONLY_ERRORS,
-                        )
-                        result.deleted_files += 1
-                        store.remove(plan.pair_id, relative)
-                    else:
-                        if identity(actual) != identity(expected):
-                            raise SyncError(f"待删除文件夹已被替换，已停止删除：{relative}")
-                        # rmdir only removes an empty, individually checked folder.
-                        # Unexpected files inserted by another program are retained.
-                        os.rmdir(native(target_path))
-                        result.deleted_dirs += 1
-                    expected_targets.pop(_key(relative))
-                    _emit(
-                        progress,
-                        "delete",
-                        relative_path=relative,
-                        message="已删除目标多余项目",
-                        completed_bytes=result.copied_bytes,
-                        total_bytes=plan.bytes_to_copy,
-                        completed_files=result.deleted_files + result.deleted_dirs,
-                        total_files=len(deletions),
-                    )
-                _cancelled(cancel)
-                revalidate_roots(context, target_root=target_root)
-                _require_manifest(context["source_entries"],
-                                  _scan(plan.source, cancel, None, mode=plan.mode)[0],
-                                  root=plan.source, side="源端",
-                                  message="同步结束时源目录发生变化，本次仅部分完成，请重新分析差异。")
-                self._verify_target(plan, expected_targets, cancel)
+                    _require_manifest(context["source_entries"],
+                                      _scan(plan.source, cancel, None, mode=plan.mode)[0],
+                                      root=plan.source, side="源端",
+                                      message="同步结束时源目录发生变化，本次仅部分完成，请重新分析差异。")
+                    self._verify_target(plan, expected_targets, cancel)
             result.status = "success"
             _emit(progress, "done", message="镜像同步完成", completed_bytes=result.copied_bytes,
                   total_bytes=plan.bytes_to_copy)

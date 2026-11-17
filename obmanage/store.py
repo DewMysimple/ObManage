@@ -7,11 +7,11 @@ import os
 import sqlite3
 from pathlib import Path
 
-from .scanning.metrics import count, measured
+from .scanning.metrics import count, measured, phase
 
 
 class BaselineStore:
-    @measured("sqlite_open")
+    @measured("sqlite_open", calls=True)
     def __init__(self, state_dir: str | Path):
         count("sqlite_connections")
         directory = Path(state_dir)
@@ -32,7 +32,8 @@ class BaselineStore:
                     path TEXT PRIMARY KEY, pair_id TEXT NOT NULL, identity TEXT NOT NULL
                 );
             """)
-            self.connection.commit()
+            with phase("sqlite_commit"):
+                self.connection.commit()
             count("sqlite_commits")
             self._data_version = self.connection.execute("PRAGMA data_version").fetchone()[0]
         except BaseException:
@@ -60,7 +61,8 @@ class BaselineStore:
                 self._paths_by_pair.clear()
                 raise sqlite3.OperationalError("校验记录已被另一个任务修改，请重新分析差异。")
             yield
-            self.connection.commit()
+            with phase("sqlite_commit"):
+                self.connection.commit()
             count("sqlite_commits")
         except BaseException:
             self.connection.rollback()
@@ -78,10 +80,11 @@ class BaselineStore:
         self._paths_by_pair[pair_id] = cached
         return cached
 
+    @measured("sqlite_close", calls=True)
     def close(self) -> None:
         self.connection.close()
 
-    @measured("sqlite_read")
+    @measured("sqlite_read", calls=True)
     def records(self, pair_id: str) -> dict[str, tuple[dict, dict, str]]:
         self._refresh_external_changes()
         rows = list(self.connection.execute(
@@ -95,7 +98,7 @@ class BaselineStore:
         return {path: (json.loads(src), json.loads(dst), digest)
                 for path, src, dst, digest in rows}
 
-    @measured("sqlite_write")
+    @measured("sqlite_write", calls=True)
     def save(self, pair_id: str, path: str, source: dict, target: dict, digest: str) -> None:
         relative_key = self._relative_key(path)
         with self._write_transaction():
@@ -118,7 +121,7 @@ class BaselineStore:
         # Commit each verified file: cancellation or a crash must not discard
         # previously completed first-adoption hash work.
 
-    @measured("sqlite_write")
+    @measured("sqlite_write", calls=True)
     def invalidate(self, records: list[tuple[str, str]]) -> None:
         """Atomically remove equivalence claims, including case-only aliases."""
         requested = {(pair_id, self._relative_key(path)) for pair_id, path in records}
@@ -145,17 +148,22 @@ class BaselineStore:
     def remove(self, pair_id: str, path: str) -> None:
         self.invalidate([(pair_id, path)])
 
+    @measured("sqlite_register_temp", calls=True)
     def register_temp(self, pair_id: str, path: str, identity: tuple) -> None:
         self.connection.execute("INSERT INTO owned_temps VALUES (?, ?, ?)",
                                 (path, pair_id, json.dumps(identity)))
-        self.connection.commit()
+        with phase("sqlite_commit"):
+            self.connection.commit()
         count("sqlite_commits")
 
+    @measured("sqlite_unregister_temp", calls=True)
     def unregister_temp(self, path: str) -> None:
         self.connection.execute("DELETE FROM owned_temps WHERE path = ?", (path,))
-        self.connection.commit()
+        with phase("sqlite_commit"):
+            self.connection.commit()
         count("sqlite_commits")
 
+    @measured("sqlite_finalize", calls=True)
     def finalize_copy(self, pair_id: str, path: str, source: dict, target: dict,
                       digest: str, temp_path: str) -> None:
         """Publish one verified baseline and retire its temp ownership atomically."""

@@ -35,9 +35,9 @@ def copy_stream_and_hash(
         if metrics is None:
             count = source.readinto(buffer)
         else:
-            started = time.perf_counter()
+            started = time.perf_counter_ns()
             count = source.readinto(buffer)
-            metrics.elapsed("source_read", time.perf_counter() - started)
+            metrics.elapsed("source_read", (time.perf_counter_ns() - started) / 1e9)
             metrics.add("source_read_bytes", count)
         if not count:
             break
@@ -48,9 +48,9 @@ def copy_stream_and_hash(
             if metrics is None:
                 written = destination.write(block[offset:])
             else:
-                started = time.perf_counter()
+                started = time.perf_counter_ns()
                 written = destination.write(block[offset:])
-                metrics.elapsed("stage_write", time.perf_counter() - started)
+                metrics.elapsed("stage_write", (time.perf_counter_ns() - started) / 1e9)
             if written is None:
                 written = count - offset
             if written <= 0:

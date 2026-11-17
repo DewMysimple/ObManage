@@ -18,7 +18,7 @@ class _MeasuredDirectory:
 
     def __init__(self, path):
         self.metrics = current()
-        started = time.perf_counter() if self.metrics else 0
+        started = time.perf_counter_ns() if self.metrics else 0
         try:
             self.context = os.scandir(path)
             self.iterator = None
@@ -29,7 +29,7 @@ class _MeasuredDirectory:
         finally:
             if self.metrics:
                 self.metrics.add("directory_enumerations")
-                self.metrics.elapsed("enumeration", time.perf_counter() - started)
+                self.metrics.elapsed("enumeration", (time.perf_counter_ns() - started) / 1e9)
 
     def __enter__(self):
         self.iterator = iter(self.context.__enter__())
@@ -44,7 +44,7 @@ class _MeasuredDirectory:
     def __next__(self):
         if self.iterator is None:
             self.iterator = iter(self.context)
-        started = time.perf_counter() if self.metrics else 0
+        started = time.perf_counter_ns() if self.metrics else 0
         try:
             entry = next(self.iterator)
         except OSError:
@@ -53,7 +53,7 @@ class _MeasuredDirectory:
             raise
         finally:
             if self.metrics:
-                self.metrics.elapsed("enumeration", time.perf_counter() - started)
+                self.metrics.elapsed("enumeration", (time.perf_counter_ns() - started) / 1e9)
         if self.metrics:
             self.metrics.add("directory_entries")
         return entry
