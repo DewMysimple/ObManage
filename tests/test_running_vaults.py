@@ -14,7 +14,7 @@ def vault(path):
 
 
 def window(title, handle=1):
-    return runtime.ObsidianWindow(handle, 123, title, r"C:\Apps\Obsidian.exe")
+    return runtime.ObsidianWindow(handle, 123, title, r"C:\Apps\Obsidian.exe", 501, 12, "Chrome_WidgetWin_1")
 
 
 def test_only_live_windows_match_closed_and_stale_registered_records(tmp_path):
@@ -76,3 +76,32 @@ def test_inaccessible_runtime_and_cancel_are_explicit(monkeypatch):
     cancel.set()
     with pytest.raises(SyncCancelled):
         runtime.match_running_vaults([window("Notes - Obsidian")], OpenedVaultCandidates(), cancel=cancel)
+
+
+def test_ambiguity_is_scoped_to_all_full_registry_paths(tmp_path):
+    first = vault(tmp_path / "outside" / "Same")
+    second = vault(tmp_path / "inside" / "Same")
+    other = vault(tmp_path / "Other")
+    observed = runtime.match_runtime_sessions((window("note - Same - Obsidian"),),
+                                               OpenedVaultCandidates((first, second, other)))
+    assert observed.catalog().vaults == ()
+    assert observed.blockers((first,)) and observed.blockers((second,))
+    assert not observed.blockers((other,))
+
+
+def test_unregistered_target_with_same_name_is_also_ambiguous(tmp_path):
+    first = vault(tmp_path / "outside" / "Same")
+    second = vault(tmp_path / "inside" / "Same")
+    observed = runtime.match_runtime_sessions((window("note - Same - Obsidian"),),
+                                               OpenedVaultCandidates((first,)), suspect_paths=(second,))
+    assert observed.blockers((second,)) and not observed.sessions
+
+
+def test_hidden_vault_window_can_be_matched(tmp_path):
+    from dataclasses import replace
+    root = vault(tmp_path / "Hidden")
+    hidden = replace(window("Hidden - Obsidian"), visible=False)
+    observed = runtime.match_runtime_sessions((hidden,), OpenedVaultCandidates((root,)))
+    assert not runtime._auxiliary(hidden)
+    assert observed.session(root).windows == (hidden,)
+    assert observed.session(root).directory_identity == runtime.vault_identity(root)

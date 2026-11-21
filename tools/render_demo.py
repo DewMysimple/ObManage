@@ -20,10 +20,12 @@ from obmanage.models import PlanItem, SyncPlan
 from obmanage.management.incremental import IncrementalAnalysis, VaultPair
 from obmanage.management.deployment import FileChange
 from obmanage.management.comsync import DatedVault
+from obmanage.management.comsync_targets import DirectoryBinding, TargetCatalog
 from obmanage.management.models import VaultCatalogResult, VaultInfo
+from obmanage.management.running_vaults import RuntimeSnapshot
 from obmanage.management.archive import ArchiveEntry, ArchivePlan
 from obmanage.operation_log import LogEntry
-from obmanage.pages.distribution import OpenVaultState
+from obmanage.pages.distribution import CatalogTaskResult, TargetScope
 from obmanage.pages.vault_chooser import VaultSourceDialog
 from obmanage.pages.registry import FEATURES
 from obmanage.settings import AppSettings, SettingsStore
@@ -83,12 +85,12 @@ def main() -> None:
                     PlanItem("add", "笔记/电脑新稿.md", 4380, "目标中不存在"),
                     PlanItem("update", "笔记/项目进度.md", 15280, "内容不同，以源端为准"),
                     PlanItem("delete", "归档/旧草稿.md", 2100, "源端已不存在"),
-                ])
+                ], context={"validated": True})
                 backward = SyncPlan(right, left, [
                     PlanItem("add", "归档/旧草稿.md", 2100, "目标中不存在"),
                     PlanItem("update", "笔记/项目进度.md", 19480, "内容不同，以源端为准"),
                     PlanItem("delete", "笔记/电脑新稿.md", 4380, "源端已不存在"),
-                ])
+                ], context={"validated": True})
                 pairs.append(VaultPair(key, label, left, right, forward, backward))
             page._accept_analysis(IncrementalAnalysis(local, portable, tuple(pairs), 6))
             for key, side in (("a", "portable"), ("b", "local")):
@@ -128,16 +130,24 @@ def main() -> None:
             source = str(Path(root) / "配置范本")
             page.root_picker.set_value(root)
             page.source_picker.set_value(source)
-            vaults = tuple(DatedVault(str(Path(root) / name), name, created_ns=1790478000000000000 - (6 - i) * 86400000000000) for i, name in enumerate((
-                "配置范本", "工作笔记", "学习笔记", "读书笔记", "项目资料", "旅行记录", "新建知识库",
-            )))
+            names = ("配置范本", "工作笔记", "学习笔记", "读书笔记", "项目资料", "旅行记录", "新建知识库")
+            vaults = tuple(DatedVault(str(Path(root) / name), name,
+                created_ns=1790478000000000000 - max(0, 5 - i) * 86400000000000)
+                for i, name in enumerate(names))
             catalog = VaultCatalogResult(vaults)
-            page._accept_catalog(catalog)
+            # Model-only fixture. These bindings cannot pass a live filesystem precheck.
+            root_binding = DirectoryBinding(root, root, ("dir", 0, 1), "demo")
+            bindings = tuple(DirectoryBinding(vault.path, vault.path, ("dir", 0, i + 2), "demo")
+                             for i, vault in enumerate(vaults))
+            page._accept_catalog_task(CatalogTaskResult(page._target_catalog_version,
+                TargetCatalog(root, root_binding, catalog, bindings), RuntimeSnapshot()))
             page.component_boxes["file"].setChecked(True)
             page.component_boxes["claude"].setChecked(True)
             page.component_boxes["claudian"].setChecked(True)
-            page._select_newest()
-            page.open_state = OpenVaultState()
+            page.target_scope_buttons.button(TargetScope.LATEST).click()
+            row = next(i for i, vault in enumerate(page.target_model.rows) if vault == vaults[-1])
+            page.target_model.setData(page.target_model.index(row, 0),
+                Qt.CheckState.Checked, Qt.ItemDataRole.CheckStateRole)
             # Presentation-only values: no executable engine plan or filesystem scan.
             targets = tuple(SimpleNamespace(
                 target_root=vault.path, component_id="obsidian",
@@ -198,10 +208,7 @@ def main() -> None:
         for _ in range(15):
             app.processEvents()
             time.sleep(.01)
-        if args.page == "comsync":
-            page.target_table.scrollToBottom()
-            app.processEvents()
-        assert not window.busy and not window.confirm_direction_checkbox.isChecked()
+        assert not window.busy and window._worker_confirmation_dialog is None
         args.output.parent.mkdir(parents=True, exist_ok=True)
         capture = chooser if args.source_chooser and args.page == "comsync" else window
         if args.logs:

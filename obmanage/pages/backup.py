@@ -20,13 +20,11 @@ from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
-    QCheckBox,
     QFrame,
     QGridLayout,
     QHeaderView,
     QHBoxLayout,
     QLabel,
-    QMessageBox,
     QPushButton,
     QSizePolicy,
     QStackedWidget,
@@ -38,7 +36,9 @@ from PySide6.QtWidgets import (
 
 from ..engine import SYNC_MODE_NO_VIDEO, SyncEngine
 from ..file_types import VIDEO_EXTENSIONS
-from ..models import PlanItem, SyncPlan, SyncResult
+from ..models import PlanItem, Progress, SyncPlan, SyncResult
+from ..sync_workflow import SyncIntent, SyncRequest, confirmation_text, preview_copy, run_sync, sync_input_error
+from ..tasking import ConfirmableOperation, TaskConfirmation
 from .common import FeaturePage, PathPicker, format_bytes, panel
 
 
@@ -258,6 +258,7 @@ class VaultBackupPage(FeaturePage):
         self.state_dir = Path(state_dir)
         self.plan: SyncPlan | None = None
         self.last_result: SyncResult | None = None
+        self._sync_request: SyncRequest | None = None
         direction = settings.get("direction", "to_local")
         self.direction = direction if direction in {"to_local", "to_portable"} else "to_local"
         local_value = settings.get("local_path", default_local)
@@ -372,10 +373,10 @@ class VaultBackupPage(FeaturePage):
         empty_page = QWidget()
         empty_layout = QVBoxLayout(empty_page)
         empty_layout.addStretch()
-        self.empty_title = QLabel("先分析非视频差异")
+        self.empty_title = QLabel("等待分析非视频差异")
         self.empty_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.empty_title.setStyleSheet("color: #657984; font-size: 16px; font-weight: 500;")
-        self.empty_detail = QLabel("选择方向和两端仓库后，分析阶段只读取文件。")
+        self.empty_detail = QLabel("点击同步会自动分析非视频内容，并在写入前确认方向与删除范围。")
         self.empty_detail.setObjectName("Muted")
         self.empty_detail.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.empty_detail.setWordWrap(True)
@@ -400,10 +401,6 @@ class VaultBackupPage(FeaturePage):
         preview_layout.addWidget(self.preview_stack, 1)
         self.body.setStretch(2, 1)
 
-        self.confirm_checkbox = QCheckBox()
-        self.confirm_checkbox.setEnabled(False)
-        self.confirm_checkbox.setObjectName("backup_confirm_direction")
-        self.root_layout.addWidget(self.confirm_checkbox)
         actions = QHBoxLayout()
         actions.addStretch()
         self.cancel_button = QPushButton("取消")
@@ -413,7 +410,7 @@ class VaultBackupPage(FeaturePage):
         self.deep_button = QPushButton("完整校验非视频内容")
         self.deep_button.setToolTip("绕过快速记录，重新读取并比较两端全部非视频文件。")
         actions.addWidget(self.deep_button)
-        self.analyze_button = QPushButton("分析非视频差异")
+        self.analyze_button = QPushButton("预览变更")
         actions.addWidget(self.analyze_button)
         self.execute_button = QPushButton("开始备份")
         self.execute_button.setObjectName("Primary")
@@ -424,7 +421,6 @@ class VaultBackupPage(FeaturePage):
         self.to_portable_button.clicked.connect(lambda: self.set_direction("to_portable"))
         self.local_picker.changed.connect(self._inputs_changed)
         self.portable_picker.changed.connect(self._inputs_changed)
-        self.confirm_checkbox.toggled.connect(lambda *_: self.refresh_actions())
         self.filter_tabs.currentChanged.connect(self._filter_changed)
         self.copy_button.clicked.connect(self.copy_selected_target_paths)
         self.table.selectionModel().selectionChanged.connect(
@@ -499,20 +495,15 @@ class VaultBackupPage(FeaturePage):
             f"非视频新增、覆盖和删除只发生在：\n{target}\n目标已有视频始终保留。"
         )
         self.preview_title.setText(f"非视频差异预览 · 仅修改{target_name}")
-        self.confirm_checkbox.setText(
-            "我已确认本次方向与非视频删除；仅修改目标，视频保持原样"
-        )
-        self.confirm_checkbox.setToolTip(
-            f"只读取：{source}\n仅修改非视频内容：{target}\n"
-            "重新分析、切换方向或离开本页后需要再次确认。"
-        )
-        self.execute_button.setText(f"更新{target_name}")
+        self.execute_button.setText(f"同步到{target_name}")
         self.model.set_context(source, target, source_name, target_name)
 
     @Slot()
     def _inputs_changed(self, *_: Any) -> None:
         if self._initializing:
             return
+        if self._task_active and self._task_kind == "sync":
+            self.cancel_requested.emit()
         self._invalidate_plan("仓库位置已改变，旧预览与确认已清除。")
         self._refresh_direction_text()
         self.settings_changed.emit()
@@ -533,28 +524,16 @@ class VaultBackupPage(FeaturePage):
 
     def _invalidate_plan(self, message: str) -> None:
         self.plan = None
-        blocker = QSignalBlocker(self.confirm_checkbox)
-        self.confirm_checkbox.setChecked(False)
-        del blocker
         self.model.set_rows([])
         self.preview_stack.setCurrentIndex(0)
-        self.empty_title.setText("先分析非视频差异")
-        self.empty_detail.setText("分析只读取两端；视频文件不会进入复制、更新或删除。")
+        self.empty_title.setText("等待分析非视频差异")
+        self.empty_detail.setText("分析只读取两端。同步前会确认方向与删除范围。")
         for value in self.summary_values.values():
             value.setText("—")
         for index, (name, _actions) in enumerate(BACKUP_FILTERS):
             self.filter_tabs.setTabText(index, name)
         if not self._task_active:
             self.set_status(message)
-        self.refresh_actions()
-
-    def invalidate_confirmation(self) -> None:
-        was_checked = self.confirm_checkbox.isChecked()
-        blocker = QSignalBlocker(self.confirm_checkbox)
-        self.confirm_checkbox.setChecked(False)
-        del blocker
-        if was_checked and self.plan is not None:
-            self.set_status("已离开本页面，本轮备份确认已撤销。", "warning")
         self.refresh_actions()
 
     @Slot(int)
@@ -568,28 +547,49 @@ class VaultBackupPage(FeaturePage):
         QTimer.singleShot(0, self.table.fit_columns)
 
     def _start_analyze(self, deep: bool) -> None:
+        self._start_backup(SyncIntent.PREVIEW, deep)
+
+    def _start_execute(self) -> None:
+        self._start_backup(SyncIntent.MANUAL)
+
+    def _start_backup(self, intent: SyncIntent, deep: bool = False) -> None:
+        if self._task_active or self._global_busy:
+            return
+        if intent is SyncIntent.MANUAL and self._external_recovery_pending:
+            self.set_status("存在待恢复事务，已阻止新的仓库备份写入。", "warning")
+            return
         source, target = self._paths()
         if not source or not target:
             self.set_status("请先填写笔记本轻量仓库和移动硬盘完整仓库。", "warning")
             return
+        if intent is SyncIntent.MANUAL and (input_error := sync_input_error(source, target)):
+            self.set_status(input_error, "warning")
+            return
         self._invalidate_plan("正在分析；此阶段只读取两个仓库。")
+        self.last_result = None
         self._refresh_direction_text()
         state_dir = self.state_dir
+        source_name, target_name = self._endpoint_names()
+        request = SyncRequest(source, target, source_name, target_name, SYNC_MODE_NO_VIDEO, intent, deep)
 
-        def operation(cancel, progress):
-            return SyncEngine(state_dir).analyze(
-                source,
-                target,
-                deep=deep,
-                mode=SYNC_MODE_NO_VIDEO,
-                cancel=cancel,
-                progress=progress,
+        def operation(cancel, progress, confirm=None):
+            def approve(plan):
+                return confirm(TaskConfirmation(*confirmation_text(request, plan), payload=preview_copy(plan)))
+
+            return run_sync(
+                SyncEngine(state_dir), request, cancel, progress,
+                confirm=approve if confirm is not None else None,
+                executing=lambda _: progress(Progress("execute", "正在同步非视频内容。")),
             )
 
-        self.start_task("analyze_deep" if deep else "analyze", operation)
+        self._sync_request = request
+        if intent is SyncIntent.MANUAL:
+            self.start_task("sync", ConfirmableOperation(operation))
+        else:
+            self.start_task("analyze_deep" if deep else "analyze", operation)
         if not self._task_active:
+            self._sync_request = None
             return
-        source_name, target_name = self._endpoint_names()
         self.set_status(
             f"正在以{source_name}为准分析非视频差异；{target_name}尚未修改。",
             "busy",
@@ -599,64 +599,13 @@ class VaultBackupPage(FeaturePage):
             "视频不复制、不覆盖、不删除。"
         )
 
-    def _start_execute(self) -> None:
-        if self._external_recovery_pending:
-            self.set_status("存在待恢复事务，已阻止新的仓库备份写入。", "warning")
-            return
-        if (
-            self.plan is None
-            or not self._plan_matches_paths()
-            or not self.plan.can_execute
-            or not self.plan.has_changes
-            or not self.confirm_checkbox.isChecked()
-        ):
-            self.set_status("请先重新分析并确认当前方向与非视频差异预览。", "warning")
-            return
-        allow_empty = False
-        deletions = any(
-            item.action in {"delete", "rmdir"} for item in self.plan.items
-        )
-        if self.plan.source_empty and deletions:
-            source_name, target_name = self._endpoint_names()
-            answer = QMessageBox.warning(
-                self,
-                "排除视频后来源为空",
-                f"{source_name}排除视频后没有可管理内容。\n\n"
-                f"继续会删除{target_name}中预览列出的全部非视频内容；"
-                "两端视频仍会保留。确认继续吗？",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-                QMessageBox.StandardButton.Cancel,
-            )
-            if answer != QMessageBox.StandardButton.Yes:
-                self.set_status("已保留目标非视频内容；请核对来源后重新分析。")
-                return
-            allow_empty = True
-        plan = self.plan
-        state_dir = self.state_dir
-        blocker = QSignalBlocker(self.confirm_checkbox)
-        self.confirm_checkbox.setChecked(False)
-        del blocker
-
-        def operation(cancel, progress):
-            return SyncEngine(state_dir).execute(
-                plan,
-                allow_empty=allow_empty,
-                cancel=cancel,
-                progress=progress,
-            )
-
-        source_name, target_name = self._endpoint_names()
-        self.start_task("execute", operation)
-        if not self._task_active:
-            return
-        self.set_status(
-            f"正在更新{target_name}的非视频内容；{source_name}只读取，视频保持原样。",
-            "busy",
-        )
-        self.message_logged.emit(
-            f"开始无视频备份：{plan.source} → {plan.target}；"
-            f"预计复制 {format_bytes(plan.bytes_to_copy)}，视频保持原样。"
-        )
+    def task_confirmation(self, prompt: TaskConfirmation) -> bool:
+        plan = prompt.payload
+        self._accept_plan(plan)
+        if self.plan is not plan:
+            return False
+        self.set_status("等待确认本轮方向和非视频差异。", "busy")
+        return True
 
     def _accept_plan(self, plan: SyncPlan) -> None:
         if plan.mode != SYNC_MODE_NO_VIDEO:
@@ -718,10 +667,7 @@ class VaultBackupPage(FeaturePage):
     def _accept_result(self, result: SyncResult) -> None:
         self.last_result = result
         self.plan = None
-        blocker = QSignalBlocker(self.confirm_checkbox)
-        self.confirm_checkbox.setChecked(False)
-        del blocker
-        _source_name, target_name = self._endpoint_names()
+        target_name = self._sync_request.target_name
         summary = (
             f"复制 {result.copied_files:,} 个文件（{format_bytes(result.copied_bytes)}），"
             f"删除 {result.deleted_files:,} 个文件、{result.deleted_dirs:,} 个文件夹"
@@ -754,23 +700,24 @@ class VaultBackupPage(FeaturePage):
         kind = self._task_kind
         super().task_finished(status, payload)
         if status == "ok":
-            if kind.startswith("analyze"):
+            if isinstance(payload, SyncPlan):
                 self._accept_plan(payload)
-            elif kind == "execute":
+            elif kind == "sync":
                 self._accept_result(payload)
         elif kind.startswith("analyze"):
             self._invalidate_plan(
                 "分析已取消，请重新开始。" if status == "cancelled" else str(payload)
             )
-        elif kind == "execute":
+        elif kind == "sync":
             self.plan = None
             self.set_status(
-                "备份任务已停止；再次操作前必须重新分析。"
+                "本轮已取消，尚未执行写入。"
                 if status == "cancelled"
                 else str(payload),
                 "warning" if status == "cancelled" else "error",
             )
         self._task_kind = ""
+        self._sync_request = None
         self.refresh_actions()
 
     @Slot()
@@ -795,16 +742,9 @@ class VaultBackupPage(FeaturePage):
         paths_ready = bool(source and target)
         self.analyze_button.setEnabled(available and paths_ready)
         self.deep_button.setEnabled(available and paths_ready)
-        executable = (
-            available
-            and not self._external_recovery_pending
-            and self._plan_matches_paths()
-            and self.plan is not None
-            and self.plan.can_execute
-            and self.plan.has_changes
-        )
-        self.confirm_checkbox.setEnabled(executable)
-        self.execute_button.setEnabled(executable and self.confirm_checkbox.isChecked())
+        input_error = sync_input_error(source, target)
+        self.execute_button.setEnabled(available and not input_error and not self._external_recovery_pending)
+        self.execute_button.setToolTip(input_error or f"仅修改 {target} 的非视频内容；{source} 只读取。")
         self.cancel_button.setVisible(self._task_active)
         self.cancel_button.setEnabled(self._task_active)
         self.copy_button.setEnabled(

@@ -40,7 +40,6 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMenu,
-    QMessageBox,
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
@@ -56,12 +55,16 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from .engine import SyncEngine
+from .engine import SYNC_MODE_MIRROR, SyncEngine
 from .models import PlanItem, Progress, SyncCancelled, SyncError, SyncPlan, SyncResult
 from .paths import validate_state_separation
 from .scheduler import Scheduler
 from .settings import SettingsStore
-from .tasking import FeatureWorker
+from .tasking import ConfirmationDialog, ConfirmationExchange, FeatureWorker, TaskConfirmation
+from .sync_workflow import (
+    SyncIntent, SyncRequest, confirmation_text, preview_copy, run_sync, sync_input_error,
+    would_empty_target,
+)
 from .pages.backup import VaultBackupPage
 from .pages.archive import ArchivePage
 from .pages.common import FeaturePage, PathPicker
@@ -309,27 +312,23 @@ class ResponsivePlanTableView(QTableView):
 class SyncWorker(QThread):
     progress = Signal(object)
     completed = Signal(object)
+    confirmation_requested = Signal(object)
+    execution_started = Signal(object)
 
     def __init__(
         self,
         state_dir: Path,
-        operation: str,
-        source: str,
-        target: str,
-        deep: bool,
-        plan: SyncPlan | None,
-        allow_empty: bool,
+        request: SyncRequest,
         cancel: threading.Event,
     ) -> None:
         super().__init__()
         self.state_dir = state_dir
-        self.operation = operation
-        self.source = source
-        self.target = target
-        self.deep = deep
-        self.plan = plan
-        self.allow_empty = allow_empty
+        self.request = request
         self.cancel = cancel
+        self.confirmation_exchange = (
+            ConfirmationExchange(self.confirmation_requested.emit, cancel)
+            if request.intent is SyncIntent.MANUAL else None
+        )
         self.last_progress = 0.0
         self.last_phase = ""
         self._rate_key: tuple[str, str] | None = None
@@ -367,28 +366,25 @@ class SyncWorker(QThread):
     @Slot()
     def run(self) -> None:
         try:
-            engine = SyncEngine(self.state_dir)
-            if self.operation == "analyze":
-                result = engine.analyze(
-                    self.source,
-                    self.target,
-                    deep=self.deep,
-                    cancel=self.cancel,
-                    progress=self._progress,
-                )
-            else:
-                assert self.plan is not None
-                result = engine.execute(
-                    self.plan,
-                    allow_empty=self.allow_empty,
-                    cancel=self.cancel,
-                    progress=self._progress,
-                )
+            result = run_sync(SyncEngine(self.state_dir), self.request, self.cancel, self._progress,
+                              confirm=self._confirm, executing=self._executing)
             self.completed.emit(("ok", result))
         except SyncCancelled:
             self.completed.emit(("cancelled", None))
         except Exception as exc:
             self.completed.emit(("error", f"{type(exc).__name__}: {exc}"))
+
+    def _confirm(self, plan: SyncPlan) -> bool:
+        if self.confirmation_exchange is None:
+            return False
+        return self.confirmation_exchange.ask(
+            TaskConfirmation(*confirmation_text(self.request, plan), payload=preview_copy(plan))
+        )
+
+    def _executing(self, plan: SyncPlan) -> None:
+        self.execution_started.emit(
+            preview_copy(plan) if self.request.intent is SyncIntent.SCHEDULED else None
+        )
 
 
 STYLE = """
@@ -480,11 +476,11 @@ class MainWindow(QMainWindow):
         self._feature_worker: FeatureWorker | None = None
         self._feature_page: FeaturePage | None = None
         self._feature_outcome: tuple[str, Any] | None = None
+        self._worker_confirmation_dialog: ConfirmationDialog | None = None
         self._catalog_display = CatalogPresentationCache()
         self._cancel_event = threading.Event()
         self._pending_outcome: tuple[str, Any] | None = None
         self._operation = ""
-        self._scheduled = False
         self._job_started = 0.0
         self._progress_key: tuple[str, str] | None = None
         self._progress_started = 0.0
@@ -493,7 +489,6 @@ class MainWindow(QMainWindow):
         self._copy_started = 0.0
         self._copy_initial_bytes = 0
         self._exit_requested = False
-        self._confirming_empty = False
         self._tray_close_notified = False
         self._log_dialog: QDialog | None = None
         self._log_lines: list[str] = []
@@ -586,7 +581,7 @@ class MainWindow(QMainWindow):
         self.logs_button = QPushButton("查看操作日志")
         self.logs_button.setObjectName("NavUtility")
         nav_layout.addWidget(self.logs_button)
-        nav_hint = QLabel("所有写操作都先预览并确认")
+        nav_hint = QLabel("手动写入前会分析并确认")
         nav_hint.setObjectName("NavCaption")
         nav_hint.setWordWrap(True)
         nav_layout.addWidget(nav_hint)
@@ -792,10 +787,10 @@ class MainWindow(QMainWindow):
         empty_layout = QVBoxLayout(empty_page)
         empty_layout.setContentsMargins(20, 18, 20, 18)
         empty_layout.addStretch()
-        self.empty_title = QLabel("先看清变化，再开始同步")
+        self.empty_title = QLabel("等待分析仓库差异")
         self.empty_title.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.empty_title.setStyleSheet("color: #657984; font-size: 16px; font-weight: 500;")
-        self.empty_detail = QLabel("选择同步位置后，点击「分析差异」查看文件变化。")
+        self.empty_detail = QLabel("点击同步会自动分析差异，并在写入前确认本轮方向与删除范围。")
         self.empty_detail.setObjectName("Muted")
         self.empty_detail.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.empty_detail.setWordWrap(True)
@@ -891,10 +886,6 @@ class MainWindow(QMainWindow):
         footer_layout.setContentsMargins(20, 6, 20, 10)
         footer_layout.setSpacing(6)
         footer_layout.addLayout(progress_layout)
-        self.confirm_direction_checkbox = QCheckBox()
-        self.confirm_direction_checkbox.setObjectName("confirm_direction_checkbox")
-        self.confirm_direction_checkbox.setEnabled(False)
-        footer_layout.addWidget(self.confirm_direction_checkbox)
         actions = QHBoxLayout()
         actions.setSpacing(10)
         actions.addStretch()
@@ -906,7 +897,7 @@ class MainWindow(QMainWindow):
         self.deep_button.setObjectName("deep_button")
         self.deep_button.setToolTip("重新读取并比较全部文件内容；两端位于不同磁盘时会并行校验。")
         actions.addWidget(self.deep_button)
-        self.analyze_button = QPushButton("分析差异")
+        self.analyze_button = QPushButton("预览变更")
         self.analyze_button.setObjectName("analyze_button")
         actions.addWidget(self.analyze_button)
         self.sync_button = QPushButton("开始同步")
@@ -1005,11 +996,15 @@ class MainWindow(QMainWindow):
             return
         current = self.pages.get(self._current_page_key)
         if current is self.mirror_page and page is not current:
-            # A destructive acknowledgment never survives leaving its context.
-            self.confirm_direction_checkbox.setChecked(False)
+            if getattr(self._worker, "confirmation_exchange", None) is not None:
+                self._cancel_event.set()
+                self._dismiss_worker_confirmation()
             self.local_selection.dismiss()
             self.portable_selection.dismiss()
         elif isinstance(current, FeaturePage) and page is not current:
+            if self._feature_page is current and self._feature_worker.confirmation_exchange is not None:
+                self._feature_worker.request_cancel()
+                self._dismiss_worker_confirmation()
             current.invalidate_confirmation()
             for selection in current.findChildren(VaultSelection):
                 selection.dismiss()
@@ -1080,17 +1075,19 @@ class MainWindow(QMainWindow):
         if self._reject_unsafe_state_location(page):
             self._refresh_actions()
             return
-        if self.busy or self._confirming_empty or self._exit_requested:
+        if self.busy or self._exit_requested:
             page._task_active = False
             page.set_status("已有任务正在运行，请等待完成或先取消。", "warning")
             page.refresh_actions()
             return
         if not isinstance(page, VaultSelection) and page._task_kind in {
-                "execute", "archive", "clear", "clear_all", "finalize", "resolve", "restore", "rollback"}:
+                "execute", "sync", "archive", "clear", "clear_all", "finalize", "resolve", "restore", "rollback"}:
             # A failed or cancelled writer can still have changed the filesystem.
             self._catalog_display.invalidate()
         worker = FeatureWorker(operation, cancellable=page.task_cancellable())
+        worker.confirmation_requested.connect(self._show_worker_confirmation)
         worker.progress.connect(page.task_progress)
+        worker.progress.connect(self._on_feature_stage_changed)
         worker.completed.connect(self._on_feature_completed)
         worker.finished.connect(self._feature_thread_finished)
         worker.finished.connect(worker.deleteLater)
@@ -1102,6 +1099,56 @@ class MainWindow(QMainWindow):
         self._begin_log_task(feature, kind)
         self._refresh_actions()
         worker.start()
+
+    @Slot(object)
+    def _on_feature_stage_changed(self, event) -> None:
+        if event.phase in {"recovering-deployment", "restoring-sessions"}:
+            self._refresh_actions()
+
+    @Slot(object)
+    def _show_worker_confirmation(self, pending) -> None:
+        worker = self.sender()
+        if self._exit_requested or worker is None:
+            pending.resolve(False)
+            return
+        try:
+            if worker is self._feature_worker:
+                valid = (
+                    self.pages.get(self._current_page_key) is self._feature_page
+                    and not worker.cancel_event.is_set()
+                    and self._feature_page.task_confirmation(pending.prompt)
+                )
+            elif worker is self._worker:
+                valid = (
+                    self._current_page_key == "mirror"
+                    and not self._cancel_event.is_set()
+                    and self._show_mirror_confirmation(pending.prompt.payload)
+                )
+            else:
+                valid = False
+            if not valid:
+                pending.resolve(False)
+                return
+            dialog = ConfirmationDialog(pending.prompt, self)
+        except Exception as exc:
+            pending.resolve(False)
+            self._log(f"无法显示最终确认，已撤销本轮写入授权：{exc}", level="error")
+            return
+        self._worker_confirmation_dialog = dialog
+
+        def finish(result: int) -> None:
+            if self._worker_confirmation_dialog is dialog:
+                self._worker_confirmation_dialog = None
+            pending.resolve(result == ConfirmationDialog.DialogCode.Accepted)
+            dialog.deleteLater()
+
+        dialog.finished.connect(finish)
+        dialog.show()
+
+    def _dismiss_worker_confirmation(self) -> None:
+        dialog = getattr(self, "_worker_confirmation_dialog", None)
+        if dialog is not None:
+            dialog.reject()
 
     def _recovery_page_keys(self) -> tuple[str, ...]:
         return tuple(
@@ -1123,6 +1170,7 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _feature_thread_finished(self) -> None:
+        self._dismiss_worker_confirmation()
         worker = self._feature_worker
         page = self._feature_page
         outcome = self._feature_outcome or ("error", "后台任务结束，但未返回结果。")
@@ -1176,7 +1224,6 @@ class MainWindow(QMainWindow):
     def _connect_signals(self) -> None:
         self.direction_to_local_button.clicked.connect(lambda: self.set_direction("to_local"))
         self.direction_to_portable_button.clicked.connect(lambda: self.set_direction("to_portable"))
-        self.confirm_direction_checkbox.toggled.connect(self._refresh_actions)
         self.source_browse.clicked.connect(lambda: self._browse(True))
         self.target_browse.clicked.connect(lambda: self._browse(False))
         self.source_edit.textChanged.connect(self._paths_changed)
@@ -1220,13 +1267,7 @@ class MainWindow(QMainWindow):
         for action, verb in (("add", "新增"), ("update", "更新"), ("delete", "删除"), ("skip", "跳过")):
             self.stat_titles[action].setText(verb)
             self.stat_titles[action].setToolTip(f"本次目标：{target_name}\n{target}")
-        self.confirm_direction_checkbox.setText(
-            f"我已确认：以{source_name}为准，仅更新{target_name}，包括预览中的删除"
-        )
-        self.confirm_direction_checkbox.setToolTip(
-            f"只读取：{source}\n仅修改：{target}\n每次重新分析或切换方向后，需要重新确认本次预览。"
-        )
-        self.sync_button.setText(f"更新{target_name}")
+        self.sync_button.setText(f"同步到{target_name}")
         self.sync_button.setToolTip(f"仅修改 {target}；{source} 只读取，不覆盖或删除。")
         self.table_model.set_context(source, target, source_name, target_name)
         if hasattr(self, "tray_sync_action"):
@@ -1235,7 +1276,7 @@ class MainWindow(QMainWindow):
     def set_direction(self, direction: str) -> None:
         if direction not in ("to_local", "to_portable"):
             raise ValueError("同步方向无效")
-        if self.busy or self._confirming_empty or self._exit_requested:
+        if self.busy or self._exit_requested:
             self._refresh_direction_text()
             return
         if direction == self.settings.direction:
@@ -1249,9 +1290,9 @@ class MainWindow(QMainWindow):
         self.pause_schedule()
         self._refresh_direction_text()
         source_name, target_name = self._endpoint_names()
-        self.paths_panel.setToolTip("方向已切换，旧预览与确认已清除，定时已暂停。请重新分析差异。")
+        self.paths_panel.setToolTip("方向已切换，旧预览已清除，定时已暂停。")
         self.current_file.setText(f"{source_name}只读取；新增、更新与删除仅发生在{target_name}。")
-        self._set_status(f"已切换为 {source_name} → {target_name}，请重新分析。")
+        self._set_status(f"已切换为 {source_name} → {target_name}。")
         self._log(f"已切换方向：{source_name} {self._paths()[0]} → {target_name} {self._paths()[1]}；定时已暂停。", feature="mirror", event="切换方向", task="")
         self._refresh_actions()
         self._persist()
@@ -1274,7 +1315,7 @@ class MainWindow(QMainWindow):
         )
 
     def _browse(self, source: bool) -> None:
-        if self.busy or self._confirming_empty or self._exit_requested:
+        if self.busy or self._exit_requested:
             return
         current = self.source_edit.text() if source else self.target_combo.currentText()
         chosen = QFileDialog.getExistingDirectory(
@@ -1291,15 +1332,18 @@ class MainWindow(QMainWindow):
     @Slot()
     def _paths_changed(self, *_: Any) -> None:
         # Programmatic path changes are subject to the same invalidation as typing.
+        if self._worker is not None and self._worker.request.intent is not SyncIntent.PREVIEW:
+            self._cancel_event.set()
+            self._dismiss_worker_confirmation()
         self._invalidate_plan()
         was_enabled = self.schedule_toggle.isChecked()
         self.settings.set_endpoints(self.local_edit.text().strip(), self.portable_combo.currentText().strip())
         self.pause_schedule()
         self._refresh_direction_text()
         self.paths_panel.setToolTip(
-            "同步位置已变更，定时已暂停。请重新分析差异；重新开启定时后绑定当前位置。"
+            "同步位置已变更，定时已暂停。重新开启定时后绑定当前位置。"
             if was_enabled
-            else "仓库位置已变更，请重新分析差异。上方方向决定本次以哪一端为准。"
+            else "上方方向决定本次以哪一端为准。"
         )
         if not self.busy:
             self._set_status("路径已变更，旧预览已清除。")
@@ -1308,11 +1352,10 @@ class MainWindow(QMainWindow):
 
     def _invalidate_plan(self) -> None:
         self.plan = None
-        self.confirm_direction_checkbox.setChecked(False)
         self.table_model.set_items([])
         self.preview_stack.setCurrentIndex(0)
-        self.empty_title.setText("先看清变化，再开始同步")
-        self.empty_detail.setText("确认上方方向后，点击「分析差异」。分析只读取两个仓库，不修改文件。")
+        self.empty_title.setText("等待分析仓库差异")
+        self.empty_detail.setText("点击同步会自动分析差异，并在写入前确认本轮方向与删除范围。")
         self.copy_summary.setText("待复制  —")
         for action in self.stat_values:
             self.stat_values[action].setText("—")
@@ -1402,7 +1445,7 @@ class MainWindow(QMainWindow):
         self._refresh_actions()
         if was_enabled:
             self._log("定时同步已暂停。", feature="mirror", event="定时设置", task="")
-            self.paths_panel.setToolTip("定时已暂停。请按上方方向分析差异，所有修改与删除仅发生在接收更新的仓库。")
+            self.paths_panel.setToolTip("定时已暂停。手动同步会按上方方向更新接收端。")
 
     def _refresh_schedule_controls(self) -> None:
         interval = self.schedule_mode.currentData() == "interval"
@@ -1425,7 +1468,7 @@ class MainWindow(QMainWindow):
             return
         was_due = self.scheduler.next_run is not None and datetime.now() >= self.scheduler.next_run
         recovery_pending = bool(self._recovery_page_keys())
-        occupied = self.busy or self._confirming_empty or recovery_pending
+        occupied = self.busy or recovery_pending
         due = self.scheduler.tick(occupied)
         if was_due and recovery_pending:
             self._log("到达定时时间，但存在待恢复事务；本轮镜像已跳过，不累计任务。", feature="mirror", event="定时跳过", task="", level="warning")
@@ -1440,7 +1483,7 @@ class MainWindow(QMainWindow):
         self._refresh_schedule_controls()
 
     def _refresh_actions(self) -> None:
-        available = not self.busy and not self._confirming_empty and not self._exit_requested
+        available = not self.busy and not self._exit_requested
         state_location_safe = not self._state_location_error()
         recovery_keys = self._recovery_page_keys()
         recovery_pending = bool(recovery_keys)
@@ -1462,19 +1505,14 @@ class MainWindow(QMainWindow):
         source, target = self._paths()
         self.analyze_button.setEnabled(available and state_location_safe and bool(source and target))
         self.deep_button.setEnabled(available and state_location_safe and bool(source and target))
+        input_error = sync_input_error(source, target)
         self.sync_button.setEnabled(
             available
             and state_location_safe
             and not recovery_pending
-            and self._plan_matches_paths()
-            and self.plan.can_execute
-            and self.plan.has_changes
-            and self.confirm_direction_checkbox.isChecked()
+            and not input_error
         )
-        self.confirm_direction_checkbox.setEnabled(
-            available and state_location_safe and not recovery_pending and self._plan_matches_paths()
-            and self.plan.can_execute and self.plan.has_changes
-        )
+        self.sync_button.setToolTip(input_error or f"仅修改 {target}；{source} 只读取。")
         cancel_sent = (
             self._feature_worker.cancel_event.is_set()
             if self._feature_worker is not None else self._cancel_event.is_set()
@@ -1495,19 +1533,39 @@ class MainWindow(QMainWindow):
         self.tray_sync_action.setEnabled(available and state_location_safe)
         for key, page in self.pages.items():
             if key != "mirror" and isinstance(page, FeaturePage):
-                page.set_global_busy(self.busy or self._confirming_empty or self._exit_requested)
+                page.set_global_busy(self.busy or self._exit_requested)
                 page.set_external_recovery_pending(any(
                     recovery_key != key for recovery_key in recovery_keys
                 ))
 
     def analyze(self, deep: bool = False, scheduled: bool = False) -> None:
-        if self.busy or self._confirming_empty or self._exit_requested:
+        self._start_mirror(SyncIntent.SCHEDULED if scheduled else SyncIntent.PREVIEW, deep)
+
+    @Slot()
+    def start_sync(self) -> None:
+        self._start_mirror(SyncIntent.MANUAL)
+
+    def _start_mirror(self, intent: SyncIntent, deep: bool = False) -> None:
+        if self.busy or self._exit_requested:
             return
         if self._reject_unsafe_state_location():
+            return
+        if intent is not SyncIntent.PREVIEW and self._recovery_page_keys():
+            self._set_status(
+                "存在待处理事务，请到事务处理页选择确认完成或确认回退。", "warning",
+            )
             return
         source, target = self._paths()
         if not source or not target:
             self._set_status("请先填写本机仓库和移动硬盘仓库的位置。", "warning")
+            return
+        if intent is SyncIntent.MANUAL and (input_error := sync_input_error(source, target)):
+            self._set_status(input_error, "warning")
+            return
+        if intent is SyncIntent.SCHEDULED and (
+            not self.settings.schedule_enabled
+            or (source, target) != (self.settings.bound_source, self.settings.bound_target)
+        ):
             return
         self._invalidate_plan()
         self.last_result = None
@@ -1519,108 +1577,29 @@ class MainWindow(QMainWindow):
             else "已有副本首次需要比较内容；完成的校验记录会保留，可随时取消。"
         )
         source_name, target_name = self._endpoint_names()
+        scheduled = intent is SyncIntent.SCHEDULED
         self._set_status(f"正在{'完整校验内容' if deep else '分析差异'}：{source_name} → {target_name}（分析不修改文件）", "busy")
         self._log(f"{'定时' if scheduled else '手动'}{'完整内容校验' if deep else '分析差异'}：以 {source_name} {source} 为准 → 仅修改 {target_name} {target}；分析阶段不修改仓库。", feature="mirror", event="分析差异")
-        self._start_worker("analyze", deep=deep, scheduled=scheduled)
+        request = SyncRequest(source, target, source_name, target_name, SYNC_MODE_MIRROR, intent, deep)
+        self._start_worker(request)
 
-    @Slot()
-    def start_sync(self) -> None:
-        if self.busy or self._confirming_empty or self._exit_requested:
-            return
-        if self._reject_unsafe_state_location():
-            return
-        if self._recovery_page_keys():
-            self._set_status(
-                "存在待处理事务，请到事务处理页选择确认完成或确认回退。",
-                "warning",
-            )
-            return
-        if not self.plan or not self._plan_matches_paths() or not self.plan.can_execute:
-            self._set_status("请先重新分析差异，得到可执行的预览。", "warning")
-            return
-        if not self.plan.has_changes:
-            self._set_status("两端已经一致，无需复制。", "success")
-            return
-        if not self.confirm_direction_checkbox.isChecked():
-            self._set_status("请先核对上方方向与预览，再勾选本次方向确认。", "warning")
-            return
-        allow_empty = False
-        if self._would_empty_target(self.plan):
-            # An empty source is additional to the ordinary per-preview direction
-            # acknowledgement because this would empty the entire destination.
-            source_name, target_name = self._endpoint_names()
-            self._confirming_empty = True
-            self._refresh_actions()
-            try:
-                answer = QMessageBox.warning(
-                    self,
-                    f"{source_name}来源仓库为空",
-                    f"本次以 {source_name} 为准，但它目前为空：\n{self.plan.source}\n\n继续将清空 {target_name} 中的内容：\n{self.plan.target}\n\n{source_name}只读取，不覆盖或删除。确认清空 {target_name} 吗？",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
-                    QMessageBox.StandardButton.Cancel,
-                )
-            finally:
-                self._confirming_empty = False
-                self._refresh_actions()
-            if answer != QMessageBox.StandardButton.Yes:
-                self._set_status(f"已保留{target_name}内容；确认{source_name}来源仓库后可重新分析。")
-                return
-            if self._exit_requested or not self.plan or not self._plan_matches_paths():
-                return
-            allow_empty = True
-        self._execute_plan(allow_empty=allow_empty, scheduled=False)
-
-    @staticmethod
-    def _would_empty_target(plan: SyncPlan) -> bool:
-        return plan.source_empty and any(item.action in ("delete", "rmdir") for item in plan.items)
-
-    def _execute_plan(self, allow_empty: bool = False, scheduled: bool = False) -> None:
-        if self._reject_unsafe_state_location():
-            return
-        if self._recovery_page_keys():
-            message = "存在待处理事务，本轮镜像已阻止；请到事务处理页选择确认完成或确认回退。"
-            self._set_status(message, "warning")
-            self._log(message, feature="mirror", event="执行", level="warning")
-            return
-        source_name, target_name = self._endpoint_names()
-        self._set_status(f"正在更新{target_name}，完成新增与更新后再删除此处多余内容；{source_name}只读取。", "busy")
-        self._log(
-            f"开始同步：以 {source_name} {self.plan.source} 为准，仅更新 {target_name} {self.plan.target}，"
-            f"包括删除；{source_name}不覆盖或删除。预计复制 {format_bytes(self.plan.bytes_to_copy)}。",
-            feature="mirror", event="执行",
-        )
-        self._start_worker("execute", scheduled=scheduled, allow_empty=allow_empty)
-
-    def _start_worker(
-        self,
-        operation: str,
-        deep: bool = False,
-        scheduled: bool = False,
-        allow_empty: bool = False,
-    ) -> None:
-        if self.busy:
-            return
+    def _start_worker(self, request: SyncRequest) -> None:
         self._cancel_event = threading.Event()
         self._pending_outcome = None
-        self._operation = operation
-        if operation == "execute":
-            self._catalog_display.invalidate()
-        self._scheduled = scheduled
+        self._operation = "analyze"
         self._job_started = time.monotonic()
-        self._begin_log_task("mirror", operation)
+        self._begin_log_task("mirror", "analyze" if request.intent is SyncIntent.PREVIEW else "sync")
         self._progress_key = None
         self._copy_started = 0.0
         self.progress_bar.setRange(0, 0)
         self.current_file.setText("正在准备…")
         self.speed_label.setText("")
-        source, target = self._paths()
-        worker = SyncWorker(
-            self.state_dir, operation, source, target, deep,
-            self.plan if operation == "execute" else None, allow_empty, self._cancel_event,
-        )
+        worker = SyncWorker(self.state_dir, request, self._cancel_event)
         worker.setParent(self)
         worker.progress.connect(self._on_progress)
         worker.completed.connect(self._on_completed)
+        worker.confirmation_requested.connect(self._show_worker_confirmation)
+        worker.execution_started.connect(self._show_mirror_execution)
         worker.finished.connect(self._thread_finished)
         worker.finished.connect(worker.deleteLater)
         self._thread = worker
@@ -1628,15 +1607,40 @@ class MainWindow(QMainWindow):
         self._refresh_actions()
         worker.start()
 
+    def _show_mirror_confirmation(self, plan: SyncPlan) -> bool:
+        self._accept_plan(plan, scheduled=False)
+        if self.plan is not plan:
+            return False
+        self._set_status("等待确认本轮方向和最终差异。", "busy")
+        return True
+
+    @Slot(object)
+    def _show_mirror_execution(self, preview: SyncPlan | None) -> None:
+        request = self._worker.request
+        self._operation = "execute"
+        self._catalog_display.invalidate()
+        if self._cancel_event.is_set():
+            return
+        if preview is not None:
+            self._accept_plan(preview, scheduled=False)
+        self._set_status(
+            f"正在更新{request.target_name}；{request.source_name}只读取。", "busy",
+        )
+        self._log(
+            f"开始同步：以 {request.source_name} {request.source} 为准，仅更新 {request.target_name} "
+            f"{request.target}，包括删除。",
+            feature="mirror", event="执行",
+        )
+
     @Slot(object)
     def _on_completed(self, outcome: tuple[str, Any]) -> None:
         self._pending_outcome = outcome
 
     @Slot()
     def _thread_finished(self) -> None:
-        # A scheduled execute is started only after the analysis QThread is fully
-        # stopped, so callbacks and close requests cannot overlap two operations.
-        operation, scheduled = self._operation, self._scheduled
+        operation = self._operation
+        request = self._worker.request
+        scheduled = request.intent is SyncIntent.SCHEDULED
         outcome = self._pending_outcome or ("error", "后台任务结束，但未返回结果。")
         log_context = self._log_context
         if operation == "analyze" and self._cancel_event.is_set():
@@ -1644,6 +1648,7 @@ class MainWindow(QMainWindow):
         self._worker = None
         self._thread = None
         self._pending_outcome = None
+        self._dismiss_worker_confirmation()
         self.progress_bar.setRange(0, 1000)
         self.progress_bar.setValue(0)
         self.speed_label.setText("")
@@ -1656,31 +1661,30 @@ class MainWindow(QMainWindow):
         status, payload = outcome
         if status == "cancelled":
             self.plan = None
-            self._set_status("已取消。已完成的校验记录可复用；再次同步前请重新分析。", "warning")
+            self._set_status("本轮已取消，尚未执行写入。已完成的校验记录可复用。", "warning")
             self.current_file.setText("已停止后续操作。")
-            self.empty_title.setText("分析已取消")
-            self.empty_detail.setText("已完成的内容校验记录已保留，点击「分析差异」即可继续。")
+            self.empty_title.setText("本轮已取消")
+            self.empty_detail.setText("可以继续预览变更或启动新一轮同步。")
             self._log("任务已取消。", level="cancelled")
         elif status == "error":
             self.plan = None
-            self._set_status("本轮未完成，请查看日志并重新分析差异。", "error")
+            self._set_status("本轮未完成，请查看具体原因。", "error")
             self.current_file.setText(str(payload))
             self.current_file.setToolTip(str(payload))
             self.empty_title.setText("未能完成分析" if operation == "analyze" else "本轮同步未完成")
             self.empty_detail.setText(str(payload))
             self._log(str(payload), level="error")
             self._notify("本轮同步未完成", str(payload), warning=True)
-        elif operation == "analyze":
+        elif isinstance(payload, SyncPlan):
             self._accept_plan(payload, scheduled)
         else:
-            self._accept_result(payload)
+            self._accept_result(payload, request)
         self._end_log_task(log_context, outcome)
         self.pages["transactions"].refresh_records()
         self._refresh_actions()
 
     def _accept_plan(self, plan: SyncPlan, scheduled: bool) -> None:
         self.plan = plan
-        self.confirm_direction_checkbox.setChecked(False)
         if not self._plan_matches_paths():
             self._invalidate_plan()
             self._set_status("分析期间路径发生变化，请重新分析差异。", "warning")
@@ -1716,17 +1720,13 @@ class MainWindow(QMainWindow):
             self.empty_title.setText("两端已经一致")
             self.empty_detail.setText("没有需要同步的变化。")
             return
-        if scheduled and self._would_empty_target(plan):
+        if scheduled and would_empty_target(plan):
             self.pause_schedule()
             self._set_status(f"{source_name}来源仓库为空，定时已暂停。请检查预览并手动确认。", "warning")
             self._log(f"{source_name}来源仓库为空，本轮未清空{target_name}。需要手动确认后同步。")
             self._notify(f"需要确认：{source_name}来源仓库为空", f"定时已暂停，{target_name}内容已保留。请检查来源仓库后手动同步。", warning=True)
             return
-        if scheduled:
-            # The user enabled automatic mirroring for this exact pair of paths.
-            self._execute_plan(scheduled=True)
-            return
-        self._set_status(f"预览已就绪。核对并勾选方向确认后，可更新{target_name}；{source_name}只读取。", "success")
+        self._set_status(f"预览已就绪。同步前会确认本轮最终差异；{source_name}只读取。", "success")
         self._refresh_actions()
 
     def _update_counts(self, plan: SyncPlan) -> None:
@@ -1748,11 +1748,10 @@ class MainWindow(QMainWindow):
             total = len(plan.items) if actions is None else sum(counts.get(action, 0) for action in actions)
             self.filter_tabs.setTabText(index, f"{name} {total:,}")
 
-    def _accept_result(self, result: SyncResult) -> None:
+    def _accept_result(self, result: SyncResult, request: SyncRequest) -> None:
         self.last_result = result
         self.plan = None  # A result never leaves an executable stale preview behind.
-        self.confirm_direction_checkbox.setChecked(False)
-        source_name, target_name = self._endpoint_names()
+        source_name, target_name = request.source_name, request.target_name
         summary = (
             f"{target_name}：复制 {result.copied_files:,} 个文件（{format_bytes(result.copied_bytes)}），"
             f"删除 {result.deleted_files:,} 个文件、{result.deleted_dirs:,} 个文件夹，"
@@ -1780,15 +1779,16 @@ class MainWindow(QMainWindow):
         for error in result.errors:
             self._log(error, level="error")
         self.preview_title.setText(f"本轮执行前记录 · 操作位置：{target_name}")
-        self.paths_panel.setToolTip(f"上方为本轮执行前的记录，操作仅针对{target_name}。再次同步前请重新分析。")
+        self.paths_panel.setToolTip(f"上方保留本轮执行前的记录，操作位置为{target_name}。")
 
     @Slot(object)
     def _on_progress(self, progress: Progress) -> None:
-        if not self.busy or self._exit_requested:
+        if self._worker is None or self._exit_requested:
             return
         if self._cancel_event.is_set():
             return
-        source_name, target_name = self._endpoint_names()
+        request = self._worker.request
+        source_name, target_name = request.source_name, request.target_name
         names = {
             "scan": "正在扫描文件",
             "hash": "正在校验文件内容",
@@ -1810,10 +1810,10 @@ class MainWindow(QMainWindow):
             message = (progress.message or names.get(progress.phase, "正在处理…")).replace("源端", source_name).replace("目标", target_name)
         self._set_status(message, "busy")
         path = progress.relative_path or "正在检查仓库…"
-        actual = absolute_item_path(self._paths()[1], progress.relative_path)
+        actual = absolute_item_path(request.target, progress.relative_path)
         self.current_file.setText(f"{target_name}：{actual}" if self._operation == "execute" and progress.relative_path else path)
         self.current_file.setToolTip(
-            f"本次只读取：{self._paths()[0]}\n本次仅修改：{self._paths()[1]}\n{path}"
+            f"本次只读取：{request.source}\n本次仅修改：{request.target}\n{path}"
         )
         if progress.total_bytes > 0:
             self.progress_bar.setRange(0, 1000)
@@ -1861,6 +1861,7 @@ class MainWindow(QMainWindow):
                 self._feature_page.set_status("正在取消，请等待当前步骤安全停止…", "warning")
         else:
             self._cancel_event.set()
+        self._dismiss_worker_confirmation()
         self._set_status("正在取消，请等待当前操作安全停止…", "warning")
         self.cancel_button.setEnabled(False)
         self.nav_cancel_button.setEnabled(False)
@@ -1910,7 +1911,7 @@ class MainWindow(QMainWindow):
         self._log_lines = [f"[{entry.timestamp}] {entry.message}" for entry in self._log_entries][-3000:]
 
     def _begin_log_task(self, feature, kind):
-        events = {"analyze": "分析差异", "preview": "预览", "execute": "执行", "archive": "打包",
+        events = {"analyze": "分析差异", "preview": "预览", "sync": "同步", "execute": "执行", "archive": "打包",
                   "scan": "扫描", "rollback": "回退", "finalize": "清理事务备份", "clear": "清理",
                   "inspect_recovery": "检查恢复方案", "resolve": "保留现状结束事务",
                   "restore": "恢复", "statistics": "统计", "catalog": "读取仓库列表", "analyze_deep": "完整内容校验",
@@ -2004,15 +2005,17 @@ class MainWindow(QMainWindow):
         self._exit_requested = True
         self._timer.stop()
         self._save_timer.stop()
-        self._persist()
         if self.busy:
             if self._feature_worker is not None:
                 self._feature_worker.request_cancel()
             else:
                 self._cancel_event.set()
+            self._dismiss_worker_confirmation()
+            self._persist()
             self._set_status("正在安全停止后台任务，完成后退出…", "warning")
             self._refresh_actions()
             return
+        self._persist()
         self._finish_exit()
 
     def _finish_exit(self) -> None:
@@ -2028,6 +2031,11 @@ class MainWindow(QMainWindow):
                 event.ignore()
             else:
                 event.accept()
+            return
+        if any(getattr(worker, "confirmation_exchange", None) is not None
+               for worker in (self._worker, self._feature_worker)):
+            event.ignore()
+            self.request_exit()
             return
         if self.busy or self.schedule_toggle.isChecked():
             event.ignore()

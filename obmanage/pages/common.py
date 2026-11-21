@@ -179,6 +179,10 @@ class FeaturePage(QWidget):
     def invalidate_confirmation(self) -> None:
         """Called when navigating away from a page with a destructive preview."""
 
+    def task_confirmation(self, prompt: Any) -> bool:
+        """Show the final analysis and check that it still belongs to this page."""
+        return True
+
     def set_global_busy(self, busy: bool) -> None:
         self._global_busy = busy
         self.refresh_actions()

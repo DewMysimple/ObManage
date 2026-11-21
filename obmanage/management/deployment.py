@@ -1076,13 +1076,19 @@ class DeploymentEngine:
 
     @scan_task("deployment")
     def analyze(self, request: DeploymentRequest, cancel: threading.Event | None = None,
-                progress: ProgressCallback = None) -> DeploymentPlan:
+                progress: ProgressCallback = None, *,
+                before_close: DeploymentPlan | None = None) -> DeploymentPlan:
+        """When refreshing after window close, seal only actual writes in the frozen scope."""
         if not self._lock.acquire(blocking=False):
             raise DeploymentError("已有仓库管理任务正在运行。")
         try:
             _cancelled(cancel)
             if not isinstance(request, DeploymentRequest) or not request.selections:
                 raise DeploymentError("请明确选择至少一个组件和目标仓库。")
+            baseline = {}
+            if before_close is not None:
+                self._validate_plan(before_close)
+                baseline = {(item.component_id, item.target_id): item for item in before_close.targets}
             batch_id = str(uuid.uuid4())
             resolved: list[
                 tuple[DeploymentSelection, str, str, str, str, tuple[ParentGuard, ...]]
@@ -1176,7 +1182,7 @@ class DeploymentEngine:
                     "目录已存在，保留其全部内容" if existing else "仅创建空目录，不复制来源内容",
                     kind="dir",
                 ),) if directory_only else _compare_entries(source_tree, target_tree))
-                target_plans.append(DeploymentTargetPlan(
+                item = DeploymentTargetPlan(
                     selection_id=selection_id,
                     component_id=selection.component.component_id,
                     target_id=selection.target.target_id,
@@ -1193,7 +1199,11 @@ class DeploymentEngine:
                     target_root_snapshot=target_root_state,
                     parent_guards=parent_guards,
                     ensure_directory=directory_only,
-                ))
+                )
+                if before_close is not None:
+                    self._check_after_close(baseline.get((item.component_id, item.target_id)), item)
+                if before_close is None or item.needs_deploy:
+                    target_plans.append(item)
                 _emit(progress, "analyzed-target", batch_id=batch_id,
                       selection_id=selection_id, component_id=selection.component.component_id,
                       target_id=selection.target.target_id, message="目标文件与目录预览已完成")
@@ -1203,6 +1213,30 @@ class DeploymentEngine:
                                   _seal_plan(batch_id, request.label, targets, created_at))
         finally:
             self._lock.release()
+
+    @staticmethod
+    def _check_after_close(original: DeploymentTargetPlan | None, current: DeploymentTargetPlan) -> None:
+        if original is None or (
+            original.target_root != current.target_root
+            or original.target_path != current.target_path
+            or original.target_volume != current.target_volume
+            or original.target_root_snapshot.identity != current.target_root_snapshot.identity
+            or original.source_authorization_root != current.source_authorization_root
+            or original.ensure_directory != current.ensure_directory
+        ):
+            raise DeploymentError(f"关闭窗口期间，来源或目标授权范围已改变：{current.target_root}")
+        if not _tree_matches(current.source_tree, original.source_tree):
+            raise DeploymentError(f"关闭窗口期间，组件来源已改变：{current.source_path}")
+        before = tuple((guard.desired_path, guard.actual_path, _identity_tuple(guard.snapshot))
+                       for guard in original.parent_guards)
+        after = tuple((guard.desired_path, guard.actual_path, _identity_tuple(guard.snapshot))
+                      for guard in current.parent_guards)
+        original_tree = original.target_tree
+        current_tree = current.target_tree
+        if (before != after or original.existing_target_path != current.existing_target_path
+                or (original_tree is not None and current_tree is not None
+                    and original_tree.root_snapshot.identity != current_tree.root_snapshot.identity)):
+            raise DeploymentError(f"关闭窗口期间，限定目标目录身份已改变：{current.target_path}")
 
     def _validate_plan(self, plan: DeploymentPlan) -> None:
         try:
@@ -1461,8 +1495,15 @@ class DeploymentEngine:
                 raise
 
     def _commit_one(self, plan: DeploymentPlan, item: DeploymentTargetPlan,
-                    created: dict[str, OwnedDirectory], progress: ProgressCallback) -> None:
-        self._revalidate_component_source(item, None)
+                    created: dict[str, OwnedDirectory], progress: ProgressCallback,
+                    cancel: threading.Event | None, safety_check: Callable[[], None] | None) -> None:
+        def check_write() -> None:
+            _cancelled(cancel)
+            if safety_check is not None:
+                safety_check()
+            _cancelled(cancel)
+
+        self._revalidate_component_source(item, cancel)
         self._revalidate_target(item, created)
         record = next(target for target in self.journal.get(plan.batch_id).targets
                       if target.selection_id == item.selection_id)
@@ -1471,6 +1512,8 @@ class DeploymentEngine:
         self._assert_owned_path(plan.batch_id, record, record.stage_path, "stage")
         _assert_manifest(record.stage_path, record.deployed_manifest,
                          record.stage_identity, "暂存目录")
+        if any(guard.snapshot is None for guard in item.parent_guards):
+            check_write()
         self._ensure_parents(plan, item, created)
         current = self._current_target_path(item, created)
         backup: str | None = None
@@ -1487,6 +1530,7 @@ class DeploymentEngine:
             self.journal.set_target(plan.batch_id, item.selection_id,
                                     phase="backing_up", backup_path=backup,
                                     backup_identity=item.target_tree.root_snapshot.identity)
+            check_write()
             _rename_directory(current, backup)
             backup_manifest, backup_identity = _manifest_tree(backup)
             if (backup_manifest != item.target_tree.manifest()
@@ -1498,6 +1542,7 @@ class DeploymentEngine:
             if current is not None:
                 raise DeploymentError(f"提交前目标子树已出现：{current}")
         self.journal.set_target(plan.batch_id, item.selection_id, phase="installing")
+        check_write()
         _rename_directory(record.stage_path, item.target_path)
         deployed_manifest, deployed_identity = _manifest_tree(item.target_path)
         if (deployed_manifest != item.source_tree.manifest()
@@ -1511,7 +1556,8 @@ class DeploymentEngine:
 
     def execute(self, plan: DeploymentPlan, cancel: threading.Event | None = None,
                 progress: ProgressCallback = None, *,
-                safety_check: Callable[[], None] | None = None) -> DeploymentResult:
+                safety_check: Callable[[], None] | None = None,
+                rollback_safety_check: Callable[[tuple[str, ...]], None] | None = None) -> DeploymentResult:
         started = time.monotonic()
         if not self._lock.acquire(blocking=False):
             return DeploymentResult(plan.batch_id, "failed", errors=("已有仓库管理任务正在运行。",))
@@ -1568,9 +1614,7 @@ class DeploymentEngine:
                 if not item.needs_deploy:
                     continue
                 _cancelled(cancel)
-                if safety_check is not None:
-                    safety_check()
-                self._commit_one(plan, item, created, progress)
+                self._commit_one(plan, item, created, progress, cancel, safety_check)
                 committed += 1
             self.journal.set_batch(plan.batch_id, status="committed")
             status = "success"
@@ -1581,15 +1625,17 @@ class DeploymentEngine:
             status = "cancelled"
             errors.append(str(exc))
             if record_created:
+                _emit(progress, "recovering-deployment", message="正在回滚或安全清理已准备的部署事务。")
                 rolled_back, recovery_errors = self._recover_failed_execution(
-                    plan.batch_id, str(exc), cancelled=True
+                    plan.batch_id, str(exc), cancelled=True, safety_check=rollback_safety_check
                 )
                 errors.extend(recovery_errors)
         except (OSError, ValueError, SyncError) as exc:
             errors.append(str(exc))
             if record_created:
+                _emit(progress, "recovering-deployment", message="正在回滚或安全清理已准备的部署事务。")
                 rolled_back, recovery_errors = self._recover_failed_execution(
-                    plan.batch_id, str(exc), cancelled=False
+                    plan.batch_id, str(exc), cancelled=False, safety_check=rollback_safety_check
                 )
                 errors.extend(recovery_errors)
         finally:
@@ -1610,7 +1656,9 @@ class DeploymentEngine:
         )
 
     def _recover_failed_execution(self, batch_id: str, error: str,
-                                  *, cancelled: bool) -> tuple[int, list[str]]:
+                                  *, cancelled: bool,
+                                  safety_check: Callable[[tuple[str, ...]], None] | None = None
+                                  ) -> tuple[int, list[str]]:
         recovery_errors: list[str] = []
         try:
             record = self.journal.get(batch_id)
@@ -1625,7 +1673,7 @@ class DeploymentEngine:
                 self.journal.set_batch(
                     batch_id, status="rollback_required", error=error
                 )
-                result = self._rollback_locked(batch_id, automatic=True)
+                result = self._rollback_locked(batch_id, automatic=True, safety_check=safety_check)
                 recovery_errors.extend(result.errors)
                 return result.rolled_back_targets, recovery_errors
             record = self.journal.set_batch(
@@ -1922,7 +1970,8 @@ class DeploymentEngine:
         return tuple(residuals)
 
     def _rollback_locked(self, batch_id: str, *, automatic: bool = False,
-                         preview: RecoveryPreview | None = None) -> DeploymentResult:
+                         preview: RecoveryPreview | None = None,
+                         safety_check: Callable[[tuple[str, ...]], None] | None = None) -> DeploymentResult:
         started = time.monotonic()
         batch = self.journal.get(batch_id)
         if batch.status in ("rolled_back", "rolled_back_with_residuals"):
@@ -1938,6 +1987,14 @@ class DeploymentEngine:
         preserve = dict(preview.current_trees) if preview is not None else None
         try:
             states = self._preflight_rollback(batch, preserve=preserve)
+            if safety_check is not None:
+                affected = tuple(dict.fromkeys(
+                    target.target_root for target in batch.targets
+                    if states[target.selection_id][0] == "deployed"
+                    or (target.backup_path and snapshot(target.backup_path) is not None)
+                    or target.created_parents
+                ))
+                safety_check(affected)
         except (OSError, SyncError) as exc:
             try:
                 self.journal.set_batch(batch_id, status="rollback_blocked", error=str(exc))
@@ -1990,6 +2047,8 @@ class DeploymentEngine:
                                             rollback_path=rollback_path,
                                             rollback_identity=authorized_rollback_identity,
                                             preserved_manifest=preserved_manifest)
+                    if safety_check is not None:
+                        safety_check((target.target_root,))
                     _rename_directory(current, rollback_path)
                     moved_current = True
                     _assert_identity(
@@ -2002,6 +2061,8 @@ class DeploymentEngine:
                     _assert_manifest(target.backup_path or "", target.original_manifest,
                                      target.backup_identity or target.original_identity,
                                      "恢复前原目标备份")
+                    if safety_check is not None:
+                        safety_check((target.target_root,))
                     try:
                         _rename_directory(target.backup_path or "", target.target_path)
                     except OSError:
@@ -2018,6 +2079,8 @@ class DeploymentEngine:
                                        allow_subset=True)
                 if target.stage_path and snapshot(target.stage_path) is not None:
                     self._cleanup_stage(batch.batch_id, target)
+                if safety_check is not None and target.created_parents:
+                    safety_check((target.target_root,))
                 target_residuals = self._remove_created_parents(target)
                 if preserved_manifest is not None:
                     target_residuals += (f"回退前的当前内容已完整保留，请按需手动取回：{rollback_path}",)

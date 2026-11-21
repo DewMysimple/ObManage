@@ -4,6 +4,7 @@ import hashlib
 import os
 from dataclasses import dataclass
 from datetime import datetime
+from enum import IntEnum
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
@@ -18,6 +19,7 @@ from PySide6.QtCore import (
 )
 from PySide6.QtWidgets import (
     QApplication,
+    QButtonGroup,
     QCheckBox,
     QComboBox,
     QGridLayout,
@@ -32,22 +34,23 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
 )
 
-from ..management import discover_vaults, read_opened_vault_candidates
+from ..management import read_opened_vault_candidates
 from ..management.deployment import (
     DeploymentComponent,
     DeploymentEngine,
     DeploymentError,
     DeploymentPlan,
-    DeploymentRequest,
     DeploymentResult,
-    DeploymentSelection,
-    DeploymentTarget,
     RecoveryPreview,
     TERMINAL_BATCH_STATUSES,
 )
 from ..management.journal import JournalBatch, JournalError
-from ..management.comsync import components, newest_vaults, source_root, with_creation_times
-from ..management.obsidian_lifecycle import close_obsidian, assert_obsidian_closed, open_vaults
+from ..management.comsync import components, newest_vaults, source_root
+from ..management.comsync_targets import DirectoryBinding, TargetCatalog, scan_target_catalog
+from ..management.running_vaults import RuntimeSnapshot, read_runtime_snapshot
+from ..management.comsync_workflow import (
+    ComSyncOutcome, ComSyncRequest, ComSyncTarget, SyncApproval, preview, synchronize,
+)
 from ..management.models import (
     ManagementIssue,
     OpenedVaultCandidates,
@@ -55,8 +58,10 @@ from ..management.models import (
     VaultInfo,
 )
 from ..models import Progress, SyncCancelled
+from ..tasking import ConfirmableOperation, TaskConfirmation
 from ..paths import canonical, native
 from .common import FeaturePage, PathPicker, format_bytes, panel
+from .collection_root import CollectionRootPicker
 from .icons import action_icon
 from .controls import DropDownCombo
 
@@ -127,16 +132,12 @@ def _physical_key(path: str) -> str:
     return os.path.normcase(value).casefold()
 
 
-def _paths_overlap(first: str, second: str) -> bool:
-    if not first or not second:
-        return False
-    first_key = _physical_key(first)
-    second_key = _physical_key(second)
+def _keys_overlap(first: str, second: str) -> bool:
     try:
-        common = os.path.commonpath((first_key, second_key))
+        common = os.path.commonpath((first, second))
     except ValueError:
         return False
-    return common in (first_key, second_key)
+    return common in (first, second)
 
 
 def _target_id(path: str) -> str:
@@ -147,6 +148,34 @@ def _target_id(path: str) -> str:
 def _absolute_change_path(target_root: str, relative_path: str) -> str:
     parts = relative_path.replace("\\", "/").split("/")
     return canonical(os.path.join(target_root, *parts))
+
+
+def _confirmation_prompt(approval: SyncApproval) -> TaskConfirmation:
+    request = approval.request
+    counts = {action: sum(change.action == action for change in approval.plan.changes)
+              for action in ("add", "update", "delete")}
+    detail = [
+        f"来源：{request.source}",
+        f"组件：{'、'.join(request.component_names)}",
+        "",
+        f"写入目标（{len(approval.write_targets)} 个）",
+        *approval.write_targets,
+    ]
+    if approval.skipped:
+        detail.extend(("", f"跳过目标（{len(approval.skipped)} 个）", *approval.skipped))
+    if approval.closed_by_task:
+        detail.extend(("", "将恢复本轮关闭的原有会话", *approval.closed_by_task))
+    if request.open_after_sync:
+        detail.extend(("", "同步成功后，若所选仓库尚未运行，将请求打开。"))
+    else:
+        detail.extend(("", "仅恢复本轮关闭的原有会话。"))
+    return TaskConfirmation(
+        "确认本轮配置与模板同步",
+        f"所选 {len(request.selected_targets)} 个仓库，实际写入 {len(approval.write_targets)} 个。"
+        f"新增 {counts['add']} 项，更新 {counts['update']} 项，删除 {counts['delete']} 项。",
+        "\n".join(detail),
+        payload=approval,
+    )
 
 
 @dataclass(frozen=True)
@@ -171,36 +200,34 @@ class DeploymentPreviewRow:
 
 @dataclass(frozen=True)
 class OpenVaultState:
-    """One read of Obsidian's open-vault registry and optional catalog validation."""
+    """Saved registry state used by the existing manual transaction rollback."""
 
     paths: tuple[str, ...] = ()
-    vaults: tuple[VaultInfo, ...] = ()
     issues: tuple[ManagementIssue, ...] = ()
     reliable: bool = True
 
 
 @dataclass(frozen=True)
 class CatalogTaskResult:
-    catalog: VaultCatalogResult
-    open_state: OpenVaultState
+    version: int
+    targets: TargetCatalog
+    running: RuntimeSnapshot
 
 
 @dataclass(frozen=True)
-class AnalyzeTaskResult:
-    plan: DeploymentPlan
-    open_state: OpenVaultState
+class RunningTargetsResult:
+    version: int
+    running: RuntimeSnapshot
 
 
-@dataclass(frozen=True)
-class ExecuteTaskResult:
-    result: DeploymentResult
-    open_state: OpenVaultState
-    launch_errors: tuple[str, ...] = ()
-    opened_targets: int = 0
+class TargetScope(IntEnum):
+    ALL = 0
+    RUNNING = 1
+    LATEST = 2
 
 
 class VaultTargetTableModel(QAbstractTableModel):
-    """Catalog-backed targets; rows are deliberately unchecked after every scan."""
+    """Visible, eligible targets and manually checked paths."""
 
     checked_changed = Signal()
     HEADERS = ("选择", "仓库", "完整位置")
@@ -211,22 +238,21 @@ class VaultTargetTableModel(QAbstractTableModel):
         self.rows: list[VaultInfo] = []
         self._checked: set[str] = set()
 
-    def set_rows(self, rows: Iterable[VaultInfo]) -> None:
+    def set_rows(self, rows: Iterable[VaultInfo], *, retain: set[str] | None = None) -> None:
+        selected = self._checked
         self.beginResetModel()
         self.rows = list(rows)
-        self._checked.clear()
+        self._checked = {item.path for item in self.rows} & selected & (retain or set())
         self.endResetModel()
-        self.checked_changed.emit()
+        if selected != self._checked:
+            self.checked_changed.emit()
 
     def checked_vaults(self) -> tuple[VaultInfo, ...]:
-        return tuple(item for item in self.rows if _physical_key(item.path) in self._checked)
+        return tuple(item for item in self.rows if item.path in self._checked)
 
     def set_all_checked(self, checked: bool) -> None:
-        wanted = {_physical_key(item.path) for item in self.rows} if checked else set()
+        wanted = {item.path for item in self.rows} if checked else set()
         self._set_checked(wanted)
-
-    def check_rows(self, rows: Iterable[int]) -> None:
-        self._set_checked(self._checked | {_physical_key(self.rows[row].path) for row in rows})
 
     def _set_checked(self, wanted: set[str]) -> None:
         if wanted == self._checked:
@@ -256,7 +282,7 @@ class VaultTargetTableModel(QAbstractTableModel):
             return None
         item = self.rows[index.row()]
         if role == Qt.ItemDataRole.CheckStateRole and index.column() == 0:
-            return (Qt.CheckState.Checked if _physical_key(item.path) in self._checked
+            return (Qt.CheckState.Checked if item.path in self._checked
                     else Qt.CheckState.Unchecked)
         if role == Qt.ItemDataRole.DisplayRole:
             created = getattr(item, "created_ns", None)
@@ -279,10 +305,10 @@ class VaultTargetTableModel(QAbstractTableModel):
 
     def setData(self, index: QModelIndex, value: Any,
                 role: int = Qt.ItemDataRole.EditRole) -> bool:
-        if (not index.isValid() or index.column() != 0
+        if (not index.isValid() or not 0 <= index.row() < len(self.rows) or index.column() != 0
                 or role != Qt.ItemDataRole.CheckStateRole):
             return False
-        key = _physical_key(self.rows[index.row()].path)
+        key = self.rows[index.row()].path
         checked = Qt.CheckState(value) == Qt.CheckState.Checked
         changed = checked != (key in self._checked)
         if not changed:
@@ -365,7 +391,6 @@ class DistributionPage(FeaturePage):
     source_label = "模板来源"
     source_hint = "选择包含待部署组件的目录"
     compact_sync = False
-    manage_obsidian = False
 
     def __init__(self, state_dir: Path, settings: dict[str, Any], default_root: str,
                  *, title: str, description: str,
@@ -379,19 +404,20 @@ class DistributionPage(FeaturePage):
         self.opened_vault_reader = opened_vault_reader or read_opened_vault_candidates
         self.plan: DeploymentPlan | None = None
         self.catalog: VaultCatalogResult | None = None
+        self._catalog_root_binding: DirectoryBinding | None = None
+        self._catalog_bindings: dict[str, DirectoryBinding] = {}
+        self._eligible_vaults: tuple[VaultInfo, ...] = ()
+        self._target_catalog_version = 0
+        self._target_scope = TargetScope.ALL
+        self._running_targets = RuntimeSnapshot()
+        self._hidden_target_count = 0
         self.current_batch: JournalBatch | None = None
         self.recovery_preview: RecoveryPreview | None = None
         self._batches: tuple[JournalBatch, ...] = ()
         self._pending_batches: tuple[JournalBatch, ...] = ()
         self._recovery_blocked = False
-        self.open_state = OpenVaultState(
-            issues=(ManagementIssue(
-                "occupancy_not_checked",
-                "尚未检查 Obsidian 当前打开的仓库。",
-                severity="warning",
-            ),),
-            reliable=False,
-        )
+        self._request_version = 0
+        self._finishing_sync = False
         self._restoring = False
 
         self.source_frame, config = panel(self.body)
@@ -399,9 +425,7 @@ class DistributionPage(FeaturePage):
             title = QLabel("1  选择来源")
             title.setObjectName("SectionTitle")
             config.addWidget(title)
-        self.root_picker = PathPicker(
-            "仓库集合根目录", "", dialog_title="选择要发现目标仓库的集合根目录"
-        )
+        self.root_picker = CollectionRootPicker()
         self.root_picker.edit.setObjectName(f"{self.page_key}_root")
         if not self.compact_sync:
             config.addWidget(self.root_picker)
@@ -443,8 +467,9 @@ class DistributionPage(FeaturePage):
         target_title = QLabel("2  勾选目标仓库" if self.compact_sync else "目标仓库")
         target_title.setObjectName("SectionTitle")
         target_header.addWidget(target_title)
-        self.target_summary = QLabel("尚未发现仓库 · 默认不选择任何目标")
+        self.target_summary = QLabel("可见 0 · 有效 0 · 已选 0 · 请刷新仓库")
         self.target_summary.setObjectName("Muted")
+        self.target_summary.setWordWrap(True)
         target_header.addWidget(self.target_summary, 1)
         target_layout.addLayout(target_header)
         if self.compact_sync:
@@ -458,6 +483,19 @@ class DistributionPage(FeaturePage):
             self.target_filter.setClearButtonEnabled(True)
             self.target_filter.addAction(action_icon("search"), QLineEdit.ActionPosition.LeadingPosition)
             target_controls.addWidget(self.target_filter, 1)
+            self.target_scope_buttons = QButtonGroup(self)
+            for scope, label in ((TargetScope.ALL, "全部仓库"), (TargetScope.RUNNING, "当前运行"),
+                                 (TargetScope.LATEST, "最新创建")):
+                button = QPushButton(label)
+                button.setCheckable(True)
+                button.setProperty("pathAction", True)
+                button.setStyleSheet(
+                    "QPushButton:checked { background: #EAF2F6; color: #254E68; border-color: #60859B; }"
+                )
+                self.target_scope_buttons.addButton(button, scope)
+                target_controls.addWidget(button)
+            self.target_scope_buttons.button(TargetScope.ALL).setChecked(True)
+            self.target_scope_buttons.idClicked.connect(self._change_target_scope)
         else:
             target_controls.addStretch()
         self.copy_target_button = QPushButton("复制所选路径", self)
@@ -466,14 +504,14 @@ class DistributionPage(FeaturePage):
             target_controls.addWidget(self.copy_target_button)
         else:
             self.copy_target_button.hide()
-        self.select_all_targets_button = QPushButton("全选列表" if self.compact_sync else "全选目标")
+        self.select_all_targets_button = QPushButton("全选当前列表" if self.compact_sync else "全选目标")
         self.select_all_targets_button.setObjectName("TextButton")
-        self.select_all_targets_button.setToolTip("只勾选当前搜索结果；已有选择会保留。")
+        self.select_all_targets_button.setToolTip("勾选当前可见的全部目标仓库。")
         target_controls.addWidget(self.select_all_targets_button)
         self.clear_targets_button = QPushButton("清空选择")
         self.clear_targets_button.setObjectName("TextButton")
         target_controls.addWidget(self.clear_targets_button)
-        self.catalog_button = QPushButton("扫描仓库" if self.compact_sync else "发现仓库")
+        self.catalog_button = QPushButton("刷新仓库")
         if self.compact_sync:
             self.root_picker.input_layout.addWidget(self.catalog_button)
         else:
@@ -484,9 +522,10 @@ class DistributionPage(FeaturePage):
         self.target_model = VaultTargetTableModel(self, creation_time=self.page_key == "comsync")
         self.target_proxy = QSortFilterProxyModel(self)
         self.target_proxy.setSourceModel(self.target_model)
-        self.target_proxy.setFilterKeyColumn(-1)
-        self.target_proxy.setFilterCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        self.target_proxy.setSortRole(Qt.ItemDataRole.UserRole)
         self.target_table.setModel(self.target_proxy)
+        self.target_table.setSortingEnabled(True)
+        self.target_table.sortByColumn(1, Qt.SortOrder.AscendingOrder)
         if self.target_filter is not None:
             self.target_filter.textChanged.connect(self._filter_targets)
         self.target_table.setSelectionBehavior(QTableView.SelectionBehavior.SelectRows)
@@ -507,6 +546,11 @@ class DistributionPage(FeaturePage):
         self.catalog_issues.setWordWrap(True)
         self.catalog_issues.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         target_layout.addWidget(self.catalog_issues)
+        self.target_scope_status = QLabel()
+        self.target_scope_status.setObjectName("Muted")
+        self.target_scope_status.setWordWrap(True)
+        self.target_scope_status.hide()
+        target_layout.addWidget(self.target_scope_status)
         self.catalog_issues.hide()
 
         self.occupancy_status = QLabel("占用状态：尚未检查")
@@ -514,12 +558,6 @@ class DistributionPage(FeaturePage):
         self.occupancy_status.setWordWrap(True)
         self.occupancy_status.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         target_layout.addWidget(self.occupancy_status)
-        self.occupancy_confirm = QCheckBox(
-            "无法自动确认占用；我已关闭所有所选目标仓库"
-        )
-        self.occupancy_confirm.setObjectName(f"{self.page_key}_occupancy_confirm")
-        self.occupancy_confirm.hide()
-        target_layout.addWidget(self.occupancy_confirm)
 
         preview_frame, preview_layout = panel(self.body)
         preview_header = QHBoxLayout()
@@ -562,7 +600,7 @@ class DistributionPage(FeaturePage):
             preview_header_view.setSectionResizeMode(2, QHeaderView.ResizeMode.Interactive)
             self.preview_table.setColumnWidth(2, 150)
         preview_layout.addWidget(self.preview_table, 1)
-        self.preview_empty = QLabel("勾选目标仓库后，点击「预览变更」。\n这里会列出新增、更新和删除的具体位置。", self.preview_table)
+        self.preview_empty = QLabel("勾选目标后即可同步，也可先预览差异。\n新增、更新和删除的实际位置在此显示。", self.preview_table)
         self.preview_empty.setObjectName("Muted")
         self.preview_empty.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.preview_empty.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
@@ -619,12 +657,6 @@ class DistributionPage(FeaturePage):
         self.body.removeWidget(self.recovery_frame)
         self.body.insertWidget(0, self.recovery_frame)
 
-        self.confirm_checkbox = QCheckBox(
-            "尚未生成计划；分析完成后必须确认目标与删除数量。"
-        )
-        self.confirm_checkbox.setObjectName(f"{self.page_key}_confirm")
-        self.confirm_checkbox.setEnabled(False)
-        self.root_layout.addWidget(self.confirm_checkbox)
         actions = QHBoxLayout()
         self.safety_hint = QLabel("分析只读取来源和目标；执行只修改已勾选仓库中的选定子树。")
         self.safety_hint.setObjectName("Muted")
@@ -650,7 +682,6 @@ class DistributionPage(FeaturePage):
             ):
                 button.setIcon(action_icon(icon))
             self.execute_button.setIcon(action_icon("arrow", "#FFFFFF"))
-            self.root_picker.browse.setText("浏览…")
             self.source_picker.browse.setText("浏览…")
             for table, copier in ((self.target_table, self.copy_selected_target_paths),
                                   (self.preview_table, self.copy_selected_preview_paths)):
@@ -660,10 +691,10 @@ class DistributionPage(FeaturePage):
                 )
 
         self.restore_settings(settings)
-        self.root_picker.changed.connect(lambda *_: self._inputs_changed(clear_catalog=True))
-        self.source_picker.changed.connect(lambda *_: self._inputs_changed(clear_catalog=True))
+        self.root_picker.changed.connect(self._collection_changed)
+        self.source_picker.changed.connect(self._source_changed)
         for box in self.component_boxes.values():
-            box.toggled.connect(lambda *_: self._inputs_changed(clear_catalog=False))
+            box.toggled.connect(self._inputs_changed)
         self.target_model.checked_changed.connect(self._targets_changed)
         self.target_table.selectionModel().selectionChanged.connect(
             lambda *_: self.refresh_actions()
@@ -683,8 +714,6 @@ class DistributionPage(FeaturePage):
         self.finalize_button.clicked.connect(self._start_finalize)
         self.batch_selector.currentIndexChanged.connect(self._batch_selection_changed)
         self.finalize_confirm.toggled.connect(lambda *_: self.refresh_actions())
-        self.confirm_checkbox.toggled.connect(lambda *_: self.refresh_actions())
-        self.occupancy_confirm.toggled.connect(lambda *_: self.refresh_actions())
         self.copy_target_button.clicked.connect(self.copy_selected_target_paths)
         self.select_all_targets_button.clicked.connect(
             self._select_visible_targets
@@ -734,10 +763,8 @@ class DistributionPage(FeaturePage):
         finally:
             del blockers
             self._restoring = False
-        if hasattr(self, "target_model"):
-            self.target_model.set_rows(())
-        self.catalog = None
-        self._invalidate_plan("设置已恢复，请重新发现目标并分析。")
+        self._clear_target_catalog()
+        self._invalidate_plan("设置已恢复，请刷新仓库并选择目标。")
 
     def selected_component_ids(self) -> tuple[str, ...]:
         return tuple(key for key, box in self.component_boxes.items() if box.isChecked())
@@ -745,66 +772,156 @@ class DistributionPage(FeaturePage):
     def _components(self) -> tuple[DeploymentComponent, ...]:
         raise NotImplementedError
 
-    def _build_request(self) -> DeploymentRequest:
-        components = self._components()
-        targets = self.target_model.checked_vaults()
-        selections = tuple(
-            DeploymentSelection(
-                component,
-                DeploymentTarget(_target_id(vault.path), vault.path),
-            )
-            for component in components
-            for vault in targets
-        )
-        return DeploymentRequest(selections, label=self.batch_label)
-
     @Slot()
-    def _inputs_changed(self, *_: Any, clear_catalog: bool = False) -> None:
+    def _inputs_changed(self, *_: Any) -> None:
         if self._restoring:
             return
-        if clear_catalog:
-            self.catalog = None
-            self.target_model.set_rows(())
-            self.target_summary.setText("输入已改变 · 请重新发现仓库 · 默认不选择任何目标")
-            self.catalog_issues.setText("")
-            self.catalog_issues.setToolTip("")
-        self._invalidate_plan("输入已改变，请重新分析文件与目录差异。")
-        self._update_occupancy_display(reset_confirmation=True)
+        self._invalidate_plan("输入已改变，已清除上次预览。")
+        self._update_occupancy_display()
         self.settings_changed.emit()
         self.refresh_actions()
+
+    def _clear_target_catalog(self) -> None:
+        self._target_catalog_version += 1
+        self.catalog = None
+        self._catalog_root_binding = None
+        self._catalog_bindings.clear()
+        self._eligible_vaults = ()
+        self._running_targets = RuntimeSnapshot()
+        self.catalog_issues.clear()
+        self.catalog_issues.setToolTip("")
+        self.catalog_issues.hide()
+        self._replace_target_rows(retain=set())
+
+    @Slot()
+    def _collection_changed(self) -> None:
+        if self._restoring:
+            return
+        self._clear_target_catalog()
+        self._inputs_changed()
+
+    @Slot()
+    def _source_changed(self) -> None:
+        if self._restoring:
+            return
+        self._update_eligible_targets()
+        self._replace_target_rows(retain=set())
+        self._inputs_changed()
 
     @Slot()
     def _targets_changed(self) -> None:
         if self._restoring:
             return
-        self._invalidate_plan("目标选择已改变，请重新分析文件与目录差异。")
-        selected = len(self.target_model.checked_vaults())
-        self.target_summary.setText(
-            f"已发现 {len(self.target_model.rows):,} 个真实仓库 · 已选 {selected:,} 个"
-        )
-        if self.compact_sync:
-            self._update_target_summary()
-        self._update_occupancy_display(reset_confirmation=True)
+        self._invalidate_plan("目标选择已改变，已清除上次预览。")
+        self._hidden_target_count = 0
+        self._update_target_summary()
+        self._update_occupancy_display()
         self.refresh_actions()
 
-    def _filter_targets(self, text: str) -> None:
-        self.target_proxy.setFilterFixedString(text.strip())
+    def _filter_targets(self, _text: str) -> None:
+        self._replace_target_rows(notify_removed=True)
+
+    def _update_eligible_targets(self) -> None:
+        candidates = self.catalog.vaults if self.catalog is not None else ()
+        source = self.source_picker.value
+        if not candidates or not source:
+            self._eligible_vaults = candidates
+            return
+        source_key = _physical_key(str(source_root(source)))
+        self._eligible_vaults = tuple(vault for vault in candidates
+            if not _keys_overlap(source_key, os.path.normcase(vault.path).casefold()))
+
+    def _restore_target_scope_button(self) -> None:
+        self.target_scope_buttons.button(self._target_scope).setChecked(True)
+
+    @Slot(int)
+    def _change_target_scope(self, scope: int) -> None:
+        if self._global_busy or self._task_active:
+            self._restore_target_scope_button()
+            return
+        if scope == TargetScope.RUNNING and self.catalog is not None:
+            version = self._target_catalog_version
+            config = self.obsidian_config_path
+            self._restore_target_scope_button()
+
+            def operation(cancel, progress):
+                progress(Progress("running_targets", "正在核验当前运行的 Obsidian 仓库…"))
+                return RunningTargetsResult(version, read_runtime_snapshot(config, cancel=cancel))
+
+            self.start_task("running_targets", operation)
+        else:
+            self._target_scope = TargetScope(scope)
+            self._replace_target_rows(notify_removed=True)
+
+    def _accept_running_targets(self, payload: RunningTargetsResult) -> None:
+        if payload.version == self._target_catalog_version:
+            self._running_targets = payload.running
+            self._target_scope = TargetScope.RUNNING
+            self._replace_target_rows(notify_removed=True)
+            self.set_status("已刷新当前运行范围。")
+        self._restore_target_scope_button()
+
+    def _replace_target_rows(self, *, retain: set[str] | None = None,
+                             notify_removed: bool = False) -> None:
+        rows, issue_messages = self._scoped_targets(self._eligible_vaults)
+        query = self.target_filter.text().strip().casefold() if self.target_filter else ""
+        if query:
+            rows = tuple(vault for vault in rows
+                         if query in vault.name.casefold() or query in vault.path.casefold())
+        selected = {vault.path for vault in self.target_model.checked_vaults()}
+        retain = selected if retain is None else retain
+        remaining = {vault.path for vault in rows} & retain
+        if tuple(self.target_model.rows) != rows or selected - remaining:
+            self.target_model.set_rows(rows, retain=retain)
+        self._hidden_target_count = len(selected - remaining) if notify_removed else 0
+        self.target_scope_status.setText(issue_messages[0] if issue_messages else "")
+        self.target_scope_status.setToolTip("\n".join(issue_messages))
+        self.target_scope_status.setVisible(bool(issue_messages))
         self._update_target_summary()
         self.refresh_actions()
 
+    def _scoped_targets(self, eligible: tuple[VaultInfo, ...]) -> tuple[tuple[VaultInfo, ...], tuple[str, ...]]:
+        if self.catalog is None:
+            return (), ()
+        if self._target_scope == TargetScope.LATEST:
+            latest = newest_vaults(eligible)
+            if eligible and not latest:
+                paths = tuple(vault.path for vault in eligible if getattr(vault, "created_ns", None) is None)
+                return (), ("无法确定最新创建仓库：部分有效候选的创建时间不可读取。", *paths)
+            return latest, ()
+        if self._target_scope == TargetScope.RUNNING:
+            running = {os.path.normcase(session.vault.path): session.directory_identity
+                       for session in self._running_targets.sessions}
+            rows, changed = [], []
+            for vault in eligible:
+                key = os.path.normcase(vault.path)
+                if key in running:
+                    binding = self._catalog_bindings.get(vault.path)
+                    if binding is not None and binding.identity == running[key]:
+                        rows.append(vault)
+                    else:
+                        changed.append(vault.path)
+            issues = [issue.message for issue in self._running_targets.issues
+                      if issue.code != "runtime_not_found"]
+            if changed:
+                issues.extend(("部分运行仓库的目录身份已改变，请刷新仓库。", *changed))
+            if issues:
+                return tuple(rows), (f"运行识别不完整：{issues[0]}", *issues[1:])
+            return tuple(rows), (() if rows else ("当前集合内未识别到正在运行的目标仓库。",))
+        return eligible, ()
+
     def _update_target_summary(self) -> None:
-        excluded = len(self.catalog.vaults) - len(self.target_model.rows) if self.catalog else 0
+        eligible = len(self._eligible_vaults)
+        suffix = " · 请刷新仓库" if self.catalog is None else ""
+        if self._hidden_target_count:
+            suffix = f" · 已移除 {self._hidden_target_count} 个不再可用或可见的选择"
         self.target_summary.setText(
-            f"{self.target_proxy.rowCount()} / {len(self.target_model.rows)} 个仓库 · "
-            f"已选 {len(self.target_model.checked_vaults())} 个"
-            + (f" · 已排除 {excluded} 个来源仓库" if excluded else "")
+            f"可见 {len(self.target_model.rows)} · 有效 {eligible} · "
+            f"已选 {len(self.target_model.checked_vaults())}{suffix}"
         )
 
     def _select_visible_targets(self) -> None:
-        self.target_model.check_rows(
-            self.target_proxy.mapToSource(self.target_proxy.index(row, 0)).row()
-            for row in range(self.target_proxy.rowCount())
-        )
+        self.target_model.set_all_checked(True)
 
     def _path_menu(self, table, point, copier) -> None:
         if not table.selectionModel().selectedRows():
@@ -813,43 +930,41 @@ class DistributionPage(FeaturePage):
         menu.addAction("复制所选完整路径", copier)
         menu.exec(table.viewport().mapToGlobal(point))
 
-    def _invalidate_plan(self, message: str = "计划已失效，请重新分析。") -> None:
+    def _invalidate_plan(self, message: str = "输入已改变，可预览或直接同步。") -> None:
+        self._request_version += 1
+        if self._task_active and self._task_kind in {"analyze", "execute"}:
+            self.cancel_requested.emit()
         self._reset_recovery_preview()
         self._reset_finalize_confirmation()
         self.plan = None
         self.preview_model.set_rows(())
         self.preview_empty.setVisible(self.compact_sync)
         self.preview_summary.setText("新增 — · 更新 — · 删除：尚未分析 · 跳过 —")
-        blocker = QSignalBlocker(self.confirm_checkbox)
-        self.confirm_checkbox.setChecked(False)
-        del blocker
-        self.confirm_checkbox.setText("尚未生成计划；分析完成后必须确认目标与删除数量。")
-        self.confirm_checkbox.setEnabled(False)
         if not self._task_active:
             self.set_status(message)
 
     def invalidate_confirmation(self) -> None:
         self._reset_recovery_preview()
-        for checkbox in (self.confirm_checkbox, self.finalize_confirm):
-            blocker = QSignalBlocker(checkbox)
-            checkbox.setChecked(False)
-            del blocker
-        if self.plan is not None and self.plan.needs_deploy:
-            self.set_status("已离开本页面，本轮部署确认已撤销。", "warning")
+        blocker = QSignalBlocker(self.finalize_confirm)
+        self.finalize_confirm.setChecked(False)
+        del blocker
         self.refresh_actions()
 
     def has_pending_recovery(self) -> bool:
         return self._recovery_blocked or bool(self._pending_batches)
 
     def task_cancellable(self) -> bool:
-        return self._task_active and self._task_kind in {
-            "catalog", "analyze", "execute"
+        return self._task_active and not self._finishing_sync and self._task_kind in {
+            "catalog", "running_targets", "analyze", "execute"
         }
 
-    def _source_overlaps_vault(self, vault: VaultInfo) -> bool:
-        return _paths_overlap(self.source_picker.value, vault.path)
+    def task_progress(self, event: Progress) -> None:
+        if event.phase in {"recovering-deployment", "restoring-sessions"}:
+            self._finishing_sync = True
+            self.refresh_actions()
+        super().task_progress(event)
 
-    def _read_open_state(self, cancel, progress, *, validate: bool) -> OpenVaultState:
+    def _read_open_state(self, cancel, progress) -> OpenVaultState:
         if cancel is not None and cancel.is_set():
             raise SyncCancelled("已取消读取 Obsidian 当前打开仓库。")
         try:
@@ -869,20 +984,6 @@ class DistributionPage(FeaturePage):
         paths_by_key = {_physical_key(path): path for path in opened.paths}
         paths = tuple(sorted(paths_by_key.values(), key=lambda item: (item.casefold(), item)))
         issues = list(opened.issues)
-        vaults: tuple[VaultInfo, ...] = ()
-        if validate and paths:
-            validated = discover_vaults(paths, recursive=False, cancel=cancel, progress=progress)
-            vaults = tuple(
-                vault for vault in validated.vaults
-                if _physical_key(vault.path) in paths_by_key
-            )
-            issues.extend(validated.issues)
-            if len(vaults) != len(paths):
-                issues.append(ManagementIssue(
-                    "opened_vault_not_valid",
-                    "部分 Obsidian 当前打开仓库未通过真实仓库校验。",
-                    severity="warning",
-                ))
         if progress is not None:
             progress(Progress(
                 phase="occupancy",
@@ -894,7 +995,6 @@ class DistributionPage(FeaturePage):
             raise SyncCancelled("已取消读取 Obsidian 当前打开仓库。")
         return OpenVaultState(
             paths=paths,
-            vaults=vaults,
             issues=tuple(issues),
             reliable=not issues,
         )
@@ -908,128 +1008,84 @@ class DistributionPage(FeaturePage):
     def _selected_target_paths(self) -> tuple[str, ...]:
         return tuple(vault.path for vault in self.target_model.checked_vaults())
 
-    def _update_occupancy_display(self, *, reset_confirmation: bool = True,
-                                  target_paths: Iterable[str] | None = None) -> None:
-        paths = tuple(target_paths) if target_paths is not None else self._selected_target_paths()
-        open_targets = self._open_selected_targets(self.open_state, paths)
-        if reset_confirmation:
-            blocker = QSignalBlocker(self.occupancy_confirm)
-            self.occupancy_confirm.setChecked(False)
-            del blocker
-        if not self.open_state.reliable:
-            first = self.open_state.issues[0].message if self.open_state.issues else "原因未知"
-            self.occupancy_status.setText(f"占用状态无法自动确认：{first}")
-            self.occupancy_status.setToolTip("\n".join(
-                f"{issue.message}{' · ' + issue.path if issue.path else ''}"
-                for issue in self.open_state.issues
-            ))
-            self.occupancy_confirm.setVisible(bool(paths))
-        elif open_targets:
-            self.occupancy_status.setText(
-                f"已阻止：{len(open_targets)} 个所选目标正被 Obsidian 标记为打开。"
-            )
-            self.occupancy_status.setToolTip("\n".join(open_targets))
-            self.occupancy_confirm.hide()
-        else:
-            self.occupancy_status.setText(
-                f"占用检查通过：当前记录 {len(self.open_state.paths)} 个打开仓库，"
-                "所选目标均未标记为打开。"
-            )
-            self.occupancy_status.setToolTip("")
-            self.occupancy_confirm.hide()
+    def _update_occupancy_display(self, **_kwargs) -> None:
+        selected_count = len(self._selected_target_paths())
+        open_hint = ("成功后若未运行，请求打开所选仓库。" if selected_count == 1
+                     else "恢复本轮关闭的会话。")
+        self.occupancy_status.setText("同步会正常关闭需要写入的目标仓库窗口。" + open_hint)
+        self.occupancy_status.setToolTip(
+            "请先保存编辑内容。关闭失败时停止本轮同步；其他仓库可以继续运行。")
 
     @Slot()
     def _start_catalog(self) -> None:
-        if not self.root_picker.value or (not self.compact_sync and not self.source_picker.value):
+        if self._global_busy or self._task_active or not self.root_picker.value:
             return
         root = self.root_picker.value
-        self.catalog = None
-        self.target_model.set_rows(())
-        self._invalidate_plan("正在重新发现仓库。")
+        version = self._target_catalog_version
+        check_running = self._target_scope == TargetScope.RUNNING
+        config = self.obsidian_config_path
 
         def operation(cancel, progress):
-            open_state = self._read_open_state(cancel, progress, validate=False)
-            catalog = discover_vaults(root, cancel=cancel, progress=progress)
-            if self.page_key == "comsync":
-                catalog = with_creation_times(catalog, cancel)
-            return CatalogTaskResult(catalog, open_state)
+            targets = scan_target_catalog(root, cancel, progress)
+            running = read_runtime_snapshot(config, cancel=cancel) if check_running else RuntimeSnapshot()
+            return CatalogTaskResult(version, targets, running)
 
         self.start_task("catalog", operation)
 
+    def _freeze_request(self) -> ComSyncRequest:
+        assert self._catalog_root_binding is not None
+        source = str(source_root(self.source_picker.value))
+        return ComSyncRequest(
+            version=self._request_version,
+            source=source,
+            collection=self._catalog_root_binding,
+            selected_targets=tuple(
+                ComSyncTarget(_target_id(path), self._catalog_bindings[path])
+                for path in self._selected_target_paths()
+            ),
+            component_names=tuple(self.component_boxes[key].text() for key in self.selected_component_ids()),
+            components=self._components(),
+            label=self.batch_label,
+            open_after_sync=len(self._selected_target_paths()) == 1,
+        )
+
     @Slot()
     def _start_analyze(self) -> None:
-        if not self.target_model.checked_vaults() or not self.selected_component_ids():
+        if not self.analyze_button.isEnabled():
             return
-        request = self._build_request()
-        state_dir = self.state_dir
         self._invalidate_plan("正在分析，仓库内容尚未修改。")
+        request = self._freeze_request()
+        state_dir = self.state_dir
 
         def operation(cancel, progress):
-            open_state = self._read_open_state(cancel, progress, validate=False)
-            plan = DeploymentEngine(state_dir).analyze(
-                request, cancel=cancel, progress=progress
-            )
-            return AnalyzeTaskResult(plan, open_state)
+            return request.version, preview(state_dir, request, cancel, progress)
 
         self.start_task("analyze", operation)
 
     @Slot()
     def _start_execute(self) -> None:
         if self._external_recovery_pending or self.has_pending_recovery():
-            self.set_status("另一个待恢复事务尚未处理，已阻止开始新的部署。", "warning")
+            self.set_status("存在待处理或无法读取的事务，已阻止新的同步。", "warning")
             return
-        if self.plan is None or not self.plan.needs_deploy or not self.confirm_checkbox.isChecked():
+        if not self.execute_button.isEnabled():
             return
-        plan = self.plan
-        state_dir = self.state_dir
-        occupancy_override = not self.occupancy_confirm.isHidden() and self.occupancy_confirm.isChecked()
-        target_paths = tuple(item.target_root for item in plan.targets)
-        selected_paths = self._selected_target_paths()
-        # Bind reopening to the user's whole selection, including unchanged
-        # targets; a batch must never turn into a series of editor launches.
-        auto_open_paths = selected_paths if len(selected_paths) == 1 else ()
-        blocker = QSignalBlocker(self.confirm_checkbox)
-        self.confirm_checkbox.setChecked(False)
-        del blocker
+        self._invalidate_plan("正在准备本轮同步。")
+        request = self._freeze_request()
+        state_dir, config_path = self.state_dir, self.obsidian_config_path
 
-        def operation(cancel, progress):
-            if self.manage_obsidian:
-                close_obsidian(cancel=cancel, progress=progress)
-                result = DeploymentEngine(state_dir).execute(
-                    plan, cancel=cancel, progress=progress,
-                    safety_check=assert_obsidian_closed,
-                )
-                launch_errors = ()
-                opened_targets = 0
-                if result.success and auto_open_paths:
-                    # Opening is separate from the committed transaction.
-                    try:
-                        launch_errors = open_vaults(
-                            auto_open_paths, config_path=self.obsidian_config_path)
-                    except Exception as exc:
-                        launch_errors = (f"无法打开仓库：{exc}",)
-                    if not launch_errors:
-                        opened_targets = 1
-                return ExecuteTaskResult(result, OpenVaultState(), launch_errors, opened_targets)
-            open_state = self._read_open_state(cancel, progress, validate=False)
-            open_targets = self._open_selected_targets(open_state, target_paths)
-            if open_targets:
-                raise DeploymentError(
-                    "所选目标正被 Obsidian 标记为打开，请关闭 Obsidian 后重新发现并分析："
-                    + "；".join(open_targets)
-                )
-            if not open_state.reliable and not occupancy_override:
-                detail = open_state.issues[0].message if open_state.issues else "原因未知"
-                raise DeploymentError(
-                    "无法自动确认目标仓库是否被 Obsidian 占用；"
-                    f"请检查后重新分析并显式确认已关闭目标仓库。（{detail}）"
-                )
-            result = DeploymentEngine(state_dir).execute(
-                plan, cancel=cancel, progress=progress
-            )
-            return ExecuteTaskResult(result, open_state)
+        def operation(cancel, progress, confirm):
+            return synchronize(state_dir, config_path, request, cancel, progress,
+                               lambda approval: confirm(_confirmation_prompt(approval)))
 
-        self.start_task("execute", operation)
+        self.start_task("execute", ConfirmableOperation(operation))
+
+    def task_confirmation(self, prompt: TaskConfirmation) -> bool:
+        approval = prompt.payload
+        if not isinstance(approval, SyncApproval) or approval.request.version != self._request_version:
+            return False
+        self._accept_plan(approval.plan)
+        self.set_status("等待确认本轮同步。可以查看最终差异或取消。", "warning")
+        return True
 
     @Slot()
     def _start_inspect_recovery(self) -> None:
@@ -1063,7 +1119,7 @@ class DistributionPage(FeaturePage):
         self._reset_recovery_preview()
 
         def operation(cancel, progress):
-            opened = self._read_open_state(cancel, progress, validate=False)
+            opened = self._read_open_state(cancel, progress)
             if self._open_selected_targets(opened, target_paths):
                 raise DeploymentError("目标仓库仍在 Obsidian 中打开，请关闭后重新检查。")
             return DeploymentEngine(state_dir).rollback(preview.batch_id, preview=preview)
@@ -1088,17 +1144,25 @@ class DistributionPage(FeaturePage):
 
         self.start_task("finalize", operation)
 
-    def _accept_catalog(self, result: VaultCatalogResult) -> None:
+    def _accept_catalog_task(self, payload: CatalogTaskResult) -> None:
+        if (payload.version != self._target_catalog_version
+                or payload.targets.root != self.root_picker.value):
+            return
+        root_binding = payload.targets.root_binding
+        incoming = {binding.path: binding for binding in payload.targets.bindings}
+        retain = set()
+        if root_binding == self._catalog_root_binding:
+            retain = {path for path, binding in incoming.items()
+                      if binding == self._catalog_bindings.get(path)}
+        self._catalog_root_binding = root_binding
+        self._catalog_bindings = incoming
+        self._running_targets = payload.running
+        self._accept_catalog(payload.targets.catalog, retain=retain)
+
+    def _accept_catalog(self, result: VaultCatalogResult, *, retain: set[str] | None = None) -> None:
         self.catalog = result
-        usable = tuple(vault for vault in result.vaults if not self._source_overlaps_vault(vault))
-        excluded = len(result.vaults) - len(usable)
-        self.target_model.set_rows(usable)
-        self.target_summary.setText(
-            f"已发现 {len(usable):,} 个真实仓库 · 已选 0 个"
-            + (f" · 已排除 {excluded} 个来源仓库" if excluded else "")
-        )
-        if self.compact_sync:
-            self._update_target_summary()
+        self._update_eligible_targets()
+        self._replace_target_rows(retain=retain or set(), notify_removed=True)
         if result.issues:
             first = result.issues[0]
             self.catalog_issues.setText(
@@ -1112,17 +1176,16 @@ class DistributionPage(FeaturePage):
             self.catalog_issues.setText("")
             self.catalog_issues.setToolTip("")
         self.catalog_issues.setVisible(bool(result.issues))
-        if not usable:
-            self.set_status("没有找到可作为目标的真实仓库；来源仓库不会列为目标。", "warning")
-        elif result.issues:
+        usable = len(self._eligible_vaults)
+        if result.issues:
             self.set_status(
-                f"已发现 {len(usable)} 个可用目标；有 {len(result.issues)} 个路径问题。",
+                f"已发现 {usable} 个可用目标，另有 {len(result.issues)} 个发现问题。",
                 "warning",
             )
+        elif not usable:
+            self.set_status("没有找到可作为目标的真实仓库。", "warning")
         else:
-            self.set_status(
-                f"已发现 {len(usable)} 个目标仓库；默认均未选择。", "success"
-            )
+            self.set_status(f"已发现 {usable} 个可用目标。", "success")
 
     def _accept_plan(self, plan: DeploymentPlan) -> None:
         self.plan = plan
@@ -1161,46 +1224,13 @@ class DistributionPage(FeaturePage):
             f"删除 {counts['delete']:,}（{delete_files:,} 文件 · {delete_dirs:,} 文件夹） · "
             f"跳过 {counts['skip']:,}"
         )
-        blocker = QSignalBlocker(self.confirm_checkbox)
-        self.confirm_checkbox.setChecked(False)
-        del blocker
-        self.confirm_checkbox.setText(
-            f"我确认：来源只读；仅修改 {len(plan.targets):,} 个组件/目标组合；"
-            f"将删除目标内 {delete_files:,} 个文件、{delete_dirs:,} 个文件夹。"
-        )
-        if self.compact_sync:
-            self.confirm_checkbox.setText(
-                f"确认同步所选组件到 {len({item.target_root for item in plan.targets})} 个仓库；"
-                f"将删除目标内 {delete_files} 个文件、{delete_dirs} 个文件夹。"
-            )
-        self.confirm_checkbox.setEnabled(plan.needs_deploy)
         if plan.needs_deploy:
             self.set_status(
-                f"预览已就绪：将删除 {delete_files} 个目标文件、{delete_dirs} 个目标文件夹；"
-                "勾选确认后才能部署。",
+                f"预览完成。将删除 {delete_files} 个目标文件和 {delete_dirs} 个目标文件夹。",
                 "warning" if counts["delete"] else "success",
             )
         else:
-            self.set_status("所有选定组件已经一致，不需要写入或生成备份。", "success")
-        self._update_occupancy_display(
-            reset_confirmation=True,
-            target_paths=(item.target_root for item in plan.targets),
-        )
-        open_targets = self._open_selected_targets(
-            self.open_state, (item.target_root for item in plan.targets)
-        )
-        if open_targets and not self.manage_obsidian:
-            self.set_status(
-                f"已阻止部署：{len(open_targets)} 个所选目标正被 Obsidian 标记为打开。"
-                "关闭后重新发现并分析。",
-                "error",
-            )
-        elif not self.open_state.reliable and not self.manage_obsidian:
-            self.set_status(
-                "文件与目录预览已完成，但无法自动确认 Obsidian 占用状态；"
-                "确认已关闭所选目标后才能部署。",
-                "warning",
-            )
+            self.set_status("所有选定组件在本次分析中一致。", "success")
 
     def _reset_finalize_confirmation(self) -> None:
         blocker = QSignalBlocker(self.finalize_confirm)
@@ -1311,26 +1341,10 @@ class DistributionPage(FeaturePage):
         )
         self._show_current_batch()
 
-    def _accept_operation_result(self, kind: str, result: DeploymentResult, *,
-                                 launch_errors: tuple[str, ...] = (),
-                                 opened_targets: int = 0) -> None:
+    def _accept_operation_result(self, kind: str, result: DeploymentResult) -> None:
         self._reload_persistent_batches()
         detail = result.errors[0] if result.errors else ""
-        if kind == "execute":
-            self._invalidate_plan("部署结束；再次部署前必须重新分析。")
-            if result.success:
-                self.set_status(
-                    f"部署完成：提交 {result.committed_targets} 个目标。"
-                    + (f"已请求在 Obsidian 中打开 {opened_targets} 个仓库。" if opened_targets else "")
-                    + ("同步已完成，但打开仓库失败，请手动打开。" if launch_errors else "")
-                    + "请到事务处理页选择确认完成或确认回退。",
-                    "warning" if launch_errors else "success",
-                )
-            else:
-                self.set_status(
-                    f"部署未完成：{detail or result.journal_status or result.status}", "error"
-                )
-        elif kind == "rollback":
+        if kind == "rollback":
             if result.success:
                 if result.journal_status == "rolled_back_with_residuals":
                     self.set_status(
@@ -1356,43 +1370,74 @@ class DistributionPage(FeaturePage):
                 self.set_status(f"事务未结束：{detail}", "error")
         for message in result.errors:
             self.message_logged.emit(message)
-        for message in launch_errors:
-            self.message_logged.emit(message)
-        if launch_errors:
-            self.status_label.setToolTip("\n".join(launch_errors))
         self.message_logged.emit(self.status_label.text())
+
+    def _accept_sync_result(self, outcome: ComSyncOutcome) -> None:
+        self._reload_persistent_batches()
+        self._invalidate_plan("本轮同步已结束。")
+        result = outcome.execution
+        details = list(outcome.skipped)
+        errors = list(result.errors if result is not None else ())
+        if outcome.error:
+            errors.append(outcome.error)
+        details.extend(errors)
+        if outcome.status == "success":
+            summary = f"同步完成，提交 {result.committed_targets} 个组件/仓库组合。请到事务处理页确认完成或回退。"
+        elif outcome.status == "no_changes":
+            summary = "无需写入。"
+        elif outcome.status == "cancelled":
+            summary = "本轮同步已取消。"
+        else:
+            summary = "同步停止。" + (errors[0] if errors else "")
+        if result is not None and result.journal_status and outcome.status != "success":
+            state = _STATUS_TEXT.get(result.journal_status, result.journal_status)
+            summary += f"事务状态为{state}。"
+        if outcome.skipped:
+            summary += f"跳过 {len(outcome.skipped)} 个仓库。"
+        for restore, label in ((True, "会话恢复"), (False, "显式打开")):
+            openings = [item for item in outcome.openings if item.restore == restore]
+            if not openings:
+                continue
+            states = {"requested": "已请求打开", "already_running": "已在运行",
+                      "failed": "打开失败", "held": "保持关闭"}
+            for item in openings:
+                details.append(f"{label} · {states[item.status]} · {item.target} {item.error}")
+            summary += label + "：" + "、".join(
+                f"{text} {num} 个"
+                for status, text in states.items()
+                if (num := sum(item.status == status for item in openings))
+            ) + "。"
+        warning = any(item.error for item in outcome.openings)
+        kind = ("error" if outcome.status == "failed" else
+                "warning" if warning or outcome.status == "cancelled" else "success")
+        self.set_status(summary, kind)
+        self.status_label.setToolTip("\n".join(details))
+        for message in (*details, summary):
+            self.message_logged.emit(message)
 
     def task_finished(self, status: str, payload: Any) -> None:
         kind = self._task_kind
+        self._finishing_sync = False
         super().task_finished(status, payload)
         if status != "ok":
-            if kind in {"analyze", "execute"}:
-                self._invalidate_plan(
-                    "操作已取消，请重新分析。" if status == "cancelled" else str(payload)
-                )
-                if status == "error":
-                    self.set_status(str(payload), "error")
-            self._task_kind = ""
-            self.refresh_actions()
-            return
-        if kind == "catalog":
-            self.open_state = payload.open_state
-            self._accept_catalog(payload.catalog)
-            self._update_occupancy_display(reset_confirmation=True)
+            if kind == "running_targets":
+                self._restore_target_scope_button()
+        elif kind == "catalog":
+            self._accept_catalog_task(payload)
+        elif kind == "running_targets":
+            self._accept_running_targets(payload)
         elif kind == "analyze":
-            self.open_state = payload.open_state
-            self._accept_plan(payload.plan)
+            version, plan = payload
+            if version == self._request_version:
+                self._accept_plan(plan)
+        elif kind == "execute":
+            self._accept_sync_result(payload)
         elif kind == "inspect_recovery":
             self.recovery_preview = payload
             self.recovery_details.setPlainText("\n\n".join(payload.details))
             self.set_status("检查完成；请选择确认完成或确认回退。")
-        elif kind in {"execute", "rollback", "finalize", "resolve"}:
-            if kind == "execute":
-                self.open_state = payload.open_state
-                self._accept_operation_result(kind, payload.result,
-                    launch_errors=payload.launch_errors, opened_targets=payload.opened_targets)
-            else:
-                self._accept_operation_result(kind, payload)
+        elif kind in {"rollback", "finalize", "resolve"}:
+            self._accept_operation_result(kind, payload)
         self._task_kind = ""
         self.refresh_actions()
 
@@ -1410,30 +1455,17 @@ class DistributionPage(FeaturePage):
             available and bool(self.root_picker.value)
             and (self.compact_sync or bool(self.source_picker.value))
         )
-        selected_targets = bool(self.target_model.checked_vaults())
-        selected_components = bool(self.selected_component_ids())
-        target_paths = (
-            tuple(item.target_root for item in self.plan.targets)
-            if self.plan is not None else self._selected_target_paths()
+        target_paths = self._selected_target_paths()
+        valid_request = (
+            available and self._catalog_root_binding is not None
+            and bool(target_paths) and bool(self.selected_component_ids())
+            and bool(self.source_picker.value)
+            and all(path in self._catalog_bindings for path in target_paths)
         )
-        open_targets = self._open_selected_targets(self.open_state, target_paths)
-        occupancy_allowed = self.manage_obsidian or (
-            not open_targets
-            and (self.open_state.reliable or self.occupancy_confirm.isChecked()))
-        self.analyze_button.setEnabled(
-            available and not pending and not self._external_recovery_pending
-            and not self._recovery_blocked and self.catalog is not None
-            and selected_targets and selected_components and bool(self.source_picker.value)
-        )
-        self.confirm_checkbox.setEnabled(
-            available and not pending and not self._external_recovery_pending
-            and not self._recovery_blocked and self.plan is not None and self.plan.needs_deploy
-            and (self.manage_obsidian or not open_targets)
-        )
+        self.analyze_button.setEnabled(valid_request)
         self.execute_button.setEnabled(
-            available and not pending and not self._external_recovery_pending
-            and not self._recovery_blocked and self.plan is not None and self.plan.needs_deploy
-            and self.confirm_checkbox.isChecked() and occupancy_allowed
+            valid_request and not pending and not self._external_recovery_pending
+            and not self._recovery_blocked
         )
         cancellable = self.task_cancellable()
         self.cancel_button.setVisible(cancellable)
@@ -1492,7 +1524,7 @@ class DistributionPage(FeaturePage):
                 not getattr(self, "recovery_detached", False)
                 and (pending or self._recovery_blocked or batch_status in {"rolled_back_with_residuals", "resolved"})
             )
-            self.confirm_checkbox.setVisible(self.plan is not None and self.plan.needs_deploy)
+            self._update_occupancy_display()
             self.occupancy_status.setVisible(bool(target_paths))
             self.progress_bar.setVisible(self._task_active)
             if self.target_filter is not None:
@@ -1524,7 +1556,6 @@ class ComSyncPage(DistributionPage):
     source_label = "配置来源"
     source_hint = "选择来源仓库或模板套件根目录"
     compact_sync = True
-    manage_obsidian = True
     component_options = (
         ComponentOption("claude", ".claude", ".claude"),
         ComponentOption("claudian", ".claudian", ".claudian"),
@@ -1536,13 +1567,10 @@ class ComSyncPage(DistributionPage):
     def __init__(self, state_dir: Path, settings: dict[str, Any], default_root: str,
                  *, obsidian_config_path: str | Path | None = None,
                  opened_vault_reader=None) -> None:
-        self._catalog_root = ""
         super().__init__(state_dir, settings, default_root,
             title=".comSync",
             description="统一同步配置和模板；为新仓库补齐 File 目录结构。",
             obsidian_config_path=obsidian_config_path, opened_vault_reader=opened_vault_reader)
-        self.source_picker.selection.catalog_transform = with_creation_times
-        self.source_picker.selection.catalog_ready.connect(self._accept_catalog)
         # Keep component controls together with the source, without another card.
         self.component_frame.setVisible(True)
         self.source_frame.layout().addWidget(self.component_frame)
@@ -1568,9 +1596,7 @@ class ComSyncPage(DistributionPage):
             ".File 包含 .Templater 内容；Note、Attachment 只补齐目录，已有笔记和附件保留。")
         self.safety_hint.setText("选中配置和模板按来源完整同步，目标独有内容会进入删除预览。")
         self.execute_button.setToolTip(
-            "先退出所有 Obsidian 窗口；未及时退出时强制结束 Obsidian。"
-            "仅选一个目标仓库时，同步成功后请求打开该仓库；选择多个时不自动打开。"
-            "请先保存正在编辑的内容。")
+            "分析并正常关闭需要写入的目标会话，检查最终变更后确认同步。")
         self.preview_table.setColumnHidden(1, False)
         self.preview_table.horizontalHeader().setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
         self.preview_table.setColumnWidth(1, 95)
@@ -1579,18 +1605,8 @@ class ComSyncPage(DistributionPage):
         self.preview_table.setMinimumHeight(125)
         self.target_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
         self.target_table.setColumnWidth(3, 164)
-        self.latest_button = QPushButton("最新仓库")
-        self.latest_button.setObjectName("TextButton")
-        self.latest_button.setIcon(action_icon("clock"))
-        self.latest_button.setToolTip("按整个扫描列表的文件夹创建时间选择最新目标，替换当前勾选；同一时间的仓库一起选择。")
-        controls = self.clear_targets_button.parentWidget().layout()
-        # The controls row lives inside the target card.
-        for index in range(controls.count()):
-            row = controls.itemAt(index).layout()
-            if row is not None and row.indexOf(self.clear_targets_button) >= 0:
-                row.insertWidget(row.indexOf(self.select_all_targets_button), self.latest_button)
-                break
-        self.latest_button.clicked.connect(self._select_newest)
+        self.target_scope_buttons.button(TargetScope.LATEST).setToolTip(
+            "按全部有效候选的目录创建时间筛选；并列项全部显示。")
         self.refresh_actions()
 
     def restore_settings(self, settings: dict[str, Any]) -> None:
@@ -1603,63 +1619,9 @@ class ComSyncPage(DistributionPage):
             self.component_boxes["templater"].setChecked(True)
             del blocker
 
-    def _inputs_changed(self, *_: Any, clear_catalog: bool = False) -> None:
+    def _inputs_changed(self, *_: Any) -> None:
         self._include_templater()
-        retained = self.catalog if self.root_picker.value == self._catalog_root else None
-        super()._inputs_changed(clear_catalog=clear_catalog)
-        if retained is not None and clear_catalog and not self._restoring:
-            self._accept_catalog(retained)
-
-    def _accept_catalog(self, result: VaultCatalogResult) -> None:
-        self._catalog_root = self.root_picker.value
-        super()._accept_catalog(result)
-
-    def _source_overlaps_vault(self, vault: VaultInfo) -> bool:
-        return bool(self.source_picker.value) and _paths_overlap(str(source_root(self.source_picker.value)), vault.path)
-
-    def _select_newest(self) -> None:
-        latest = newest_vaults(self.target_model.rows)
-        if not latest:
-            self.set_status("无法确定最新仓库：请重新扫描，确认所有候选的创建时间均可读取。", "warning")
-            return
-        self.target_filter.clear()
-        self.target_model._set_checked({_physical_key(vault.path) for vault in latest})
-        first = next(i for i, vault in enumerate(self.target_model.rows) if vault == latest[0])
-        index = self.target_proxy.mapFromSource(self.target_model.index(first, 0))
-        self.target_table.scrollTo(index)
-        self.set_status(
-            f"已按创建时间选择最新的 {len(latest)} 个仓库；"
-            + ("同步成功后会自动打开。" if len(latest) == 1 else "多个目标同步后不自动打开。"))
-
-    def _reopen_hint(self) -> str:
-        selected_count = len(self._selected_target_paths())
-        if selected_count == 1:
-            return "成功后打开该仓库。"
-        if selected_count > 1:
-            return "多个目标同步后不自动打开。"
-        return "仅选一个目标时，成功后自动打开。"
-
-    def _update_occupancy_display(self, *, reset_confirmation: bool = True,
-                                  target_paths: Iterable[str] | None = None) -> None:
-        # Registry flags survive crashes and are not proof of a live writer.
-        # Execution instead checks actual processes before every commit.
-        self.occupancy_confirm.setChecked(False)
-        self.occupancy_confirm.hide()
-        paths = tuple(target_paths) if target_paths is not None else self._selected_target_paths()
-        opened = self._open_selected_targets(self.open_state, paths)
-        close_hint = (f"{len(opened)} 个所选仓库标记为打开；同步时将自动关闭 Obsidian。"
-                      if opened else "同步前自动退出 Obsidian；")
-        self.occupancy_status.setText(close_hint + self._reopen_hint())
-        self.occupancy_status.setToolTip(
-            "关闭所有 Obsidian 窗口，必要时强制结束进程；请先保存编辑内容。\n"
-            "保存的打开标记不再阻止同步，执行时核验实际进程已退出。")
-
-    def _accept_plan(self, plan: DeploymentPlan) -> None:
-        super()._accept_plan(plan)
-        if plan.needs_deploy:
-            self.confirm_checkbox.setText(
-                self.confirm_checkbox.text().replace("确认同步所选组件到", "确认同步至") + "\n"
-                "允许退出 Obsidian（必要时强制结束全部窗口）；" + self._reopen_hint())
+        super()._inputs_changed()
 
     def refresh_actions(self) -> None:
         super().refresh_actions()
@@ -1669,12 +1631,8 @@ class ComSyncPage(DistributionPage):
         if hasattr(self, "component_boxes") and "templater" in self.component_boxes:
             self.component_boxes["templater"].setEnabled(
                 not self._global_busy and not self._task_active and not self.component_boxes["file"].isChecked())
-        if hasattr(self, "latest_button"):
-            self.latest_button.setEnabled(not self._global_busy and not self._task_active
-                and self.catalog is not None and bool(newest_vaults(self.target_model.rows)))
-
-    def set_status(self, text: str, kind: str = "neutral") -> None:
-        super().set_status(text.replace("部署", "同步"), kind)
+        for button in self.target_scope_buttons.buttons():
+            button.setEnabled(not self._global_busy and not self._task_active)
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)

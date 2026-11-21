@@ -16,6 +16,7 @@ from PySide6.QtWidgets import QApplication
 from obmanage.models import SyncCancelled
 from obmanage.settings import SettingsStore
 from obmanage.ui import MainWindow, PlanTableModel
+from test_ui import wait_for_confirmation
 
 
 @pytest.fixture(scope="module")
@@ -83,15 +84,12 @@ def contents(root: Path):
     }
 
 
-def analyze_and_confirm(app, widget):
+def analyze_changes(app, widget):
     widget.analyze()
     wait_for_idle(app, widget)
     assert widget.plan is not None
     assert widget.plan.can_execute, widget.plan.errors
     assert widget.plan.has_changes
-    assert not widget.confirm_direction_checkbox.isChecked()
-    assert not widget.sync_button.isEnabled()
-    widget.confirm_direction_checkbox.setChecked(True)
     assert widget.sync_button.isEnabled()
 
 
@@ -125,29 +123,26 @@ def test_switch_discards_preview_confirmation_and_schedule(application, directio
     widget, local, portable = directional_window
     (local / "笔记.md").write_text("本机修改", encoding="utf-8")
     (portable / "笔记.md").write_text("移动硬盘修改", encoding="utf-8")
-    analyze_and_confirm(application, widget)
+    analyze_changes(application, widget)
     widget.schedule_toggle.setChecked(True)
     assert widget.scheduler.next_run is not None
     widget.set_direction("to_local")
     assert widget.plan is None
     assert widget.table_model.rowCount() == 0
-    assert not widget.confirm_direction_checkbox.isChecked()
-    assert not widget.sync_button.isEnabled()
+    assert widget.sync_button.isEnabled()
     assert not widget.schedule_toggle.isChecked()
     assert widget.scheduler.next_run is None
-    widget.start_sync()
-    assert not widget.busy
     assert widget.last_result is None
     widget._persist()
     reloaded = SettingsStore(widget.state_dir).load()
     assert reloaded.direction == "to_local"
     assert not reloaded.schedule_enabled
-    analyze_and_confirm(application, widget)
+    analyze_changes(application, widget)
     assert widget._normalized_path(widget.plan.source) == widget._normalized_path(str(portable))
     assert widget._normalized_path(widget.plan.target) == widget._normalized_path(str(local))
 
 
-def test_complete_ui_roundtrip_preserves_each_source(application, directional_window):
+def test_direct_mirror_roundtrip_preserves_each_source(application, directional_window):
     widget, local, portable = directional_window
     (local / ".obsidian").mkdir()
     (local / ".obsidian" / "app.json").write_text('{"theme":"dark"}', encoding="utf-8")
@@ -157,8 +152,9 @@ def test_complete_ui_roundtrip_preserves_each_source(application, directional_wi
     (local / "随后删除的文件夹").mkdir()
     (local / "随后删除的文件夹" / "旧.md").write_text("旧", encoding="utf-8")
     initial_local = snapshot(local)
-    analyze_and_confirm(application, widget)
+    assert widget.plan is None and widget.sync_button.isEnabled()
     QTest.mouseClick(widget.sync_button, Qt.MouseButton.LeftButton)
+    wait_for_confirmation(application, widget).accept()
     wait_for_idle(application, widget)
     assert widget.last_result.status == "success"
     assert snapshot(local) == initial_local
@@ -175,12 +171,14 @@ def test_complete_ui_roundtrip_preserves_each_source(application, directional_wi
     portable_before_pull = snapshot(portable)
     unchanged_video_mtime = (local / "视频.mp4").stat().st_mtime_ns
     widget.set_direction("to_local")
-    analyze_and_confirm(application, widget)
+    assert widget.plan is None and widget.sync_button.isEnabled()
+    QTest.mouseClick(widget.sync_button, Qt.MouseButton.LeftButton)
+    dialog = wait_for_confirmation(application, widget)
     assert widget.plan.counts["delete"] == 2
     assert widget.plan.counts["rmdir"] == 1
     assert widget.plan.counts["skip"] == 1
     assert snapshot(portable) == portable_before_pull
-    QTest.mouseClick(widget.sync_button, Qt.MouseButton.LeftButton)
+    dialog.accept()
     wait_for_idle(application, widget)
     assert widget.last_result.status == "success", widget.last_result.errors
     assert snapshot(portable) == portable_before_pull
@@ -231,16 +229,15 @@ def test_endpoint_edit_revokes_confirmation(application, directional_window, cha
     widget, local, portable = directional_window
     (portable / "笔记.md").write_text("移动硬盘最新内容", encoding="utf-8")
     widget.set_direction("to_local")
-    analyze_and_confirm(application, widget)
+    widget.start_sync()
+    wait_for_confirmation(application, widget)
     if changed_endpoint == "local":
         widget.local_edit.setText(str(local.parent / "另一台本机"))
     else:
         widget.portable_combo.setEditText(str(portable.parent / "另一块移动硬盘"))
+    wait_for_idle(application, widget)
     assert widget.plan is None
-    assert not widget.confirm_direction_checkbox.isChecked()
-    assert not widget.sync_button.isEnabled()
-    widget.start_sync()
-    assert not widget.busy
+    assert widget._worker_confirmation_dialog is None
     assert list(local.iterdir()) == []
 
 
@@ -252,18 +249,25 @@ def test_manual_execution_requires_acknowledgment_even_when_called_directly(appl
     widget.set_direction("to_local")
     widget.analyze()
     wait_for_idle(application, widget)
-    assert not widget.sync_button.isEnabled()
+    assert widget.sync_button.isEnabled()
     widget.start_sync()
-    assert not widget.busy
+    dialog = wait_for_confirmation(application, widget)
+    assert snapshot(local) == before_local
+    assert snapshot(portable) == before_portable
+    dialog.reject()
+    wait_for_idle(application, widget)
     assert widget.last_result is None
     assert snapshot(local) == before_local
     assert snapshot(portable) == before_portable
-    widget.confirm_direction_checkbox.setChecked(True)
-    assert widget.sync_button.isEnabled()
-    widget.analyze()
+    widget.start_sync()
+    dialog = wait_for_confirmation(application, widget)
+    (local / "新到的目标文件.md").write_bytes(b"external change")
+    expected_local = snapshot(local)
+    dialog.accept()
     wait_for_idle(application, widget)
-    assert not widget.confirm_direction_checkbox.isChecked()
-    assert not widget.sync_button.isEnabled()
+    assert widget.last_result.status == "failed"
+    assert snapshot(local) == expected_local
+    assert snapshot(portable) == before_portable
 
 
 def test_busy_operation_cannot_change_direction(application, directional_window, monkeypatch):
@@ -292,6 +296,16 @@ def test_busy_operation_cannot_change_direction(application, directional_window,
     widget.cancel_operation()
     wait_for_idle(application, widget)
     assert widget.direction_to_portable_button.isEnabled()
+
+
+@pytest.mark.parametrize("relative", ["", "nested"])
+def test_direct_mirror_rejects_overlapping_inputs_before_dispatch(directional_window, relative):
+    widget, local, _portable = directional_window
+    widget.portable_combo.setEditText(str(local / relative))
+    assert not widget.sync_button.isEnabled()
+    widget.start_sync()
+    assert not widget.busy
+    assert "不能相同" in widget.status_label.text()
 
 
 def test_scheduled_pull_writes_only_local_and_switch_pauses(application, directional_window):
@@ -343,7 +357,6 @@ def test_legacy_windows_config_opens_in_preserved_direction(application, tmp_pat
         assert widget.settings.direction == ("to_local" if reverse else "to_portable")
         assert not widget.schedule_toggle.isChecked()
         assert widget.scheduler.next_run is None
-        assert not widget.confirm_direction_checkbox.isChecked()
-        assert not widget.sync_button.isEnabled()
+        assert widget.plan is None
     finally:
         dispose_window(application, widget)

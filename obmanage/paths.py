@@ -369,17 +369,11 @@ def pair_identity(source: str, target: str, source_volume: str, target_volume: s
         ensure_ascii=False).encode("utf-8")).hexdigest()
 
 
-def validate_roots(source: str, target: str) -> dict:
+def validate_root_pair(source: str, target: str) -> None:
+    """Check the configured pair without reading either filesystem."""
     if not source.strip() or not target.strip():
         raise SyncError("请选择源目录和目标目录。")
     source, target = canonical(source), canonical(target)
-    # Validate the user-selected chain before realpath can follow a link; then
-    # collapse Windows 8.3 aliases so differently spelled physical overlaps
-    # cannot bypass the containment check.
-    assert_plain_chain(source)
-    assert_plain_chain(target)
-    source = canonical(os.path.realpath(native(source)))
-    target = canonical(os.path.realpath(native(target)))
     src_key, dst_key = os.path.normcase(source), os.path.normcase(target)
     if Path(target).parent == Path(target):
         raise SyncError("目标不能是磁盘根目录，请选择专用镜像文件夹。")
@@ -389,6 +383,18 @@ def validate_roots(source: str, target: str) -> dict:
         common = ""
     if common in (src_key, dst_key):
         raise SyncError("源目录与目标目录不能相同，也不能互相包含。")
+
+
+def validate_roots(source: str, target: str) -> dict:
+    if not source.strip() or not target.strip():
+        raise SyncError("请选择源目录和目标目录。")
+    source, target = canonical(source), canonical(target)
+    # Before resolving short-name aliases, reject links in the requested paths.
+    assert_plain_chain(source)
+    assert_plain_chain(target)
+    source = canonical(os.path.realpath(native(source)))
+    target = canonical(os.path.realpath(native(target)))
+    validate_root_pair(source, target)
     assert_plain_chain(source)
     assert_plain_chain(target)
     src_state, dst_state = snapshot(source), snapshot(target)

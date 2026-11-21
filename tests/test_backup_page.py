@@ -8,7 +8,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 from PySide6.QtCore import QCoreApplication, QEvent, QPoint, QRect
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QDialogButtonBox, QPlainTextEdit
 
 import obmanage.tasking as tasking_module
 from obmanage.engine import SYNC_MODE_NO_VIDEO
@@ -18,6 +18,7 @@ from obmanage.pages.common import FeaturePage
 from obmanage.settings import SettingsStore
 from obmanage.tasking import FeatureWorker
 from obmanage.ui import MainWindow
+from test_ui import wait_for_confirmation
 
 
 @pytest.fixture(scope="module")
@@ -113,7 +114,7 @@ def test_shell_registers_backup_page_with_requested_laptop_default(application, 
         dispose(application, window)
 
 
-def test_backup_page_round_trip_moves_non_video_edits_and_preserves_videos(
+def test_direct_backup_round_trip_moves_non_video_edits_and_preserves_videos(
     application, tmp_path
 ):
     portable = tmp_path / "移动硬盘完整仓库"
@@ -131,16 +132,16 @@ def test_backup_page_round_trip_moves_non_video_edits_and_preserves_videos(
         page.local_picker.set_value(str(laptop))
         page.portable_picker.set_value(str(portable))
         page.set_direction("to_local")
-        page._start_analyze(False)
-        wait_until(application, lambda: not window.busy)
-
+        assert page.plan is None and page.execute_button.isEnabled()
+        page.execute_button.click()
+        dialog = wait_for_confirmation(application, window)
         assert page.plan is not None and page.plan.can_execute
         assert page.plan.counts["exclude"] == 2
         assert {item.action for item in page.model.rows} >= {"add", "exclude"}
-        assert "排除 2 个视频" in page.status_label.text()
-        page.confirm_checkbox.setChecked(True)
-        assert page.execute_button.isEnabled()
-        page._start_execute()
+        details = dialog.findChild(QPlainTextEdit).toPlainText()
+        assert str(portable) in details and str(laptop) in details
+        assert not (laptop / "日记.md").exists()
+        dialog.accept()
         wait_until(application, lambda: not window.busy)
 
         assert (laptop / "日记.md").read_bytes() == b"portable version"
@@ -157,13 +158,12 @@ def test_backup_page_round_trip_moves_non_video_edits_and_preserves_videos(
             portable_video.read_bytes(),
         )
         page.set_direction("to_portable")
-        page._start_analyze(False)
-        wait_until(application, lambda: not window.busy)
+        page.execute_button.click()
+        dialog = wait_for_confirmation(application, window)
         assert page.plan is not None
         assert page.plan.counts["update"] == 1
         assert page.plan.counts["delete"] == 1
-        page.confirm_checkbox.setChecked(True)
-        page._start_execute()
+        dialog.accept()
         wait_until(application, lambda: not window.busy)
 
         assert (portable / "日记.md").read_bytes() == b"edited on laptop"
@@ -193,19 +193,15 @@ def test_backup_settings_persist_and_leaving_page_revokes_confirmation(
         page.local_picker.set_value(str(local))
         page.portable_picker.set_value(str(portable))
         page.set_direction("to_portable")
-        source, target = page._paths()
-        page._accept_plan(SyncPlan(
-            source,
-            target,
-            [PlanItem("add", "note.md", 4, "目标中不存在")],
-            mode=SYNC_MODE_NO_VIDEO,
-        ))
+        put(local, "note.md", b"new")
         window._show_page("vault_backup")
-        page.confirm_checkbox.setChecked(True)
+        page.execute_button.click()
+        wait_for_confirmation(application, window)
         window._show_page("statistics")
 
-        assert page.plan is not None
-        assert not page.confirm_checkbox.isChecked()
+        wait_until(application, lambda: not window.busy)
+        assert window._worker_confirmation_dialog is None
+        assert not (portable / "note.md").exists()
         assert window._persist()
         settings = SettingsStore(state).load_document().features["vault_backup"]
         assert settings == {
@@ -213,6 +209,34 @@ def test_backup_settings_persist_and_leaving_page_revokes_confirmation(
             "portable_path": str(portable),
             "direction": "to_portable",
         }
+    finally:
+        dispose(application, window)
+
+
+def test_empty_non_video_source_has_one_confirmation_and_preserves_videos(application, tmp_path):
+    local, portable = tmp_path / "local", tmp_path / "portable"
+    local.mkdir()
+    portable.mkdir()
+    source_video = put(portable, "same.mp4", b"source video")
+    target_video = put(local, "same.mp4", b"local video")
+    old_note = put(local, "old.md", b"old")
+    window = MainWindow(tmp_path / "state")
+    try:
+        window._show_page("vault_backup")
+        page = window.pages["vault_backup"]
+        page.local_picker.set_value(str(local))
+        page.portable_picker.set_value(str(portable))
+        page.execute_button.click()
+        dialog = wait_for_confirmation(application, window)
+        buttons = {button.text(): button for button in dialog.findChild(QDialogButtonBox).buttons()}
+        assert "排除视频后来源为空" == dialog.windowTitle()
+        assert old_note.exists()
+        buttons["确认清空非视频内容"].click()
+        wait_until(application, lambda: not window.busy)
+        assert page.last_result.status == "success"
+        assert not old_note.exists()
+        assert source_video.read_bytes() == b"source video"
+        assert target_video.read_bytes() == b"local video"
     finally:
         dispose(application, window)
 
@@ -287,7 +311,7 @@ def test_backup_preview_fits_all_supported_window_sizes(application, tmp_path, s
         scroll.verticalScrollBar().setValue(scroll.verticalScrollBar().maximum())
         settle(application)
         viewport = scroll.viewport()
-        for control in (page.confirm_checkbox, page.execute_button):
+        for control in (page.analyze_button, page.execute_button):
             origin = control.mapTo(viewport, QPoint(0, 0))
             assert viewport.rect().intersects(QRect(origin, control.size()))
     finally:

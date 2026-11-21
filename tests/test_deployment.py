@@ -1360,7 +1360,7 @@ def test_commit_recovery_marks_pending_before_automatic_rollback(layout, monkeyp
     plan = engine.analyze(request_for(source, [("a", vault_a)]))
     assert engine.execute(plan).success
 
-    def crash_before_rollback(_batch_id, *, automatic=False):
+    def crash_before_rollback(_batch_id, *, automatic=False, safety_check=None):
         raise SystemExit("simulated crash")
 
     monkeypatch.setattr(engine, "_rollback_locked", crash_before_rollback)

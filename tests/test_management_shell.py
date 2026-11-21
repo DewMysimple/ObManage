@@ -10,7 +10,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 from PySide6.QtCore import QCoreApplication, QEvent
-from PySide6.QtWidgets import QApplication, QLabel
+from PySide6.QtWidgets import QApplication, QLabel, QPlainTextEdit
 
 from obmanage.management.deployment import (
     DeploymentComponent,
@@ -24,7 +24,7 @@ from obmanage.models import PlanItem, SyncCancelled, SyncPlan
 from obmanage.paths import canonical
 from obmanage.pages.backup import VaultBackupPage
 from obmanage.pages.incremental import IncrementalPage
-import obmanage.pages.distribution as distribution_page
+from obmanage.management import comsync_workflow
 from obmanage.pages.distribution import ComSyncPage
 from obmanage.pages.registry import FEATURES
 from obmanage.pages.statistics import StatisticsPage
@@ -111,6 +111,8 @@ def test_all_path_selectors_share_three_choices_and_runtime_uses_single_task_slo
                 assert picker.browse.text() == "浏览…"
         page = window.pages["comsync"]
         window._show_page("comsync", persist=False)
+        root_before = page.root_picker.value
+        assert page.root_picker.edit.isReadOnly()
         page.source_picker.running_vault.click()
         wait_until(application, entered.is_set)
         assert window.busy
@@ -122,7 +124,8 @@ def test_all_path_selectors_share_three_choices_and_runtime_uses_single_task_slo
         release.set()
         wait_until(application, lambda: not window.busy)
         assert page.source_picker.value == str(vault)
-        assert not page.confirm_checkbox.isChecked()
+        assert page.root_picker.value == root_before
+        assert page.catalog is None
         assert page.source_picker.vault_list.isEnabled()
         # Mirror uses the same adapter and ordinary input invalidation.
         window.plan = SyncPlan("old", "target", [PlanItem("add", "x")])
@@ -212,14 +215,12 @@ def test_replaced_cached_marker_invalidates_existing_mirror_preview(application,
     window, _stats, selection, _second, root, vault, _config = picker_catalog
     window._show_page("mirror", persist=False)
     window.plan = SyncPlan(str(root), str(root.with_name("other")), [PlanItem("add", "a.md")])
-    window.confirm_direction_checkbox.setChecked(True)
-    assert window.confirm_direction_checkbox.isChecked()
     (vault / ".obsidian").rename(vault / "moved-marker")
     (vault / ".obsidian").mkdir()
     selection.start()
     wait_until(application, lambda: not window.busy)
     assert window.local_edit.text() == str(root)
-    assert window.plan is None and not window.confirm_direction_checkbox.isChecked()
+    assert window.plan is None
 
 
 @pytest.mark.parametrize("change", ("root", "vault", "marker", "registry", "removed", "junction"))
@@ -327,22 +328,24 @@ def test_history_is_scoped_and_dropped_after_writes_or_recovery_changes(
     wait_until(application, lambda: not window.busy)
 
 
-def test_leaving_mirror_revokes_only_confirmation_and_persists_page(application, tmp_path):
+def test_leaving_mirror_cancels_final_confirmation_and_persists_page(application, tmp_path):
     state_dir = tmp_path / "state"
+    source, target = tmp_path / "source", tmp_path / "target"
+    source.mkdir()
+    target.mkdir()
+    (source / "note.md").write_bytes(b"new")
     window = MainWindow(state_dir)
     try:
-        source, target = window._paths()
-        window._accept_plan(
-            SyncPlan(source, target, [PlanItem("add", "note.md", 4, "new")]),
-            scheduled=False,
-        )
-        window.confirm_direction_checkbox.setChecked(True)
-        assert window.plan is not None
-
+        window.local_edit.setText(str(source))
+        window.portable_combo.setCurrentText(str(target))
+        window.set_direction("to_portable")
+        window.start_sync()
+        wait_until(application, lambda: window._worker_confirmation_dialog is not None)
         window._show_page("statistics")
 
-        assert window.plan is not None
-        assert not window.confirm_direction_checkbox.isChecked()
+        wait_until(application, lambda: not window.busy)
+        assert window._worker_confirmation_dialog is None
+        assert not (target / "note.md").exists()
         assert window.page_stack.currentWidget() is window.page_containers["statistics"]
         window._persist()
         assert SettingsStore(state_dir).load_document().selected_page == "statistics"
@@ -466,12 +469,6 @@ def test_direct_trash_cleanup_creates_no_recovery_gate(application, tmp_path):
         window.local_edit.setText(str(source))
         window.portable_combo.setCurrentText(str(target))
         window.set_direction("to_portable")
-        window._accept_plan(
-            SyncPlan(str(source), str(target), [PlanItem("add", "note.md", 4, "new")]),
-            scheduled=False,
-        )
-        window.confirm_direction_checkbox.setChecked(True)
-        window._refresh_actions()
 
         assert window.nav_recovery_button.isHidden()
         assert window.sync_button.isEnabled()
@@ -500,12 +497,6 @@ def test_legacy_trash_quarantine_still_blocks_writes_until_finalized(
         window.local_edit.setText(str(source))
         window.portable_combo.setCurrentText(str(target))
         window.set_direction("to_portable")
-        window._accept_plan(
-            SyncPlan(str(source), str(target), [PlanItem("add", "note.md", 4, "new")]),
-            scheduled=False,
-        )
-        window.confirm_direction_checkbox.setChecked(True)
-        window._refresh_actions()
 
         assert window._recovery_page_keys() == ("trash_cleanup",)
         assert not window.nav_recovery_button.isHidden()
@@ -514,7 +505,7 @@ def test_legacy_trash_quarantine_still_blocks_writes_until_finalized(
         assert window.pages["vault_backup"]._external_recovery_pending
         for key in ("comsync",):
             assert window.pages[key]._external_recovery_pending
-        window._execute_plan()
+        window.start_sync()
         assert not window.busy
 
         window.scheduler.next_run = datetime.now() - timedelta(seconds=1)
@@ -532,9 +523,34 @@ def test_legacy_trash_quarantine_still_blocks_writes_until_finalized(
         assert window._recovery_page_keys() == ()
         assert window.nav_recovery_button.isHidden()
         window._show_page("mirror")
-        window.confirm_direction_checkbox.setChecked(True)
-        window._refresh_actions()
         assert window.sync_button.isEnabled()
+    finally:
+        dispose(application, window)
+
+
+def test_mirror_rechecks_recovery_gate_after_final_confirmation(
+    application, tmp_path, seed_legacy_quarantine,
+):
+    state, source, target, other = (tmp_path / name for name in ("state", "source", "target", "other"))
+    source.mkdir()
+    target.mkdir()
+    (source / "note.md").write_bytes(b"new")
+    (other / ".obsidian").mkdir(parents=True)
+    (other / ".trash").mkdir()
+    (other / ".trash/recover.md").write_bytes(b"restore later")
+    window = MainWindow(state)
+    try:
+        window.local_edit.setText(str(source))
+        window.portable_combo.setCurrentText(str(target))
+        window.set_direction("to_portable")
+        window.start_sync()
+        wait_until(application, lambda: window._worker_confirmation_dialog is not None)
+        seed_legacy_quarantine(state, other)
+        window._worker_confirmation_dialog.accept()
+        wait_until(application, lambda: not window.busy)
+        assert not (target / "note.md").exists()
+        assert "待处理旧版回收站批次" in window.current_file.text()
+        assert not window.sync_button.isEnabled()
     finally:
         dispose(application, window)
 
@@ -732,35 +748,40 @@ def test_comsync_new_vault_full_worker_flow_and_rollback(application, tmp_path, 
     window = MainWindow(tmp_path / "state")
     page = window.pages["comsync"]
     obsidian_actions = []
-    monkeypatch.setattr(distribution_page, "close_obsidian",
-                        lambda **_kwargs: obsidian_actions.append("close") or 1)
+    monkeypatch.setattr(comsync_workflow, "close_target_sessions",
+                        lambda paths, **_kwargs: obsidian_actions.append(("check/close", paths)))
+    monkeypatch.setattr(comsync_workflow, "assert_target_sessions_closed", lambda *_args, **_kwargs: None)
 
-    def open_targets(paths, **_kwargs):
+    def open_target(path, **_kwargs):
         assert (target / ".obsidian/app.json").read_text() == "new"
         assert (target / "File/Templater/template.md").read_text() == "template"
-        obsidian_actions.append(("open", tuple(paths)))
-        return ()
+        obsidian_actions.append(("open", path))
+        return True
 
-    monkeypatch.setattr(distribution_page, "open_vaults", open_targets)
+    monkeypatch.setattr(comsync_workflow, "request_open_target", open_target)
     try:
         page.opened_vault_reader = lambda _: OpenedVaultCandidates()
         page.source_picker.set_value(str(source))
         page.root_picker.set_value(str(target.parent))
         page.component_boxes["file"].setChecked(True)
         window._show_page("comsync", persist=False)
+        window.show()
         page.catalog_button.click()
         wait_until(application, lambda: not window.busy)
-        assert page.latest_button.isEnabled()
-        page.latest_button.click()
+        assert page.target_model.checked_vaults() == ()
+        page.select_all_targets_button.click()
         assert len(page.target_model.checked_vaults()) == 1
-        page.analyze_button.click()
-        wait_until(application, lambda: not window.busy)
-        assert page.plan and "1 个仓库" in page.confirm_checkbox.text()
-        assert obsidian_actions == []
-        page.confirm_checkbox.setChecked(True)
+        assert page.plan is None and page.execute_button.isEnabled()
         page.execute_button.click()
+        wait_until(application, lambda: window._worker_confirmation_dialog is not None)
+        dialog = window._worker_confirmation_dialog
+        details = dialog.findChild(QPlainTextEdit).toPlainText()
+        assert str(target) in details and ".File" in details
+        assert page.plan is not None and window.busy and not page.execute_button.isEnabled()
+        assert not (target / ".obsidian/app.json").exists()
+        dialog.accept()
         wait_until(application, lambda: not window.busy)
-        assert obsidian_actions == ["close", ("open", (str(target),))]
+        assert obsidian_actions == [("check/close", (str(target),)), ("open", str(target))]
         assert page.has_pending_recovery()
         assert (target / ".obsidian/app.json").read_text() == "new"
         assert (target / "File/Templater/template.md").read_text() == "template"
@@ -780,6 +801,66 @@ def test_comsync_new_vault_full_worker_flow_and_rollback(application, tmp_path, 
         assert not (target / "File").exists()
         assert not (target / ".obsidian/app.json").exists()
         assert any(row.feature == "comsync" and row.level == "success" for row in window._log_entries)
+    finally:
+        dispose(application, window)
+
+
+@pytest.mark.parametrize("action", ["reject", "navigate", "input", "close"])
+def test_comsync_revokes_pending_confirmation_and_restores_session(
+    application, tmp_path, monkeypatch, action,
+):
+    source, target = tmp_path / "source", tmp_path / "collection" / "target"
+    (source / ".obsidian").mkdir(parents=True)
+    (target / ".obsidian").mkdir(parents=True)
+    (source / ".obsidian/app.json").write_text("new")
+    state = tmp_path / "state"
+    window = MainWindow(state)
+    page = window.pages["comsync"]
+    actions = []
+
+    def close(paths, *, on_closed, **_):
+        assert paths == (str(target),)
+        actions.append("close")
+        on_closed(str(target))
+
+    monkeypatch.setattr(comsync_workflow, "close_target_sessions", close)
+    monkeypatch.setattr(comsync_workflow, "request_open_target",
+                        lambda path, **_: actions.append(("open", path)) or True)
+    monkeypatch.setattr(window, "_finish_exit", lambda: actions.append("exit"))
+    try:
+        window._show_page("comsync", persist=False)
+        window.show()
+        page.source_picker.set_value(str(source))
+        page.root_picker.set_value(str(target.parent))
+        page.catalog_button.click()
+        wait_until(application, lambda: not window.busy)
+        page.select_all_targets_button.click()
+        page.execute_button.click()
+        wait_until(application, lambda: window._worker_confirmation_dialog is not None)
+        original_worker = window._feature_worker
+        assert actions == ["close"]
+        window.settings.schedule_enabled = True
+        window.scheduler.configure(window.settings)
+        window.scheduler.next_run = datetime.now() - timedelta(seconds=1)
+        window._timer_tick()
+        page.execute_button.click()
+        assert window._feature_worker is original_worker
+        assert window._thread is None
+        assert window.scheduler.next_run > datetime.now()
+        if action == "reject":
+            window._worker_confirmation_dialog.reject()
+        elif action == "navigate":
+            window._show_page("mirror", persist=False)
+        elif action == "input":
+            page.source_picker.set_value(str(tmp_path / "different"))
+        else:
+            window.close()
+        wait_until(application, lambda: not window.busy)
+        assert window._worker_confirmation_dialog is None
+        assert actions[:2] == ["close", ("open", str(target))]
+        assert ("exit" in actions) == (action == "close")
+        assert DeploymentEngine(state).list_batches() == ()
+        assert not (target / ".obsidian/app.json").exists()
     finally:
         dispose(application, window)
 

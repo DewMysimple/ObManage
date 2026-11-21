@@ -43,7 +43,7 @@ def choose(page, key, side):
     selector.setCurrentIndex(selector.findData(side))
 
 
-def test_real_worker_mixed_directions_confirmation_and_settings(application, prepared):
+def test_mixed_directions_execute_without_opening_difference_details(application, prepared):
     window, page, local, portable = prepared
     before = tree(local), tree(portable)
     page._start_scan()
@@ -130,7 +130,7 @@ def test_incomplete_worker_result_explains_blocked_batch(application, prepared, 
 
     def scandir(path):
         if not isinstance(path, int) and canonical(path) == str(inaccessible):
-            raise PermissionError("injected directory access")
+            raise PermissionError("injected directory access " + "LongUnbrokenDiagnostic" * 8)
         return original(path)
 
     window.resize(*size)
@@ -143,8 +143,10 @@ def test_incomplete_worker_result_explains_blocked_batch(application, prepared, 
     assert "扫描不完整" in page.summary_label.text()
     assert "本批无法执行" in page.status_label.text()
     assert page.issues_label.text().count(str(inaccessible)) == 1
+    assert str(inaccessible) in page.issues_label.toolTip()
     assert page.issues_label.isVisible() and not page.execute_button.isEnabled()
-    assert window.page_containers["incremental"].horizontalScrollBar().maximum() == 0
+    scrollbar = window.page_containers["incremental"].horizontalScrollBar()
+    wait_until(application, lambda: scrollbar.maximum() == 0)
     assert (tree(local), tree(portable)) == before
 
 

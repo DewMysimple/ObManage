@@ -179,7 +179,7 @@ def test_preview_has_priority_and_primary_actions_stay_visible(application, prev
     assert widget.preview_title.mapTo(widget, QPoint()).y() < widget.height() / 2, "The preview should start in the upper half of the window"
     assert widget.table.viewport().height() >= 4 * widget.table.rowHeight(0), "At least four full file rows should fit even on a laptop"
     assert widget.table.height() > widget.paths_panel.height(), "Path controls should not dominate the file preview"
-    for control in (widget.analyze_button, widget.sync_button, widget.confirm_direction_checkbox):
+    for control in (widget.analyze_button, widget.deep_button, widget.sync_button):
         assert control.isVisible()
         assert widget.rect().contains(control.mapTo(widget, QPoint()))
         assert widget.rect().contains(control.mapTo(widget, control.rect().bottomRight()))
@@ -283,7 +283,7 @@ def test_every_management_page_fits_width_and_bottom_actions_are_reachable(
                 window.pages["incremental"].execute_button,
             ),
             "vault_backup": (
-                window.pages["vault_backup"].confirm_checkbox,
+                window.pages["vault_backup"].analyze_button,
                 window.pages["vault_backup"].execute_button,
             ),
             "statistics": (window.pages["statistics"].scan_button,),

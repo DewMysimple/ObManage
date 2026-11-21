@@ -38,6 +38,7 @@ def components(value: str, selected) -> tuple[DeploymentComponent, ...]:
 @dataclass(frozen=True)
 class DatedVault(VaultInfo):
     created_ns: int | None = None
+    observed_identity: tuple[str, int, int] | None = None
 
 
 def with_creation_times(catalog: VaultCatalogResult, cancel=None) -> VaultCatalogResult:
@@ -46,12 +47,13 @@ def with_creation_times(catalog: VaultCatalogResult, cancel=None) -> VaultCatalo
     for vault in catalog.vaults:
         if cancel is not None and cancel.is_set():
             raise SyncCancelled("已取消读取仓库创建时间。")
-        created = None
+        created = observed_identity = None
         try:
             assert_plain_chain(vault.path)
             state = os.stat(native(vault.path), follow_symlinks=False)
             if not stat.S_ISDIR(state.st_mode):
                 raise ValueError("仓库根已变成非目录")
+            observed_identity = ("dir", state.st_dev, state.st_ino)
             created = getattr(state, "st_birthtime_ns", None)
             if created is None and os.name == "nt":
                 created = state.st_ctime_ns
@@ -60,7 +62,7 @@ def with_creation_times(catalog: VaultCatalogResult, cancel=None) -> VaultCatalo
         except (OSError, ValueError, SyncError) as exc:
             issues.append(ManagementIssue("creation_time_unavailable",
                 f"无法读取仓库创建时间：{exc}", vault.path, "warning"))
-        rows.append(DatedVault(vault.path, vault.name, vault.parent_path, created))
+        rows.append(DatedVault(vault.path, vault.name, vault.parent_path, created, observed_identity))
     return VaultCatalogResult(tuple(rows), tuple(issues))
 
 

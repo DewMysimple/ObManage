@@ -3,7 +3,7 @@ type: moc
 status: active
 kind: process
 importance: high
-updated: 2026-11-17
+updated: 2026-11-21
 topic: work-log-index
 source_logs: []
 supersedes: null
@@ -15,6 +15,7 @@ supersedes: null
 
 | 时间 | 类型 | 目标 | 状态 | 主题 | 日志 |
 | --- | --- | --- | --- | --- | --- |
+| 2026-11-21 | feature | - | archived | direct-sync-vault-sessions-delivery | [直接同步与目标会话](./2026-11-21-直接同步与目标会话.md) |
 | 2026-11-17 | bug | - | archived | mirror-profile-bounded-terminal-events | [镜像诊断长时间线末次事件保留](./2026-11-17-镜像诊断长时间线末次事件保留.md) |
 | 2026-11-17 | test | - | archived | ordinary-mirror-console-timeout-acceptance | [普通镜像现场确认超时验收](./2026-11-17-普通镜像现场确认超时验收.md) |
 | 2026-11-17 | feature | - | archived | ordinary-mirror-once-diagnostics | [普通镜像单次诊断与真实预览](./2026-11-17-普通镜像单次诊断与真实预览.md) |

@@ -23,7 +23,8 @@ from obmanage.management.models import ManagementIssue, OpenedVaultCandidates, V
 from obmanage.management.models import VaultCatalogResult
 from obmanage.management.comsync import DatedVault
 import obmanage.pages.distribution as distribution_page
-from obmanage.models import SyncCancelled
+from obmanage.tasking import ConfirmableOperation
+from obmanage.management import comsync_workflow
 from obmanage.pages.distribution import (
     DeploymentPreviewRow,
     ComSyncPage,
@@ -63,8 +64,18 @@ def run_last_operation(page, operations: list, starter):
     starter()
     assert len(operations) == before + 1
     operation = operations[-1]
-    result = operation(threading.Event(), lambda _event: None)
+    cancel, progress = threading.Event(), lambda _event: None
+    if isinstance(operation, ConfirmableOperation):
+        result = operation.run(cancel, progress, lambda prompt: page.task_confirmation(prompt))
+    else:
+        result = operation(cancel, progress)
     page.task_finished("ok", result)
+    if starter == page._start_analyze:
+        return result[1]
+    if starter == page._start_catalog:
+        return result.targets.catalog
+    if starter == page._start_execute:
+        return result.execution
     for attribute in ("result", "plan", "catalog"):
         if hasattr(result, attribute):
             return getattr(result, attribute)
@@ -127,6 +138,13 @@ def prepare_config_plan(page, operations: list) -> None:
     run_last_operation(page, operations, page._start_analyze)
 
 
+@pytest.fixture
+def isolated_sessions(monkeypatch):
+    monkeypatch.setattr(comsync_workflow, "close_target_sessions", lambda *_args, **_kwargs: ())
+    monkeypatch.setattr(comsync_workflow, "assert_target_sessions_closed", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(comsync_workflow, "request_open_target", lambda *_args, **_kwargs: True)
+
+
 def test_catalog_lists_only_real_vaults_excludes_source_and_analyze_is_read_only(
     application, tmp_path
 ):
@@ -150,7 +168,8 @@ def test_catalog_lists_only_real_vaults_excludes_source_and_analyze_is_read_only
         assert page.target_model.data(
             page.target_model.index(0, 0), Qt.ItemDataRole.CheckStateRole
         ) == Qt.CheckState.Unchecked
-        assert "排除 1 个来源仓库" in page.target_summary.text()
+        assert "可见 1" in page.target_summary.text()
+        assert "已选 0" in page.target_summary.text()
 
         check_target(page)
         assert page.plan is None
@@ -162,7 +181,7 @@ def test_catalog_lists_only_real_vaults_excludes_source_and_analyze_is_read_only
         dispose(page)
 
 
-def test_file_preview_complete_clone_confirmation_copy_and_target_invalidation(
+def test_file_preview_complete_clone_copy_and_target_invalidation(
     application, tmp_path
 ):
     root, source, _target, _fake = create_config_fixture(tmp_path)
@@ -185,26 +204,22 @@ def test_file_preview_complete_clone_confirmation_copy_and_target_invalidation(
         tooltip = page.preview_model.data(index, Qt.ItemDataRole.ToolTipRole)
         assert delete_rows[0].absolute_path in tooltip
         assert "删除 1" in page.preview_summary.text()
-        assert "删除目标内 1 个文件" in page.confirm_checkbox.text()
-        assert not page.execute_button.isEnabled()
+        assert page.execute_button.isEnabled()
 
         page.preview_table.selectRow(index.row())
         page.copy_selected_preview_paths()
         assert QApplication.clipboard().text() == delete_rows[0].absolute_path
 
-        page.confirm_checkbox.setChecked(True)
-        assert page.execute_button.isEnabled()
         check_target(page, checked=False)
         assert page.plan is None
         assert page.preview_model.rowCount() == 0
-        assert not page.confirm_checkbox.isChecked()
         assert not page.execute_button.isEnabled()
         assert "删除：尚未分析" in page.preview_summary.text()
     finally:
         dispose(page)
 
 
-def test_execute_and_new_page_can_rollback_persistent_batch(application, tmp_path):
+def test_execute_and_new_page_can_rollback_persistent_batch(application, tmp_path, isolated_sessions):
     root, source, target, _fake = create_config_fixture(tmp_path)
     original = snapshot_tree(target / ".obsidian")
     settings = {"root": str(root), "source": str(source)}
@@ -218,7 +233,6 @@ def test_execute_and_new_page_can_rollback_persistent_batch(application, tmp_pat
     try:
         assert page.recovery_frame.isHidden()
         prepare_config_plan(page, operations)
-        page.confirm_checkbox.setChecked(True)
         result = run_last_operation(page, operations, page._start_execute)
 
         assert result.success
@@ -255,7 +269,7 @@ def test_execute_and_new_page_can_rollback_persistent_batch(application, tmp_pat
         dispose(page)
 
 
-def test_execute_and_new_page_can_finalize_persistent_batch(application, tmp_path):
+def test_execute_and_new_page_can_finalize_persistent_batch(application, tmp_path, isolated_sessions):
     root, source, target, _fake = create_config_fixture(tmp_path)
     settings = {"root": str(root), "source": str(source)}
     state = tmp_path / "state"
@@ -267,7 +281,6 @@ def test_execute_and_new_page_can_finalize_persistent_batch(application, tmp_pat
     recovered = None
     try:
         prepare_config_plan(page, operations)
-        page.confirm_checkbox.setChecked(True)
         result = run_last_operation(page, operations, page._start_execute)
         assert result.success
         assert tuple(target.glob(".obmanage-deploy-*.backup"))
@@ -559,17 +572,14 @@ def test_suite_and_templater_build_explicit_bounded_requests_and_restore_setting
         assert suite.target_model.checked_vaults() == ()
         suite.component_boxes["claude"].setChecked(True)
         check_target(suite)
-        suite_request = suite._build_request()
-        assert len(suite_request.selections) == 1
-        assert suite_request.selections[0].component.destination == ".claude"
-        assert Path(suite_request.selections[0].component.source) == suite_source / ".claude"
+        (claude,) = suite._components()
+        assert claude.destination == ".claude"
+        assert Path(claude.source) == suite_source / ".claude"
 
         assert templater.selected_component_ids() == ("templater",)
         templater.target_model.set_rows((VaultInfo(str(target), target.name),))
         check_target(templater)
-        templater_request = templater._build_request()
-        assert len(templater_request.selections) == 1
-        component = templater_request.selections[0].component
+        (component,) = templater._components()
         assert component.destination == "File/Templater"
         assert component.source_subtree == "File/Templater"
 
@@ -604,66 +614,6 @@ def test_suite_and_templater_build_explicit_bounded_requests_and_restore_setting
         dispose(suite)
 
 
-def test_source_changes_reuse_discovery_but_revoke_selection_plan_and_confirmation(application, tmp_path):
-    root, source, _target, _fake = create_config_fixture(tmp_path)
-    page = ComSyncPage(
-        tmp_path / "state", {"root": str(root), "source": str(source)}, str(root),
-        opened_vault_reader=closed_vault_reader,
-    )
-    operations: list = []
-    page.task_requested.connect(operations.append)
-    try:
-        prepare_config_plan(page, operations)
-        page.confirm_checkbox.setChecked(True)
-        page.source_picker.set_value(str(source / ".obsidian"))
-
-        assert page.catalog is not None
-        assert page.target_model.rowCount() == 1
-        assert not page.target_model.checked_vaults()
-        assert page.plan is None
-        assert not page.confirm_checkbox.isChecked()
-        assert not page.execute_button.isEnabled()
-        page.root_picker.set_value(str(root / "新范围"))
-        assert page.catalog is None
-        assert page.target_model.rowCount() == 0
-    finally:
-        dispose(page)
-
-
-def test_target_select_all_and_clear_are_explicit_and_revoke_plan(application, tmp_path):
-    root = tmp_path / "集合"
-    first = root / "一"
-    second = root / "二"
-    for vault in (first, second):
-        (vault / ".obsidian").mkdir(parents=True)
-    source = tmp_path / "来源"
-    (source / ".obsidian").mkdir(parents=True)
-    (source / ".obsidian" / "config.json").write_text("new", encoding="utf-8")
-    page = ComSyncPage(
-        tmp_path / "state", {"root": str(root), "source": str(source)}, str(root),
-        opened_vault_reader=closed_vault_reader,
-    )
-    operations: list = []
-    page.task_requested.connect(operations.append)
-    try:
-        run_last_operation(page, operations, page._start_catalog)
-        assert page.target_model.checked_vaults() == ()
-        page.select_all_targets_button.click()
-        assert {item.path for item in page.target_model.checked_vaults()} == {
-            str(first), str(second)
-        }
-        run_last_operation(page, operations, page._start_analyze)
-        page.confirm_checkbox.setChecked(True)
-        assert page.plan is not None
-
-        page.clear_targets_button.click()
-        assert page.target_model.checked_vaults() == ()
-        assert page.plan is None
-        assert not page.confirm_checkbox.isChecked()
-    finally:
-        dispose(page)
-
-
 def test_source_list_includes_closed_registered_and_collection_vaults_without_auto_choice(
     application, tmp_path
 ):
@@ -692,7 +642,7 @@ def test_source_list_includes_closed_registered_and_collection_vaults_without_au
         assert {v.path for v in result.choices.vaults} == {str(source), str(target), str(closed)}
         assert result.choices.issues
         assert page.source_picker.value == ""  # No first/last/current vault is silently chosen.
-        assert page.open_state.paths == ()  # Registered candidates are never treated as occupancy.
+        assert page.catalog is None
         dialog = page.source_picker.selection.dialog
         assert dialog is not None
         assert not dialog.choose_button.isEnabled()
@@ -703,10 +653,12 @@ def test_source_list_includes_closed_registered_and_collection_vaults_without_au
         dialog.table.selectRow(0)
         dialog.choose_button.click()
         assert page.source_picker.value == str(closed)
-        assert page.catalog is not None  # The collection has already been discovered.
+        assert page.catalog is None
+        assert page.root_picker.value == str(root)
+        run_last_operation(page, operations, page._start_catalog)
         assert not page.target_model.checked_vaults()
         assert {v.path for v in page.target_model.rows} == {str(source), str(target)}
-        state = page._read_open_state(threading.Event(), None, validate=False)
+        state = page._read_open_state(threading.Event(), None)
         assert state.paths == (str(source),)
         assert snapshot_tree(root) == before
     finally:
@@ -729,7 +681,7 @@ def test_broken_registry_still_offers_collection_sources_and_manual_browse(appli
         selection.task_finished("ok", result)
         assert {v.path for v in result.choices.vaults} == {str(source), str(target)}
         assert any(i.code == "config_invalid_json" for i in result.choices.issues)
-        assert not page.open_state.reliable
+        assert page.catalog is None
         dialog = page.source_picker.selection.dialog
         dialog.search.setText("没有匹配")
         assert dialog.proxy.rowCount() == 0
@@ -741,306 +693,6 @@ def test_broken_registry_still_offers_collection_sources_and_manual_browse(appli
         dialog._browse()
         assert browsed == [True]
         assert not page.source_picker.value
-    finally:
-        dispose(page)
-
-
-def test_filtered_target_selection_and_copy_use_visible_rows(application, tmp_path):
-    root, source, target, _fake = create_config_fixture(tmp_path)
-    second = root / "另一仓库"
-    (second / ".obsidian").mkdir(parents=True)
-    page = ComSyncPage(tmp_path / "state", {"root": str(root), "source": str(source)},
-                              str(root), opened_vault_reader=closed_vault_reader)
-    operations = []
-    page.task_requested.connect(operations.append)
-    try:
-        run_last_operation(page, operations, page._start_catalog)
-        page.target_filter.setText("目标仓库")
-        page.select_all_targets_button.click()
-        assert [v.path for v in page.target_model.checked_vaults()] == [str(target)]
-        assert not page.select_all_targets_button.isEnabled()
-        page.target_table.selectRow(0)
-        page.copy_selected_target_paths()
-        assert QApplication.clipboard().text() == str(target)
-        run_last_operation(page, operations, page._start_analyze)
-        page.confirm_checkbox.setChecked(True)
-        page.target_filter.setText("另一仓库")
-        assert page.plan is not None  # Filtering alone doesn't change the selected targets.
-        assert "已选 1" in page.target_summary.text()
-        page.select_all_targets_button.click()
-        assert {v.path for v in page.target_model.checked_vaults()} == {str(target), str(second)}
-        assert page.plan is None
-        assert not page.confirm_checkbox.isChecked()
-        page.clear_targets_button.click()
-        assert not page.target_model.checked_vaults()  # Clear includes hidden selections.
-    finally:
-        dispose(page)
-
-
-def test_open_registry_does_not_block_close_sync_and_open_flow(application, tmp_path, monkeypatch):
-    root, source, target, _fake = create_config_fixture(tmp_path)
-    events = []
-
-    def close(**_kwargs):
-        events.append("close")
-        return 2
-
-    def check_closed():
-        events.append("check")
-
-    def open_targets(paths, **_kwargs):
-        assert (target / ".obsidian/changed.json").read_text() == "new"
-        events.append(("open", tuple(paths)))
-        return ()
-
-    monkeypatch.setattr(distribution_page, "close_obsidian", close)
-    monkeypatch.setattr(distribution_page, "assert_obsidian_closed", check_closed)
-    monkeypatch.setattr(distribution_page, "open_vaults", open_targets)
-    page = ComSyncPage(
-        tmp_path / "state", {"root": str(root), "source": str(source)}, str(root),
-        opened_vault_reader=lambda _: OpenedVaultCandidates(paths=(str(target),)),
-    )
-    operations = []
-    page.task_requested.connect(operations.append)
-    before = snapshot_tree(root)
-    try:
-        prepare_config_plan(page, operations)
-        assert snapshot_tree(root) == before
-        assert events == []  # Scanning and preview remain read-only.
-        assert page.confirm_checkbox.isEnabled()
-        assert "退出 Obsidian" in page.confirm_checkbox.text()
-        assert "必要时强制结束全部窗口" in page.confirm_checkbox.text()
-        page.confirm_checkbox.setChecked(True)
-        assert page.execute_button.isEnabled()
-        result = run_last_operation(page, operations, page._start_execute)
-        assert result.success
-        assert events[0] == "close"
-        assert "check" in events
-        assert events[-1] == ("open", (str(target),))
-        assert snapshot_tree(target / ".obsidian") == snapshot_tree(source / ".obsidian")
-    finally:
-        dispose(page)
-
-
-def test_unreadable_open_registry_uses_process_checks_instead_of_manual_override(
-    application, tmp_path, monkeypatch
-):
-    root, source, target, _fake = create_config_fixture(tmp_path)
-    unavailable = OpenedVaultCandidates(issues=(ManagementIssue(
-        "config_unreadable", "测试配置不可读取", str(tmp_path / "obsidian.json")
-    ),))
-    checks = []
-    monkeypatch.setattr(distribution_page, "assert_obsidian_closed", lambda: checks.append("checked"))
-    page = ComSyncPage(
-        tmp_path / "state", {"root": str(root), "source": str(source)}, str(root),
-        opened_vault_reader=lambda _: unavailable,
-    )
-    operations = []
-    page.task_requested.connect(operations.append)
-    try:
-        prepare_config_plan(page, operations)
-        assert page.open_state.reliable is False
-        assert page.occupancy_confirm.isHidden()
-        page.confirm_checkbox.setChecked(True)
-        assert page.execute_button.isEnabled()
-        result = run_last_operation(page, operations, page._start_execute)
-        assert result.success and checks
-        assert snapshot_tree(target / ".obsidian") == snapshot_tree(source / ".obsidian")
-    finally:
-        dispose(page)
-
-
-@pytest.mark.parametrize("cancelled", [False, True])
-def test_close_failure_or_cancellation_never_writes_or_opens_vaults(
-    application, tmp_path, monkeypatch, cancelled
-):
-    root, source, target, _fake = create_config_fixture(tmp_path)
-    state = tmp_path / "state"
-    opened = []
-
-    def close(**_kwargs):
-        if cancelled:
-            raise SyncCancelled("已取消关闭 Obsidian")
-        raise DeploymentError("无法确认 Obsidian 已退出")
-
-    monkeypatch.setattr(distribution_page, "close_obsidian", close)
-    monkeypatch.setattr(distribution_page, "open_vaults", lambda paths, **_kwargs: opened.append(tuple(paths)) or ())
-    page = ComSyncPage(state, {"root": str(root), "source": str(source)}, str(root),
-                       opened_vault_reader=closed_vault_reader)
-    operations = []
-    page.task_requested.connect(operations.append)
-    try:
-        prepare_config_plan(page, operations)
-        before = snapshot_tree(target)
-        page.confirm_checkbox.setChecked(True)
-        page._start_execute()
-        with pytest.raises(SyncCancelled if cancelled else DeploymentError) as error:
-            operations[-1](threading.Event(), lambda _event: None)
-        page.task_finished("cancelled" if cancelled else "error", str(error.value))
-        assert snapshot_tree(target) == before
-        assert not (state / "deployment-journal").exists()
-        assert opened == []
-        assert page.plan is None
-    finally:
-        dispose(page)
-
-
-def test_close_side_effects_invalidate_preview_without_overwriting_new_content(
-    application, tmp_path, monkeypatch
-):
-    root, source, target, _fake = create_config_fixture(tmp_path)
-    opened = []
-
-    def close(**_kwargs):
-        (target / ".obsidian/workspace.json").write_text("saved by Obsidian")
-        return 1
-
-    monkeypatch.setattr(distribution_page, "close_obsidian", close)
-    monkeypatch.setattr(distribution_page, "open_vaults", lambda paths, **_kwargs: opened.append(tuple(paths)) or ())
-    page = ComSyncPage(tmp_path / "state", {"root": str(root), "source": str(source)}, str(root),
-                       opened_vault_reader=closed_vault_reader)
-    operations = []
-    page.task_requested.connect(operations.append)
-    try:
-        prepare_config_plan(page, operations)
-        page.confirm_checkbox.setChecked(True)
-        result = run_last_operation(page, operations, page._start_execute)
-        assert not result.success
-        assert (target / ".obsidian/workspace.json").read_text() == "saved by Obsidian"
-        assert (target / ".obsidian/changed.json").read_text() == "old"
-        assert opened == []
-        assert page.plan is None
-    finally:
-        dispose(page)
-
-
-def test_cancellation_during_sync_never_opens_targets(application, tmp_path, monkeypatch):
-    root, source, target, _fake = create_config_fixture(tmp_path)
-    opened = []
-    monkeypatch.setattr(distribution_page, "open_vaults", lambda paths, **_kwargs: opened.append(tuple(paths)) or ())
-    page = ComSyncPage(tmp_path / "state", {"root": str(root), "source": str(source)}, str(root),
-                       opened_vault_reader=closed_vault_reader)
-    operations = []
-    page.task_requested.connect(operations.append)
-    cancel = threading.Event()
-
-    def progress(event):
-        if event.phase == "stage":
-            cancel.set()
-
-    try:
-        prepare_config_plan(page, operations)
-        before = snapshot_tree(target / ".obsidian")
-        page.confirm_checkbox.setChecked(True)
-        page._start_execute()
-        payload = operations[-1](cancel, progress)
-        page.task_finished("ok", payload)
-        assert payload.result.status == "cancelled"
-        assert snapshot_tree(target / ".obsidian") == before
-        assert opened == []
-    finally:
-        dispose(page)
-
-
-@pytest.mark.parametrize("selection", ["single", "batch", "batch_one_changed", "newest_tie"])
-def test_multiple_components_only_open_a_single_selected_vault(
-    application, tmp_path, monkeypatch, selection
-):
-    root, source, first, _fake = create_config_fixture(tmp_path)
-    second = root / "另一仓库"
-    if selection != "single":
-        (second / ".obsidian").mkdir(parents=True)
-    (source / ".claude").mkdir()
-    (source / ".claude/settings.json").write_text("template")
-    if selection == "batch_one_changed":
-        for component in (".obsidian", ".claude"):
-            (second / component).mkdir(exist_ok=True)
-            for source_file in (source / component).iterdir():
-                (second / component / source_file.name).write_bytes(source_file.read_bytes())
-    opened = []
-    monkeypatch.setattr(distribution_page, "open_vaults", lambda paths, **_kwargs: opened.append(tuple(paths)) or ())
-    page = ComSyncPage(tmp_path / "state", {"root": str(root), "source": str(source)}, str(root),
-                       opened_vault_reader=closed_vault_reader)
-    operations = []
-    page.task_requested.connect(operations.append)
-    try:
-        page.component_boxes["claude"].setChecked(True)
-        catalog = run_last_operation(page, operations, page._start_catalog)
-        if selection == "newest_tie":
-            page._accept_catalog(VaultCatalogResult(tuple(
-                DatedVault(vault.path, vault.name, created_ns=20) for vault in catalog.vaults
-            )))
-            page.latest_button.click()
-        else:
-            page.select_all_targets_button.click()
-        assert page.execute_button.text() == ("同步并打开" if selection == "single" else "同步所选")
-        run_last_operation(page, operations, page._start_analyze)
-        assert len(page.plan.targets) == (2 if selection == "single" else 4)
-        if selection == "batch_one_changed":
-            assert {item.target_root for item in page.plan.targets if item.needs_deploy} == {str(first)}
-        assert ("成功后打开该仓库" if selection == "single" else "多个目标同步后不自动打开") in page.confirm_checkbox.text()
-        page.confirm_checkbox.setChecked(True)
-        assert run_last_operation(page, operations, page._start_execute).success
-        assert opened == ([(str(first),)] if selection == "single" else [])
-        assert snapshot_tree(first / ".obsidian") == snapshot_tree(source / ".obsidian")
-        assert snapshot_tree(first / ".claude") == snapshot_tree(source / ".claude")
-        if selection != "single":
-            assert snapshot_tree(second / ".obsidian") == snapshot_tree(source / ".obsidian")
-            assert snapshot_tree(second / ".claude") == snapshot_tree(source / ".claude")
-    finally:
-        dispose(page)
-
-
-def test_open_failure_preserves_completed_sync_and_reports_launch_error(application, tmp_path, monkeypatch):
-    root, source, target, _fake = create_config_fixture(tmp_path)
-    monkeypatch.setattr(distribution_page, "open_vaults", lambda _paths, **_kwargs: ("测试：无法启动 Obsidian",))
-    page = ComSyncPage(tmp_path / "state", {"root": str(root), "source": str(source)}, str(root),
-                       opened_vault_reader=closed_vault_reader)
-    operations = []
-    page.task_requested.connect(operations.append)
-    try:
-        prepare_config_plan(page, operations)
-        page.confirm_checkbox.setChecked(True)
-        result = run_last_operation(page, operations, page._start_execute)
-        assert result.success
-        assert page.current_batch.status == "committed"
-        assert snapshot_tree(target / ".obsidian") == snapshot_tree(source / ".obsidian")
-        assert "同步完成" in page.status_label.text()
-        assert "打开仓库失败" in page.status_label.text()
-        assert "无法启动 Obsidian" in page.status_label.toolTip()
-    finally:
-        dispose(page)
-
-
-def test_newest_selection_uses_creation_time_excludes_source_and_replaces_hidden_choices(application, tmp_path):
-    root = tmp_path / "collection"
-    source = root / "source"
-    rows = tuple(DatedVault(str(root / name), name, created_ns=date)
-                 for name, date in (("old", 10), ("new", 20), ("tie", 20), ("source", 30)))
-    page = ComSyncPage(tmp_path / "state", {"source": str(source)}, str(root))
-    try:
-        assert not page.latest_button.isEnabled()
-        page._accept_catalog(VaultCatalogResult(rows))
-        assert not page.target_model.checked_vaults()
-        assert page.latest_button.isEnabled()
-        check_target(page)
-        page.target_filter.setText("old")
-        page.plan = object()
-        page.confirm_checkbox.setChecked(True)
-        page.latest_button.click()
-        assert {v.name for v in page.target_model.checked_vaults()} == {"new", "tie"}
-        assert "多个目标同步后不自动打开" in page.status_label.text()
-        assert page.execute_button.text() == "同步所选"
-        assert page.target_filter.text() == ""
-        assert page.plan is None and not page.confirm_checkbox.isChecked()
-        assert page.target_model.index(1, 3).data()
-        page.set_global_busy(True)
-        assert not page.latest_button.isEnabled()
-        page.set_global_busy(False)
-        page.root_picker.set_value(str(root / "other"))
-        assert not page.latest_button.isEnabled()
-        page._accept_catalog(VaultCatalogResult((rows[0], VaultInfo(str(root / "unknown"), "unknown"))))
-        assert not page.latest_button.isEnabled()
     finally:
         dispose(page)
 

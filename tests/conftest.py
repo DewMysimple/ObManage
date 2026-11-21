@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 import obmanage.management.trash as trash_module
-import obmanage.pages.distribution as distribution_page
+from obmanage.management import comsync_workflow
 from obmanage.management.trash import TrashCleanupEngine
 from obmanage.paths import native
 
@@ -17,9 +17,9 @@ from obmanage.paths import native
 @pytest.fixture(autouse=True)
 def isolated_obsidian_actions(monkeypatch):
     """UI tests must never close real editors or launch real vault URIs."""
-    monkeypatch.setattr(distribution_page, "close_obsidian", lambda **_kwargs: 0, raising=False)
-    monkeypatch.setattr(distribution_page, "assert_obsidian_closed", lambda: None, raising=False)
-    monkeypatch.setattr(distribution_page, "open_vaults", lambda _paths, **_kwargs: (), raising=False)
+    monkeypatch.setattr(comsync_workflow, "close_target_sessions", lambda *_args, **_kwargs: ())
+    monkeypatch.setattr(comsync_workflow, "assert_target_sessions_closed", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(comsync_workflow, "request_open_target", lambda *_args, **_kwargs: True)
 
 
 @pytest.fixture

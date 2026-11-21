@@ -7,7 +7,7 @@ from typing import Any
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QHeaderView, QHBoxLayout, QLabel, QMessageBox,
-    QPushButton, QTableWidget, QTableWidgetItem, QTabBar,
+    QPushButton, QSizePolicy, QTableWidget, QTableWidgetItem, QTabBar,
 )
 
 from ..management.incremental import (
@@ -75,7 +75,8 @@ class IncrementalPage(FeaturePage):
         vaults.addWidget(self.vault_table, 1)
         self.issues_label = QLabel()
         self.issues_label.setWordWrap(True)
-        self.issues_label.setMinimumWidth(0)
+        self.issues_label.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.issues_label.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
         self.issues_label.hide()
         vaults.addWidget(self.issues_label)
 
@@ -100,7 +101,7 @@ class IncrementalPage(FeaturePage):
         self.selection_label = QLabel("请选择来源；所选仓库范围包含其嵌套子仓库。")
         self.selection_label.setWordWrap(True)
         footer.addWidget(self.selection_label)
-        self.confirm_checkbox = QCheckBox("我已核对各仓库来源及删除明细，确认执行所选方向")
+        self.confirm_checkbox = QCheckBox("我已确认所选仓库的同步方向与目标删除范围")
         footer.addWidget(self.confirm_checkbox)
         buttons = QHBoxLayout()
         self.execute_button = QPushButton("执行所选仓库更新")
@@ -216,7 +217,9 @@ class IncrementalPage(FeaturePage):
         self.summary_label.setText(
             f"{summary}{'完整校验' if analysis.deep else '快速扫描'}耗时 {analysis.duration_seconds:.1f} 秒。")
         issues = [*analysis.issues, *(error for pair in analysis.pairs for error in pair.errors)]
-        self.issues_label.setText("\n".join(issues))
+        issue_text = "\n".join(issues)
+        self.issues_label.setText(issue_text)
+        self.issues_label.setToolTip(issue_text)
         self.issues_label.setVisible(bool(issues))
         if analysis.pairs:
             self.vault_table.selectRow(0)

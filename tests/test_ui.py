@@ -10,7 +10,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest
 from PySide6.QtCore import QCoreApplication, QEvent, Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QMessageBox
+from PySide6.QtWidgets import QApplication, QDialogButtonBox, QPlainTextEdit
 
 from obmanage.models import SyncCancelled
 from obmanage.settings import SettingsStore
@@ -32,6 +32,12 @@ def pump_until(app, condition, timeout=12):
             return
         time.sleep(0.01)
     assert condition(), "The UI operation did not complete within the test timeout"
+
+
+def wait_for_confirmation(app, widget):
+    pump_until(app, lambda: widget._worker_confirmation_dialog is not None)
+    assert widget.busy
+    return widget._worker_confirmation_dialog
 
 
 @pytest.fixture
@@ -72,8 +78,6 @@ def test_manual_preview_then_sync_and_repeat(application, window):
     assert widget.plan.can_execute
     assert widget.plan.counts["delete"] == 1
     assert widget.plan.counts["skip"] == 1
-    assert not widget.sync_button.isEnabled()
-    widget.confirm_direction_checkbox.setChecked(True)
     assert widget.sync_button.isEnabled()
     widget.filter_tabs.setCurrentIndex(next(i for i, (_, actions) in enumerate(FILTERS)
                                            if actions == {"delete", "rmdir"}))
@@ -83,11 +87,16 @@ def test_manual_preview_then_sync_and_repeat(application, window):
     preview.parent.mkdir(exist_ok=True)
     assert widget.grab().save(str(preview))
     QTest.mouseClick(widget.sync_button, Qt.MouseButton.LeftButton)
+    dialog = wait_for_confirmation(application, widget)
+    details = dialog.findChild(QPlainTextEdit).toPlainText()
+    assert str(source) in details and str(target) in details
+    assert (target / "源端已经删除.md").exists()
+    dialog.accept()
     pump_until(application, lambda: not widget.busy)
     assert widget.last_result.status == "success"
     assert widget.last_result.copied_files == 2
     assert not (target / "源端已经删除.md").exists()
-    assert not widget.sync_button.isEnabled()
+    assert widget.sync_button.isEnabled()
     widget.analyze()
     pump_until(application, lambda: not widget.busy)
     assert widget.plan.bytes_to_copy == 0
@@ -159,20 +168,21 @@ def test_scheduled_empty_source_pauses_without_deleting(application, window):
     assert widget.last_result is None
 
 
-def test_empty_source_manual_no_then_yes(application, window, monkeypatch):
+def test_empty_source_manual_no_then_yes(application, window):
     widget, source, target = window
     (target / "删除.md").write_text("old", encoding="utf-8")
-    widget.analyze()
+    widget.start_sync()
+    dialog = wait_for_confirmation(application, widget)
+    assert "为空" in dialog.windowTitle()
+    buttons = dialog.findChild(QDialogButtonBox)
+    assert {button.text(): button.isDefault() for button in buttons.buttons()} == {
+        "确认清空目标": False, "取消": True,
+    }
+    dialog.reject()
     pump_until(application, lambda: not widget.busy)
-    widget.confirm_direction_checkbox.setChecked(True)
-    monkeypatch.setattr(QMessageBox, "warning", lambda *args, **kwargs: QMessageBox.StandardButton.No)
-    monkeypatch.setattr(QMessageBox, "question", lambda *args, **kwargs: QMessageBox.StandardButton.No)
-    widget.start_sync()
-    assert not widget.busy
     assert (target / "删除.md").exists()
-    monkeypatch.setattr(QMessageBox, "warning", lambda *args, **kwargs: QMessageBox.StandardButton.Yes)
-    monkeypatch.setattr(QMessageBox, "question", lambda *args, **kwargs: QMessageBox.StandardButton.Yes)
     widget.start_sync()
+    wait_for_confirmation(application, widget).accept()
     pump_until(application, lambda: not widget.busy)
     assert widget.last_result.status == "success"
     assert not (target / "删除.md").exists()
@@ -197,7 +207,7 @@ def test_cancel_analysis_keeps_ui_responsive(application, window, monkeypatch):
     pump_until(application, lambda: not widget.busy)
     assert widget.plan is None
     assert widget.analyze_button.isEnabled()
-    assert not widget.sync_button.isEnabled()
+    assert widget.sync_button.isEnabled()
 
 
 def test_offline_schedule_keeps_timer_for_next_attempt(application, window):
@@ -209,4 +219,23 @@ def test_offline_schedule_keeps_timer_for_next_attempt(application, window):
     assert widget.plan.errors
     assert widget.schedule_toggle.isChecked()
     assert widget.scheduler.next_run is not None
-    assert not widget.sync_button.isEnabled()
+    assert widget.sync_button.isEnabled()
+
+
+def test_scheduler_and_repeat_click_cannot_enter_during_confirmation(application, window):
+    widget, source, target = window
+    (source / "note.md").write_bytes(b"source")
+    widget.schedule_toggle.setChecked(True)
+    widget.start_sync()
+    dialog = wait_for_confirmation(application, widget)
+    original_thread = widget._thread
+    widget.scheduler.next_run = datetime.now() - timedelta(seconds=1)
+    widget._timer_tick()
+    widget.start_sync()
+    assert widget._thread is original_thread
+    assert widget._worker_confirmation_dialog is dialog
+    assert not (target / "note.md").exists()
+    dialog.reject()
+    pump_until(application, lambda: not widget.busy)
+    assert widget.scheduler.next_run > datetime.now()
+    assert not (target / "note.md").exists()
