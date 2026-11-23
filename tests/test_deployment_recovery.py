@@ -19,6 +19,10 @@ def contents(root):
             for path in root.rglob("*") if path.is_file()}
 
 
+def managed_copy(state, local_path):
+    return state / "backups" / Path(local_path).name
+
+
 @pytest.fixture
 def committed(tmp_path):
     source, target, state = (tmp_path / name for name in ("source", "target", "state"))
@@ -72,12 +76,14 @@ def test_preserved_rollback_restores_old_and_keeps_all_new_content(committed):
     assert result.journal_status == "rolled_back_with_residuals"
     assert contents(target / ".obsidian") == {"old.json": b"old"}
     saved = engine.get_batch(batch_id).targets[0]
-    assert contents(Path(saved.rollback_path)) == expected
+    preserved = managed_copy(state, saved.rollback_path)
+    assert contents(preserved) == expected
+    assert not Path(saved.rollback_path).exists()
     assert saved.preserved_manifest is not None
     assert contents(source) == {"config.json": b"new"}
     require_recovery_clear(state)
     assert not engine.finalize(batch_id).success
-    assert contents(Path(saved.rollback_path)) == expected
+    assert contents(preserved) == expected
     require_recovery_clear(state)  # an invalid cleanup must not reopen recovery
 
 
@@ -103,7 +109,7 @@ def test_old_inspection_cannot_acknowledge_new_transaction_state(committed):
 
 def test_bad_backup_blocks_rollback_but_can_resolve_without_deleting_anything(committed):
     engine, batch_id, _, target, state = committed
-    backup = Path(engine.get_batch(batch_id).targets[0].backup_path)
+    backup = managed_copy(state, engine.get_batch(batch_id).targets[0].backup_path)
     (backup / "unknown.txt").write_text("do not delete")
     before = contents(target)
     preview = engine.inspect_recovery(batch_id)
@@ -155,7 +161,7 @@ def test_restart_continues_preserved_rollback_without_losing_copies(committed, m
     def crash(source, destination):
         rename(source, destination)
         if ((crash_point == "move" and str(destination).endswith(".rollback")) or
-                (crash_point == "restore" and str(source).endswith(".backup"))):
+                (crash_point == "restore" and Path(destination) == target / ".obsidian")):
             raise Crash()
     monkeypatch.setattr(deployment, "_rename_directory", crash)
     with pytest.raises(Crash):
@@ -165,7 +171,8 @@ def test_restart_continues_preserved_rollback_without_losing_copies(committed, m
     result = fresh.rollback(batch_id)
     assert result.success, result.errors
     saved = fresh.get_batch(batch_id).targets[0]
-    assert contents(Path(saved.rollback_path)) == expected
+    assert contents(managed_copy(state, saved.rollback_path)) == expected
+    assert not Path(saved.rollback_path).exists()
     assert contents(target / ".obsidian") == {"old.json": b"old"}
     require_recovery_clear(state)
 
@@ -176,7 +183,7 @@ def test_resolved_cleanup_never_deletes_preserved_rollback_content(committed, mo
     preview = engine.inspect_recovery(batch_id)
     rename = deployment._rename_directory
     def fail_restore(source, destination):
-        if str(source).endswith(".backup"):
+        if Path(destination) == target / ".obsidian":
             raise RuntimeError("simulated process crash")
         rename(source, destination)
     monkeypatch.setattr(deployment, "_rename_directory", fail_restore)
@@ -186,7 +193,9 @@ def test_resolved_cleanup_never_deletes_preserved_rollback_content(committed, mo
     assert engine.resolve(batch_id, expected_revision=preview.revision).success
     assert engine.finalize(batch_id).success
     saved = engine.get_batch(batch_id).targets[0]
-    assert contents(Path(saved.rollback_path)) == expected
+    preserved = (managed_copy(state, saved.rollback_path) if saved.managed_rollback is not None
+                 else Path(saved.rollback_path))
+    assert contents(preserved) == expected
     require_recovery_clear(state)
 
 
@@ -240,7 +249,7 @@ def test_cleanup_preview_rejects_changed_backup(committed):
     engine, batch_id, _, target, state = committed
     assert engine.resolve(batch_id, expected_revision=engine.get_batch(batch_id).revision).success
     preview = engine.inspect_recovery(batch_id)
-    backup = Path(engine.get_batch(batch_id).targets[0].backup_path)
+    backup = managed_copy(state, engine.get_batch(batch_id).targets[0].backup_path)
     (backup / "old.json").write_text("user changed backup")
     before = contents(target)
     assert not engine.finalize(batch_id, preview=preview).success
@@ -306,6 +315,8 @@ def test_clear_ended_transaction_removes_all_copies_and_record(committed, rollba
     batch = engine.get_batch(batch_id)
     paths = [Path(path) for t in batch.targets for path in
              (t.backup_path, t.stage_path, t.rollback_path) if path]
+    paths.extend(managed_copy(state, path) for t in batch.targets for path in
+                 (t.backup_path, t.rollback_path) if path)
     preview = engine.inspect_recovery(batch_id)
     assert not preview.cleanup_error
     assert engine.clear_transaction(batch_id, preview=preview).success
@@ -319,10 +330,10 @@ def test_clear_ended_transaction_removes_all_copies_and_record(committed, rollba
 
 
 def test_clear_rejects_changed_copy_and_retains_record(committed):
-    engine, batch_id, _, _, _ = committed
+    engine, batch_id, _, _, state = committed
     assert engine.resolve(batch_id, expected_revision=engine.get_batch(batch_id).revision).success
     preview = engine.inspect_recovery(batch_id)
-    backup = Path(engine.get_batch(batch_id).targets[0].backup_path)
+    backup = managed_copy(state, engine.get_batch(batch_id).targets[0].backup_path)
     (backup / "unknown.txt").write_text("user content")
     assert not engine.clear_transaction(batch_id, preview=preview).success
     assert (backup / "old.json").exists()

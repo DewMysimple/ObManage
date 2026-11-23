@@ -55,6 +55,7 @@ def test_recovery_workbench_is_readable_and_actions_reachable(application, tmp_p
     assert engine.execute(plan).success
     (target / ".obsidian" / "workspace.json").write_text("changed")
     window = MainWindow(state)
+    window._timer.stop()
     page = window.pages["comsync"]
     window._show_page("transactions", persist=False)
     window.resize(*size)
@@ -83,9 +84,16 @@ def test_recovery_workbench_is_readable_and_actions_reachable(application, tmp_p
         assert transactions.clear_button.isVisible()
         assert page.rollback_button.isVisible()
         assert window.pages["trash_cleanup"].restore_button.isHidden()
+        assert transactions.backup_directory.toolTip() == str(state / "backups")
         for control in (transactions.details_button, transactions.clear_button, page.rollback_button):
             scroll.ensureWidgetVisible(control)
             settle(application)
+            position = control.mapTo(scroll.viewport(), QPoint())
+            assert scroll.viewport().rect().contains(QRect(position, control.size()))
+        scroll.verticalScrollBar().setValue(scroll.verticalScrollBar().maximum())
+        settle(application)
+        for control in (transactions.backup_directory, transactions.backup_retention_spin,
+                        transactions.backup_retention_apply):
             position = control.mapTo(scroll.viewport(), QPoint())
             assert scroll.viewport().rect().contains(QRect(position, control.size()))
         scroll.verticalScrollBar().setValue(0)
@@ -292,7 +300,11 @@ def test_every_management_page_fits_width_and_bottom_actions_are_reachable(
             ),
             "trash_cleanup": (window.pages["trash_cleanup"].clear_button,),
             "archive": (window.pages["archive"].execute_button,),
-            "transactions": (window.pages["transactions"].empty_label, window.pages["transactions"].refresh_button),
+            "transactions": (
+                window.pages["transactions"].backup_directory,
+                window.pages["transactions"].backup_retention_spin,
+                window.pages["transactions"].backup_retention_apply,
+            ),
         }
         for key, controls in bottom_controls.items():
             window._show_page(key, persist=False)

@@ -5,14 +5,16 @@ import json
 import time
 from datetime import datetime, timedelta
 from threading import Event
+from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
 from PySide6.QtCore import QCoreApplication, QEvent
-from PySide6.QtWidgets import QApplication, QLabel, QPlainTextEdit
+from PySide6.QtWidgets import QApplication, QLabel, QPlainTextEdit, QPushButton
 
 from obmanage.management.deployment import (
+    BackupMaintenanceResult,
     DeploymentComponent,
     DeploymentEngine,
     DeploymentRequest,
@@ -29,6 +31,7 @@ from obmanage.pages.distribution import ComSyncPage
 from obmanage.pages.registry import FEATURES
 from obmanage.pages.statistics import StatisticsPage
 from obmanage.pages.trash_cleanup import TrashCleanupPage
+from obmanage.pages import transactions as transactions_page
 from obmanage.settings import SettingsStore
 from obmanage.ui import MainWindow
 from obmanage.pages.common import PathPicker
@@ -69,6 +72,117 @@ def wait_clear(app, window):
     page = window.pages["transactions"]
     wait_until(app, lambda: not window.busy and not page._clear_confirm_timer.isActive()
                and page._clear_preview is None)
+
+
+def test_deployment_backup_retention_persists_before_idle_maintenance(application, tmp_path, monkeypatch):
+    calls = []
+
+    def maintain(state_dir, retention_days, _cancel, _progress):
+        calls.append((state_dir, retention_days))
+        return SimpleNamespace(moved=0, removed=0, errors=())
+
+    monkeypatch.setattr(transactions_page, "maintain_transaction_backups", maintain)
+    state = tmp_path / "state"
+    window = MainWindow(state)
+    page = window.pages["transactions"]
+    monkeypatch.setattr(page, "has_deployment_records", lambda: True)
+    try:
+        assert page.backup_directory.text() == str(state / "backups")
+        assert page.backup_directory.isReadOnly()
+        assert page.backup_retention_spin.value() == 0
+        assert not page.backup_retention_apply.isEnabled()
+        window._timer_tick()
+        assert window.busy
+        wait_until(application, lambda: not window.busy)
+        assert calls == [(state, None)]
+
+        page.backup_retention_spin.setValue(7)
+        assert page.backup_retention_days is None
+        assert page.backup_retention_apply.isEnabled()
+        page.backup_retention_apply.click()
+        assert SettingsStore(state).load_document().features["transactions"]["backup_retention_days"] == 7
+
+        release = Event()
+
+        def foreground_task(_cancel, _progress):
+            release.wait(2)
+            raise SyncCancelled("finished the foreground test task")
+
+        window.pages["statistics"].start_task("statistics", foreground_task)
+        try:
+            active = window._feature_worker
+            assert active is not None
+            assert not page.backup_retention_apply.isEnabled()
+            window._timer_tick()
+            assert window._feature_worker is active
+            assert calls == [(state, None)]
+        finally:
+            release.set()
+        wait_until(application, lambda: not window.busy)
+        window._timer_tick()
+        wait_until(application, lambda: not window.busy)
+        assert calls == [(state, None), (state, 7)]
+    finally:
+        dispose(application, window)
+
+    restarted = MainWindow(state)
+    try:
+        page = restarted.pages["transactions"]
+        assert page.backup_retention_spin.value() == 7
+        page.backup_retention_spin.setValue(0)
+        page.backup_retention_apply.click()
+        assert SettingsStore(state).load_document().features["transactions"]["backup_retention_days"] is None
+    finally:
+        dispose(application, restarted)
+
+
+def test_failed_backup_retention_save_does_not_enable_pruning(application, tmp_path, monkeypatch):
+    def save_failed(_):
+        raise OSError("cannot persist setting")
+
+    window = MainWindow(tmp_path / "state")
+    monkeypatch.setattr(window.store, "save_document", save_failed)
+    page = window.pages["transactions"]
+    try:
+        page.backup_retention_spin.setValue(1)
+        page.backup_retention_apply.click()
+        assert page.backup_retention_days is None
+        assert window.settings_document.features["transactions"]["backup_retention_days"] is None
+        assert page.backup_retention_apply.isEnabled()
+        assert "保存失败" in page.status_label.text()
+    finally:
+        dispose(application, window)
+
+
+def test_startup_migrates_authenticated_legacy_deployment_with_retention_off(
+        application, tmp_path, monkeypatch):
+    source, target, state = (tmp_path / name for name in ("source", "vault", "state"))
+    for root, content in ((source, b"new config"), (target, b"original config")):
+        (root / ".obsidian").mkdir(parents=True)
+        (root / ".obsidian/config.json").write_bytes(content)
+    engine = DeploymentEngine(state)
+    plan = engine.analyze(DeploymentRequest((DeploymentSelection(
+        DeploymentComponent.obsidian(source), DeploymentTarget("target", str(target))),)))
+    with monkeypatch.context() as legacy:
+        legacy.setattr(DeploymentEngine, "_archive_batch_locked", lambda *_: BackupMaintenanceResult())
+        assert engine.execute(plan).success
+    record = engine.get_batch(plan.batch_id).targets[0]
+    local_backup = target / os.path.basename(record.backup_path)
+    managed_backup = state / "backups" / local_backup.name
+    assert (local_backup / "config.json").read_bytes() == b"original config"
+    assert not managed_backup.exists()
+
+    window = MainWindow(state)
+    try:
+        assert window.pages["transactions"].backup_retention_days is None
+        window._timer.setInterval(20)
+        wait_until(application, lambda: not window.busy and not local_backup.exists())
+        assert (managed_backup / "config.json").read_bytes() == b"original config"
+        assert (target / ".obsidian/config.json").read_bytes() == b"new config"
+        assert engine.inspect_recovery(plan.batch_id).can_rollback
+        assert window._recovery_page_keys() == ("comsync",)
+    finally:
+        dispose(application, window)
 
 
 def test_shell_registers_eight_pages_with_mirror_first(application, tmp_path):
@@ -470,7 +584,6 @@ def test_direct_trash_cleanup_creates_no_recovery_gate(application, tmp_path):
         window.portable_combo.setCurrentText(str(target))
         window.set_direction("to_portable")
 
-        assert window.nav_recovery_button.isHidden()
         assert window.sync_button.isEnabled()
         assert not window.pages["trash_cleanup"].has_pending_recovery()
         for key in ("vault_backup", "comsync"):
@@ -499,7 +612,7 @@ def test_legacy_trash_quarantine_still_blocks_writes_until_finalized(
         window.set_direction("to_portable")
 
         assert window._recovery_page_keys() == ("trash_cleanup",)
-        assert not window.nav_recovery_button.isHidden()
+        assert not any(button.text() == "待恢复事务" for button in window.findChildren(QPushButton))
         assert not window.sync_button.isEnabled()
         assert window.pages["trash_cleanup"].has_pending_recovery()
         assert window.pages["vault_backup"]._external_recovery_pending
@@ -513,7 +626,7 @@ def test_legacy_trash_quarantine_still_blocks_writes_until_finalized(
         assert not window.busy
         assert window.scheduler.next_run > datetime.now()
         assert any("待恢复事务" in line and "跳过" in line for line in window._log_lines)
-        window.nav_recovery_button.click()
+        window.navigation_buttons["transactions"].click()
         assert window._current_page_key == "transactions"
 
         finalized = TrashCleanupEngine(state).finalize(operation_id)
@@ -521,7 +634,6 @@ def test_legacy_trash_quarantine_still_blocks_writes_until_finalized(
         window.pages["trash_cleanup"]._reload_operations()
         window._refresh_actions()
         assert window._recovery_page_keys() == ()
-        assert window.nav_recovery_button.isHidden()
         window._show_page("mirror")
         assert window.sync_button.isEnabled()
     finally:
@@ -568,7 +680,6 @@ def test_unreadable_deployment_journal_fails_closed_across_pages(application, tm
         )
         assert all(page._recovery_blocked for page in blocked_pages)
         assert all(page.has_pending_recovery() for page in blocked_pages)
-        assert not window.nav_recovery_button.isHidden()
         assert not window.sync_button.isEnabled()
         for page in blocked_pages:
             page._start_execute()
@@ -597,13 +708,12 @@ def test_unknown_legacy_deployment_is_globally_blocked_and_reachable(
     window = MainWindow(state)
     try:
         assert "comsync" in window._recovery_page_keys()
-        assert not window.nav_recovery_button.isHidden()
         assert window.pages["comsync"].has_pending_recovery()
         assert window.pages["archive"]._external_recovery_pending
         assert window.pages["vault_backup"]._external_recovery_pending
         assert window.pages["trash_cleanup"]._external_recovery_pending
 
-        window.nav_recovery_button.click()
+        window.navigation_buttons["transactions"].click()
 
         assert window._current_page_key == "transactions"
         page = window.pages["comsync"]
@@ -654,7 +764,7 @@ def test_completing_changed_deployment_releases_all_pages_in_one_confirmation(
     window = MainWindow(state)
     try:
         assert window._recovery_page_keys() == ("comsync",)
-        window.nav_recovery_button.click()
+        window.navigation_buttons["transactions"].click()
         page = window.pages["comsync"]
         window.show()
         wait_until(application, lambda: not window.busy and page.recovery_preview is not None)
@@ -671,13 +781,13 @@ def test_completing_changed_deployment_releases_all_pages_in_one_confirmation(
         assert len(confirmations) == 1
         assert confirmations[0][0] == "确认完成"
         assert not window._recovery_page_keys()
-        assert window.nav_recovery_button.isHidden()
         for key in ("incremental", "vault_backup", "archive", "trash_cleanup"):
             assert not window.pages[key]._external_recovery_pending
         assert engine.list_batches() == ()
         assert (target / ".obsidian" / "workspace.json").read_text() == "later"
         assert (target / ".obsidian" / "settings.json").read_text() == "new"
         assert not tuple(target.glob(".obmanage-deploy-*.backup"))
+        assert not tuple((state / "backups").glob("*.backup"))
         assert transactions.selector.count() == 0
     finally:
         dispose(application, window)
@@ -902,6 +1012,7 @@ def test_transactions_clear_through_worker_and_restart(application, tmp_path, mo
         assert controller.batch_selector.count() == 0
         assert "已清除" in page.status_label.text()
         assert not tuple(target.glob(".obmanage-deploy-*.backup"))
+        assert not tuple((state / "backups").glob("*.backup"))
         assert (target / ".obsidian/config.json").read_text() == "new"
         assert not window._recovery_page_keys()
     finally:
@@ -1022,7 +1133,7 @@ def test_transaction_cancel_and_navigation_during_confirmation_do_not_write(
         assert len(calls) == 1
         assert not window.busy
         assert engine.get_batch(plan.batch_id).revision == revision
-        assert tuple(target.glob(".obmanage-deploy-*.backup"))
+        assert tuple((state / "backups").glob(".obmanage-deploy-*.backup"))
         assert (target / ".obsidian/new.json").read_text() == "new"
 
         def leave_page(*args):
@@ -1035,7 +1146,7 @@ def test_transaction_cancel_and_navigation_during_confirmation_do_not_write(
         assert not window.busy
         assert controller.recovery_preview is None
         assert engine.get_batch(plan.batch_id).revision == revision
-        assert tuple(target.glob(".obmanage-deploy-*.backup"))
+        assert tuple((state / "backups").glob(".obmanage-deploy-*.backup"))
     finally:
         dispose(application, window)
 
@@ -1059,7 +1170,7 @@ def test_transaction_stale_backup_keeps_record_and_allows_retry(
         window.show()
         controller, page = window.pages["comsync"], window.pages["transactions"]
         wait_until(application, lambda: not window.busy and controller.recovery_preview is not None)
-        backup = next(target.glob(".obmanage-deploy-*.backup"))
+        backup = next((state / "backups").glob(".obmanage-deploy-*.backup"))
         (backup / "unknown.txt").write_text("keep unknown data")
         confirmations = []
         monkeypatch.setattr(page, "_confirm", lambda *args: confirmations.append(args) or True)
@@ -1092,7 +1203,7 @@ def test_pending_deployment_completion_releases_gate_when_copy_cleanup_is_unsafe
     plan = engine.analyze(DeploymentRequest((DeploymentSelection(
         DeploymentComponent.obsidian(source), DeploymentTarget("target", str(target))),)))
     assert engine.execute(plan).success
-    backup = next(target.glob(".obmanage-deploy-*.backup"))
+    backup = next((state / "backups").glob(".obmanage-deploy-*.backup"))
     (backup / "unknown.txt").write_text("preserve unknown data")
     window = MainWindow(state)
     try:
@@ -1134,7 +1245,7 @@ def test_old_unsafe_backup_does_not_block_new_pending_completion(
     first = engine.analyze(request)
     assert engine.execute(first).success
     assert engine.resolve(first.batch_id, expected_revision=engine.get_batch(first.batch_id).revision).success
-    old_backup = next(target.glob(".obmanage-deploy-*.backup"))
+    old_backup = next((state / "backups").glob(".obmanage-deploy-*.backup"))
     (old_backup / "unknown.txt").write_text("preserve unknown data")
     (source / ".obsidian/config.json").write_text("second")
     second = engine.analyze(request)
@@ -1158,7 +1269,7 @@ def test_old_unsafe_backup_does_not_block_new_pending_completion(
         assert "未删除的副本和记录保留供重试" in confirmations[0][1]
         assert {batch.batch_id for batch in engine.list_batches()} == {first.batch_id}
         assert (old_backup / "unknown.txt").read_text() == "preserve unknown data"
-        assert tuple(target.glob(".obmanage-deploy-*.backup")) == (old_backup,)
+        assert tuple((state / "backups").glob(".obmanage-deploy-*.backup")) == (old_backup,)
         assert (target / ".obsidian/config.json").read_text() == "second"
         assert (target / ".obsidian/later.json").read_text() == "keep later content"
         assert not window._recovery_page_keys()
@@ -1259,7 +1370,7 @@ def test_transaction_selection_automatically_inspects_selected_batch(application
             assert not page.details_button.isChecked()
         assert {batch.batch_id: batch.revision for batch in engine.list_batches()} == revisions
         assert (target / ".obsidian/config.json").read_text() == "second"
-        assert len(tuple(target.glob(".obmanage-deploy-*.backup"))) == 2
+        assert len(tuple((state / "backups").glob(".obmanage-deploy-*.backup"))) == 2
     finally:
         dispose(application, window)
 
@@ -1350,7 +1461,7 @@ def test_mixed_transactions_share_one_selector_and_clear_action(
         assert not window.busy
         assert len(deployment.list_batches()) == 1
         assert len(trash.list_operations()) == 2
-        assert tuple(target.glob(".obmanage-deploy-*.backup"))
+        assert tuple((state / "backups").glob(".obmanage-deploy-*.backup"))
         page.selector.setCurrentIndex(page.selector.findData(f"deploy:{plan.batch_id}"))
         wait_until(application, lambda: not window.busy and controller.recovery_preview is not None)
         page.selector.setCurrentIndex(page.selector.findData(f"trash:{operations[0][0]}"))
@@ -1371,6 +1482,7 @@ def test_mixed_transactions_share_one_selector_and_clear_action(
         assert "全部 3 条" in confirmations[0][1]
         assert not deployment.list_batches()
         assert not tuple(target.glob(".obmanage-deploy-*.backup"))
+        assert not tuple((state / "backups").glob("*.backup"))
         for identifier, backup, _ in operations:
             assert not backup.exists()
             assert identifier in confirmations[0][2]

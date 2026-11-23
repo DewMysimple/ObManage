@@ -81,6 +81,8 @@ from .pages.logs import OperationLogDialog
 from .operation_log import append_entry, new_entry, read_entries
 
 
+BACKUP_MAINTENANCE_INTERVAL_SECONDS = 60 * 60
+
 ACTION_NAMES = {
     "add": "新增文件",
     "update": "更新文件",
@@ -432,8 +434,6 @@ QPushButton#TextButton { background: transparent; border-color: transparent; col
 QPushButton#TextButton:hover { color: #274E69; background: #E9EEEF; }
 QPushButton[pathAction="true"] { min-height: 26px; padding: 1px 11px; }
 QPushButton#Cancel { color: #A04F44; }
-QPushButton#Recovery { color: #8B642D; border-color: #DEC9A7; background: #FFF9EE; }
-QPushButton#Recovery:hover { background: #F8EDD9; border-color: #CFB27E; }
 QCheckBox { spacing: 8px; }
 QTabBar { background: transparent; }
 QTabBar::tab { color: #78868D; background: transparent; padding: 9px 13px 8px; border-bottom: 2px solid transparent; font-size: 12px; }
@@ -495,6 +495,7 @@ class MainWindow(QMainWindow):
         self._log_context = None
         self._log_entries = []
         self._log_issues = []
+        self._next_backup_maintenance = time.monotonic()
         self._load_log()
 
         self.setWindowTitle("ObManage · Obsidian 仓库管理")
@@ -567,13 +568,6 @@ class MainWindow(QMainWindow):
             nav_layout.addWidget(button)
             button.clicked.connect(lambda checked=False, key=feature.key: self._show_page(key))
         nav_layout.addStretch()
-        self.nav_recovery_button = QPushButton("待恢复事务")
-        self.nav_recovery_button.setObjectName("Recovery")
-        self.nav_recovery_button.setToolTip(
-            "有写操作尚未确认、撤销或安全清理；点击进入处理页面。"
-        )
-        self.nav_recovery_button.hide()
-        nav_layout.addWidget(self.nav_recovery_button)
         self.nav_cancel_button = QPushButton("取消当前任务")
         self.nav_cancel_button.setObjectName("Cancel")
         self.nav_cancel_button.hide()
@@ -939,7 +933,11 @@ class MainWindow(QMainWindow):
                     self.settings.local_path,
                 )
             elif feature.key == "transactions":
-                page = TransactionsPage(self.state_dir, self.pages["comsync"], self.pages["trash_cleanup"])
+                page = TransactionsPage(
+                    self.state_dir, self.pages["comsync"], self.pages["trash_cleanup"],
+                    self.settings_document.features.get(feature.key, {}),
+                )
+                page.backup_retention_requested.connect(self._apply_backup_retention)
             elif feature.key == "trash_cleanup":
                 page = TrashCleanupPage(
                     self.state_dir,
@@ -1020,6 +1018,24 @@ class MainWindow(QMainWindow):
     def _queue_settings_save(self) -> None:
         if hasattr(self, "_save_timer"):
             self._save_timer.start()
+
+    @Slot(int)
+    def _apply_backup_retention(self, days: int) -> None:
+        if self.busy or self._exit_requested:
+            return
+        page = self.pages["transactions"]
+        previous = page.backup_retention_days
+        page.backup_retention_days = days or None
+        if not self._persist():
+            page.backup_retention_days = previous
+            self.settings_document.features[page.page_key] = page.settings_payload()
+            page.set_status("自动清理设置保存失败，仍使用上次设置。", "error")
+        else:
+            message = f"已启用部署备份自动清理，保留 {days} 天。" if days else "已关闭部署备份自动清理。"
+            page.set_status(message, "success")
+            self._log(message, feature=page.page_key, event="备份设置", task="")
+            self._next_backup_maintenance = time.monotonic()
+        page.refresh_actions()
 
     def _configured_repository_paths(self) -> tuple[str, ...]:
         roots = [*self._paths()]
@@ -1157,13 +1173,6 @@ class MainWindow(QMainWindow):
             and page.has_pending_recovery()
         )
 
-    @Slot()
-    def _show_first_recovery_page(self) -> None:
-        keys = self._recovery_page_keys()
-        if keys:
-            self._show_page("transactions")
-            self.page_containers["transactions"].verticalScrollBar().setValue(0)
-
     @Slot(object)
     def _on_feature_completed(self, outcome: tuple[str, Any]) -> None:
         self._feature_outcome = outcome
@@ -1175,12 +1184,14 @@ class MainWindow(QMainWindow):
         page = self._feature_page
         outcome = self._feature_outcome or ("error", "后台任务结束，但未返回结果。")
         log_context = self._log_context
+        kind = getattr(page, "_task_kind", "")
+        transactions = self.pages["transactions"]
         self._feature_worker = None
         self._feature_page = None
         self._feature_outcome = None
         if page is not None:
             if isinstance(page, VaultSelection):
-                self.pages["transactions"].refresh_records()
+                transactions.refresh_records()
                 if self._exit_requested:
                     page.dismiss()
                 if worker is not None and worker.cancel_event.is_set():
@@ -1192,8 +1203,11 @@ class MainWindow(QMainWindow):
             elif status == "cancelled":
                 self._log("管理任务已取消。", level="cancelled")
         self._end_log_task(log_context, outcome)
-        if not isinstance(page, VaultSelection) and page is not self.pages["transactions"]:
-            self.pages["transactions"].refresh_records()
+        if not isinstance(page, VaultSelection) and page is not transactions:
+            transactions.refresh_records()
+        if ((page is self.pages["comsync"] and kind in {"execute", "sync"})
+                or (page is transactions and kind == "rollback")):
+            self._next_backup_maintenance = time.monotonic()
         self._refresh_actions()
         if self._exit_requested:
             self._finish_exit()
@@ -1233,7 +1247,6 @@ class MainWindow(QMainWindow):
         self.sync_button.clicked.connect(self.start_sync)
         self.cancel_button.clicked.connect(self.cancel_operation)
         self.nav_cancel_button.clicked.connect(self.cancel_operation)
-        self.nav_recovery_button.clicked.connect(self._show_first_recovery_page)
         self.logs_button.clicked.connect(self.show_logs)
         self.filter_tabs.currentChanged.connect(self._change_filter)
         self.schedule_toggle.toggled.connect(self._schedule_changed)
@@ -1481,6 +1494,19 @@ class MainWindow(QMainWindow):
             else:
                 self.analyze(scheduled=True)
         self._refresh_schedule_controls()
+        self._maybe_maintain_backups()
+
+    def _maybe_maintain_backups(self) -> None:
+        now = time.monotonic()
+        if (now < self._next_backup_maintenance or self.busy or self._exit_requested
+                or QApplication.activeModalWidget() is not None):
+            return
+        page = self.pages["transactions"]
+        if page._clear_preview is not None:
+            return
+        self._next_backup_maintenance = now + BACKUP_MAINTENANCE_INTERVAL_SECONDS
+        if page.has_deployment_records() and not self._state_location_error():
+            page.start_backup_maintenance()
 
     def _refresh_actions(self) -> None:
         available = not self.busy and not self._exit_requested
@@ -1512,7 +1538,10 @@ class MainWindow(QMainWindow):
             and not recovery_pending
             and not input_error
         )
-        self.sync_button.setToolTip(input_error or f"仅修改 {target}；{source} 只读取。")
+        if recovery_pending:
+            self.sync_button.setToolTip("请在事务处理页处理待确认或待恢复的事务后再同步。")
+        else:
+            self.sync_button.setToolTip(input_error or f"仅修改 {target}；{source} 只读取。")
         cancel_sent = (
             self._feature_worker.cancel_event.is_set()
             if self._feature_worker is not None else self._cancel_event.is_set()
@@ -1528,8 +1557,6 @@ class MainWindow(QMainWindow):
         )
         self.nav_cancel_button.setVisible(cancellable)
         self.nav_cancel_button.setEnabled(cancellable and not cancel_sent and not self._exit_requested)
-        self.nav_recovery_button.setVisible(recovery_pending)
-        self.nav_recovery_button.setText("待恢复事务")
         self.tray_sync_action.setEnabled(available and state_location_safe)
         for key, page in self.pages.items():
             if key != "mirror" and isinstance(page, FeaturePage):
@@ -1915,7 +1942,7 @@ class MainWindow(QMainWindow):
                   "scan": "扫描", "rollback": "回退", "finalize": "清理事务备份", "clear": "清理",
                   "inspect_recovery": "检查恢复方案", "resolve": "保留现状结束事务",
                   "restore": "恢复", "statistics": "统计", "catalog": "读取仓库列表", "analyze_deep": "完整内容校验",
-                  "prepare_clear": "检查完成范围", "clear_all": "确认完成"}
+                  "prepare_clear": "检查完成范围", "clear_all": "确认完成", "maintain_backups": "整理部署备份"}
         event = events.get(kind, kind or "任务")
         self._log_context = (feature, event, uuid.uuid4().hex)
         self._log("任务开始。")

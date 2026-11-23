@@ -2,19 +2,22 @@
 from pathlib import Path
 
 from PySide6.QtCore import QSignalBlocker, QTimer, Qt, Signal
-from PySide6.QtWidgets import QComboBox, QHBoxLayout, QLabel, QMessageBox, QPushButton
+from PySide6.QtWidgets import QComboBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QSpinBox
 
 from .common import FeaturePage, format_bytes, panel
 from .controls import DropDownCombo
-from ..management.deployment import TERMINAL_BATCH_STATUSES
-from ..management.transactions import complete_transactions, inspect_transaction_completion
+from ..management.deployment import MAX_BACKUP_RETENTION_DAYS, TERMINAL_BATCH_STATUSES, managed_backup_dir
+from ..management.transactions import (
+    complete_transactions, inspect_transaction_completion, maintain_transaction_backups,
+)
 
 
 class TransactionsPage(FeaturePage):
     page_key = "transactions"
     records_changed = Signal()
+    backup_retention_requested = Signal(int)
 
-    def __init__(self, state_dir: Path, distribution, trash):
+    def __init__(self, state_dir: Path, distribution, trash, settings):
         super().__init__("事务处理", "确认完成会保留仓库现状并清理事务副本和记录；确认回退会恢复旧内容。")
         self.state_dir = state_dir
         self.owners = (distribution, trash)
@@ -23,6 +26,7 @@ class TransactionsPage(FeaturePage):
         self._confirmation_revision = 0
         self._inspection_pending = False
         self._inspection_status = None
+        self._maintenance_status = None
         self._selecting = False
         self._clear_preview = None
         self._clear_revision = 0
@@ -94,9 +98,67 @@ class TransactionsPage(FeaturePage):
         self.body.addWidget(self.empty_label)
         self.refresh_button = QPushButton("刷新事务列表")
         self.body.addWidget(self.refresh_button)
+        self._build_backup_settings(settings)
         self.body.addStretch()
         self.refresh_button.clicked.connect(self.refresh_records)
         self.refresh_records()
+
+    def _build_backup_settings(self, settings):
+        days = settings.get("backup_retention_days")
+        self.backup_retention_days = days if type(days) is int and 1 <= days <= MAX_BACKUP_RETENTION_DAYS else None
+        _, layout = panel(self.body)
+        title = QLabel("部署备份")
+        title.setObjectName("SectionTitle")
+        layout.addWidget(title)
+
+        location_row = QHBoxLayout()
+        location_label = QLabel("备份目录")
+        self.backup_directory = QLineEdit(str(managed_backup_dir(self.state_dir)))
+        self.backup_directory.setReadOnly(True)
+        self.backup_directory.setToolTip(self.backup_directory.text())
+        self.backup_directory.setAccessibleName(location_label.text())
+        location_row.addWidget(location_label)
+        location_row.addWidget(self.backup_directory, 1)
+        layout.addLayout(location_row)
+
+        retention_row = QHBoxLayout()
+        retention_label = QLabel("自动清理保留期限")
+        self.backup_retention_spin = QSpinBox()
+        self.backup_retention_spin.setRange(0, MAX_BACKUP_RETENTION_DAYS)
+        self.backup_retention_spin.setSpecialValueText("关闭")
+        self.backup_retention_spin.setSuffix(" 天")
+        self.backup_retention_spin.setValue(self.backup_retention_days or 0)
+        self.backup_retention_spin.setAccessibleName(retention_label.text())
+        self.backup_retention_apply = QPushButton("应用")
+        self.backup_retention_apply.setAccessibleName("应用自动清理保留期限")
+        self.backup_retention_apply.clicked.connect(
+            lambda: self.backup_retention_requested.emit(self.backup_retention_spin.value()))
+        self.backup_retention_spin.valueChanged.connect(self.refresh_actions)
+        retention_row.addWidget(retention_label)
+        retention_row.addWidget(self.backup_retention_spin)
+        retention_row.addWidget(self.backup_retention_apply)
+        retention_row.addStretch()
+        layout.addLayout(retention_row)
+
+        note = QLabel("启用后，程序运行时将删除到期的已成功同步或已结束的部署备份（含回退保全副本）。"
+                      "删除后无法取回副本或用它回退。")
+        note.setObjectName("Muted")
+        note.setWordWrap(True)
+        layout.addWidget(note)
+
+    def settings_payload(self) -> dict[str, int | None]:
+        return {"backup_retention_days": self.backup_retention_days}
+
+    def has_deployment_records(self) -> bool:
+        return bool(self.distribution._batches)
+
+    def start_backup_maintenance(self) -> None:
+        state_dir, retention_days = self.state_dir, self.backup_retention_days
+        self._maintenance_status = (self.status_label.text(), self._status_kind)
+        self.start_task("maintain_backups", lambda cancel, progress:
+                        maintain_transaction_backups(state_dir, retention_days, cancel, progress))
+        if self._task_active:
+            self.set_status("正在整理部署备份…", "busy")
 
     def showEvent(self, event):
         super().showEvent(event)
@@ -212,12 +274,28 @@ class TransactionsPage(FeaturePage):
 
     def task_cancellable(self):
         return (self._delegate.task_cancellable() if self._delegate is not None
-                else self._task_active and self._task_kind in {"prepare_clear", "clear_all"})
+                else self._task_active and self._task_kind in {"prepare_clear", "clear_all", "maintain_backups"})
 
     def task_finished(self, status, payload):
         owner, kind = self._delegate, self._task_kind
         super().task_finished(status, payload)
         self._delegate = None
+        if kind == "maintain_backups":
+            self._task_kind = ""
+            if status == "ok":
+                if payload.moved or payload.removed or payload.errors:
+                    self.set_status(f"部署备份整理完成。已迁移 {payload.moved} 份副本，已清理 {payload.removed} 条到期事务。"
+                                    + (" " + "；".join(payload.errors) if payload.errors else ""),
+                                    "warning" if payload.errors else "success")
+                    self.message_logged.emit(self.status_label.text())
+                    self.refresh_records()
+                elif self._maintenance_status:
+                    self.set_status(*self._maintenance_status)
+            else:
+                self.refresh_records()
+            self._maintenance_status = None
+            self.refresh_actions()
+            return
         if kind == "prepare_clear":
             self._task_kind = ""
             if status == "ok" and self._clear_revision == self._confirmation_revision:
@@ -370,6 +448,9 @@ class TransactionsPage(FeaturePage):
         preview, batch = owner.recovery_preview, owner.current_batch
         operation = trash.current_operation if kind == "trash" else None
         available = not self._global_busy and not self._task_active
+        self.backup_retention_spin.setEnabled(available)
+        self.backup_retention_apply.setEnabled(
+            available and self.backup_retention_spin.value() != (self.backup_retention_days or 0))
         ended = kind == "deploy" and batch is not None and batch.status in TERMINAL_BATCH_STATUSES
         clearable = bool(trash._operations) or bool(owner._batches)
         inspected = (kind == "deploy" and preview is not None and batch is not None

@@ -180,7 +180,9 @@ def test_new_directory_receiving_user_content_blocks_rollback_without_deleting_i
     recovered = engine.rollback(plan.batch_id, preview=preview)
     assert recovered.success, recovered.errors
     note = next(item for item in engine.get_batch(plan.batch_id).targets if item.component_id == "file_note")
-    assert (Path(note.rollback_path) / "user.md").read_text() == "keep"
+    preserved = state / "backups" / Path(note.rollback_path).name
+    assert (preserved / "user.md").read_text() == "keep"
+    assert not Path(note.rollback_path).exists()
     assert not (second / "File/Note").exists()
 
 

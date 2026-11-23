@@ -36,6 +36,10 @@ def tree_bytes(root: Path) -> dict[str, bytes]:
             for path in root.rglob("*") if path.is_file()}
 
 
+def managed_backup(state: Path, record) -> Path:
+    return state / "backups" / Path(record.backup_path).name
+
+
 def overwrite_journal(state: Path, batch_id: str, change) -> None:
     path = state / "deployment-journal" / f"{batch_id}.json"
     value = json.loads(path.read_text(encoding="utf-8"))
@@ -124,7 +128,8 @@ def test_successful_deployment_can_be_rolled_back_from_new_instance(layout):
     stored = DeploymentEngine(state).get_batch(plan.batch_id)
     assert stored.status == "committed"
     assert stored.targets[0].backup_path
-    assert Path(stored.targets[0].backup_path).exists()
+    assert managed_backup(state, stored.targets[0]).exists()
+    assert not Path(stored.targets[0].backup_path).exists()
 
     rollback = DeploymentEngine(state).rollback(plan.batch_id)
 
@@ -164,7 +169,7 @@ def test_finalize_from_new_instance_keeps_deployment_and_removes_only_backup(lay
     plan = DeploymentEngine(state).analyze(request_for(source, [("a", vault_a)]))
     assert DeploymentEngine(state).execute(plan).success
     stored = DeploymentEngine(state).get_batch(plan.batch_id)
-    backup = Path(stored.targets[0].backup_path or "")
+    backup = managed_backup(state, stored.targets[0])
 
     result = DeploymentEngine(state).finalize(plan.batch_id)
 
@@ -184,7 +189,7 @@ def test_finalize_refuses_missing_live_deployment_and_preserves_backup(layout, r
     assert engine.execute(plan).success
     stored = engine.get_batch(plan.batch_id)
     target_record = stored.targets[0]
-    backup = Path(target_record.backup_path or "")
+    backup = managed_backup(state, target_record)
     if retrying:
         engine.journal.set_batch(plan.batch_id, status="finalizing")
         engine.journal.set_target(
@@ -409,14 +414,15 @@ def test_rollback_refuses_to_remove_deployment_when_backup_is_not_verified(layou
     plan = engine.analyze(request_for(source, [("a", vault_a)]))
     assert engine.execute(plan).success
     record = engine.get_batch(plan.batch_id).targets[0]
-    put(Path(record.backup_path or ""), "old.txt", b"corrupt backup")
+    backup = managed_backup(state, record)
+    put(backup, "old.txt", b"corrupt backup")
     deployed_before = tree_bytes(vault_a / "Config")
 
     result = DeploymentEngine(state).rollback(plan.batch_id)
 
     assert result.status == "failed"
     assert tree_bytes(vault_a / "Config") == deployed_before
-    assert Path(record.backup_path or "").exists()
+    assert backup.exists()
 
 
 def test_finalize_refuses_changed_backup_and_never_touches_deployed_target(layout):
@@ -427,13 +433,14 @@ def test_finalize_refuses_changed_backup_and_never_touches_deployed_target(layou
     plan = engine.analyze(request_for(source, [("a", vault_a)]))
     assert engine.execute(plan).success
     record = engine.get_batch(plan.batch_id).targets[0]
-    put(Path(record.backup_path or ""), "unexpected.txt", b"do not delete")
+    backup = managed_backup(state, record)
+    put(backup, "unexpected.txt", b"do not delete")
 
     result = DeploymentEngine(state).finalize(plan.batch_id)
 
     assert result.status == "failed"
     assert tree_bytes(vault_a / "Config") == {"new.txt": b"new"}
-    assert Path(record.backup_path or "").exists()
+    assert backup.exists()
 
 
 def test_finalize_cleans_verified_windows_readonly_backup(layout):
@@ -444,14 +451,15 @@ def test_finalize_cleans_verified_windows_readonly_backup(layout):
     plan = engine.analyze(request_for(source, [("a", vault_a)]))
     assert engine.execute(plan).success
     record = engine.get_batch(plan.batch_id).targets[0]
-    backup_file = Path(record.backup_path or "") / "old.txt"
+    backup = managed_backup(state, record)
+    backup_file = backup / "old.txt"
     os.chmod(backup_file, stat.S_IREAD)
 
     result = DeploymentEngine(state).finalize(plan.batch_id)
 
     assert result.success
     assert tree_bytes(vault_a / "Config") == {"new.txt": b"new"}
-    assert not Path(record.backup_path or "").exists()
+    assert not backup.exists()
 
 
 def test_rollback_cleans_verified_windows_readonly_deployment(layout):
@@ -552,7 +560,7 @@ def test_tampered_journal_target_cannot_escape_root_or_touch_canary(layout, monk
     plan = engine.analyze(request_for(source, [("a", vault_a)]))
     assert engine.execute(plan).success
     record = engine.get_batch(plan.batch_id).targets[0]
-    backup = Path(record.backup_path or "")
+    backup = managed_backup(state, record)
     overwrite_journal(
         state, plan.batch_id,
         lambda value: value["targets"][0].update(target_path=str(canary)),
@@ -707,6 +715,9 @@ def test_authenticated_grant_rejects_consistent_journal_forgery_before_source_re
             "backup_identity": None,
             "rollback_path": None,
             "rollback_identity": None,
+            "managed_backup": None,
+            "managed_rollback": None,
+            "restore_identity": None,
             "deployed_identity": list(source_identity),
             "original_identity": None,
             "source_manifest": source_manifest,
@@ -986,7 +997,7 @@ def test_valid_but_inconsistent_terminal_state_tamper_cannot_skip_rollback(
     engine = DeploymentEngine(state)
     plan = engine.analyze(request_for(source, [("a", vault_a)]))
     assert engine.execute(plan).success
-    backup = Path(engine.get_batch(plan.batch_id).targets[0].backup_path or "")
+    backup = managed_backup(state, engine.get_batch(plan.batch_id).targets[0])
 
     def corrupt(document):
         if field == "status":
@@ -1009,10 +1020,10 @@ def test_single_dynamic_identity_tamper_fails_whole_record_authentication(layout
     engine = DeploymentEngine(state)
     plan = engine.analyze(request_for(source, [("a", vault_a)]))
     assert engine.execute(plan).success
-    backup = Path(engine.get_batch(plan.batch_id).targets[0].backup_path or "")
+    backup = managed_backup(state, engine.get_batch(plan.batch_id).targets[0])
 
     def corrupt(document):
-        identity_value = document["targets"][0]["backup_identity"]
+        identity_value = document["targets"][0]["managed_backup"]["identity"]
         identity_value[2] += 1
 
     overwrite_journal(state, plan.batch_id, corrupt)
@@ -1060,8 +1071,8 @@ def test_owned_path_must_equal_exact_deterministic_name(layout):
     plan = engine.analyze(request_for(source, [("a", vault_a)]))
     assert engine.execute(plan).success
     record = engine.get_batch(plan.batch_id).targets[0]
-    backup = Path(record.backup_path or "")
-    decoy = backup.with_name(backup.name.removesuffix(".backup") + ".user-data.backup")
+    backup = managed_backup(state, record)
+    decoy = vault_a / (backup.name.removesuffix(".backup") + ".user-data.backup")
     shutil.copytree(backup, decoy)
     decoy_identity = deployment.identity(deployment.snapshot(str(decoy)))
     engine.journal.set_target(
@@ -1085,7 +1096,7 @@ def test_unknown_added_after_cleanup_manifest_check_is_never_deleted(layout, mon
     engine = DeploymentEngine(state)
     plan = engine.analyze(request_for(source, [("a", vault_a)]))
     assert engine.execute(plan).success
-    backup = Path(engine.get_batch(plan.batch_id).targets[0].backup_path or "")
+    backup = managed_backup(state, engine.get_batch(plan.batch_id).targets[0])
     original_scan = deployment._scan_tree
     backup_key = os.path.normcase(str(backup.resolve()))
     backup_scans = 0

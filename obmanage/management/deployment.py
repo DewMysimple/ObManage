@@ -2,10 +2,9 @@
 
 This module replaces the legacy "delete then copytree" scripts with a planned
 multi-target transaction.  Every selected target is staged and SHA-256 checked
-on its own volume before the first target is switched.  Directory renames keep
-the old target available as a durable backup until the caller explicitly calls
-``finalize``; ``rollback`` is available from a new engine instance through the
-persistent journal.
+on its own volume before the first target is switched. Old trees are kept in
+program-managed storage after the switch. The persistent journal binds both
+the managed copies and any temporary same-volume directories.
 """
 from __future__ import annotations
 
@@ -27,11 +26,11 @@ from typing import Any, Callable, Iterable
 
 from ..copying import copy_stream_and_hash
 from ..reading import ReadScope, hash_stream
-from ..models import SyncCancelled, SyncError
+from ..models import Progress, SyncCancelled, SyncError
 from ..paths import (assert_plain_chain, canonical, checked_child, identity, native,
                      snapshot, volume_identity)
 from .journal import (DeploymentJournal, JournalBatch, JournalError, JournalTarget,
-                      OwnedDirectory)
+                      ManagedCopy, OwnedDirectory)
 
 
 _DEPLOYMENT_TASK_LOCK = threading.Lock()
@@ -45,6 +44,8 @@ TERMINAL_BATCH_STATUSES = frozenset({
     "cancelled", "prepare_failed", "rolled_back",
     "rolled_back_with_residuals", "finalized", "resolved", "discarded",
 })
+_ARCHIVABLE_BATCH_STATUSES = TERMINAL_BATCH_STATUSES | {"committed"}
+MAX_BACKUP_RETENTION_DAYS = 36_500
 
 
 def _deployment_mutex_name(key: str) -> str:
@@ -904,6 +905,52 @@ def _manifest_tree(root: str, cancel: threading.Event | None = None) -> tuple[
     return tree.manifest(), tree.root_snapshot.identity
 
 
+def _assert_no_named_streams(tree: FrozenTree) -> None:
+    """Portable manifests cover the unnamed data stream only."""
+    if os.name != "nt":
+        return
+    import ctypes
+    from ctypes import wintypes
+
+    class StreamData(ctypes.Structure):
+        _fields_ = [("size", ctypes.c_longlong), ("name", wintypes.WCHAR * 296)]
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    first, next_stream, close = kernel.FindFirstStreamW, kernel.FindNextStreamW, kernel.FindClose
+    first.argtypes = [wintypes.LPCWSTR, ctypes.c_int, ctypes.POINTER(StreamData), wintypes.DWORD]
+    first.restype = wintypes.HANDLE
+    next_stream.argtypes = [wintypes.HANDLE, ctypes.POINTER(StreamData)]
+    next_stream.restype = wintypes.BOOL
+    close.argtypes = [wintypes.HANDLE]
+    close.restype = wintypes.BOOL
+    invalid_handle = ctypes.c_void_p(-1).value
+    for relative_path in ("", *(entry.relative_path for entry in tree.entries)):
+        path = checked_child(tree.root, relative_path) if relative_path else tree.root
+        stream = StreamData()
+        handle = first(native(path), 0, ctypes.byref(stream), 0)
+        if handle == invalid_handle:
+            error = ctypes.get_last_error()
+            if error in (38, 87):  # No streams, or filesystem does not support them.
+                continue
+            raise ctypes.WinError(error)
+        try:
+            if stream.name != "::$DATA" or next_stream(handle, ctypes.byref(stream)):
+                raise DeploymentError(f"副本包含清单无法核验的备用数据流，已保留：{path}")
+            error = ctypes.get_last_error()
+            if error != 38:
+                raise ctypes.WinError(error)
+        finally:
+            close(handle)
+
+
+def _assert_portable_copy(tree: FrozenTree) -> None:
+    _assert_no_named_streams(tree)
+    for entry in tree.files:
+        path = checked_child(tree.root, entry.relative_path)
+        if not _owned_file_stat_matches(os.lstat(native(path)), entry.snapshot):
+            raise DeploymentError(f"副本文件已改变或含多重硬链接，无法安全跨卷保留：{path}")
+
+
 def _assert_manifest(root: str, expected: dict[str, dict[str, Any]],
                      expected_identity: tuple[str, int, int] | None,
                      description: str, *, allow_subset: bool = False,
@@ -1058,6 +1105,17 @@ def _rmdir_owned(path: str, expected_identity: tuple[str, int, int] | None) -> N
 
 def _rename_directory(source: str, target: str) -> None:
     os.rename(native(source), native(target))
+
+
+def managed_backup_dir(state_dir: str | Path) -> Path:
+    return Path(state_dir) / "backups"
+
+
+@dataclass(frozen=True)
+class BackupMaintenanceResult:
+    moved: int = 0
+    removed: int = 0
+    errors: tuple[str, ...] = ()
 
 
 class DeploymentEngine:
@@ -1317,16 +1375,42 @@ class DeploymentEngine:
                 raise DeploymentError(f"目标子树在预览后发生变化：{current_path}")
 
     def _stage_name(self, plan: DeploymentPlan, item: DeploymentTargetPlan, suffix: str) -> str:
-        short_batch = plan.batch_id.replace("-", "")
-        short_selection = item.selection_id.replace("-", "")
-        return canonical(os.path.join(
-            item.target_root, f"{_OWNED_PREFIX}{short_batch}-{short_selection}.{suffix}"
-        ))
+        return self._copy_path(item.target_root, plan.batch_id, item.selection_id, suffix)
+
+    @staticmethod
+    def _copy_path(root: str | Path, batch_id: str, selection_id: str, suffix: str) -> str:
+        name = f"{_OWNED_PREFIX}{batch_id.replace('-', '')}-{selection_id.replace('-', '')}.{suffix}"
+        return canonical(os.path.join(root, name))
+
+    def _managed_path(self, batch: JournalBatch, target: JournalTarget, suffix: str) -> str:
+        return self._copy_path(managed_backup_dir(self.state_dir), batch.batch_id, target.selection_id, suffix)
+
+    def _restore_path(self, batch: JournalBatch, target: JournalTarget) -> str:
+        return self._copy_path(target.target_root, batch.batch_id, target.selection_id, "restore")
 
     def _copy_to_stage(self, plan: DeploymentPlan, item: DeploymentTargetPlan, stage: str,
                        cancel: threading.Event | None, progress: ProgressCallback) -> None:
-        directories = [entry for entry in item.source_tree.entries if entry.snapshot.kind == "dir"]
-        files = [entry for entry in item.source_tree.entries if entry.snapshot.kind == "file"]
+        total_bytes, total_files = item.source_tree.total_bytes, len(item.source_tree.files)
+
+        def notify(relative: str, number: int, completed_bytes: int) -> None:
+            _emit(progress, "stage", batch_id=plan.batch_id,
+                  selection_id=item.selection_id, component_id=item.component_id,
+                  target_id=item.target_id, relative_path=relative,
+                  completed_files=number, total_files=total_files,
+                  completed_bytes=completed_bytes, total_bytes=total_bytes,
+                  message="已暂存，正在准备整体验证")
+
+        self._copy_frozen_tree(item.source_tree, stage, cancel, notify if progress else None)
+        _emit(progress, "stage", batch_id=plan.batch_id,
+              selection_id=item.selection_id, component_id=item.component_id,
+              target_id=item.target_id, completed_files=total_files, total_files=total_files,
+              completed_bytes=total_bytes, total_bytes=total_bytes,
+              message="暂存目录已完成 SHA-256 整体验证")
+
+    def _copy_frozen_tree(self, tree: FrozenTree, stage: str, cancel: threading.Event | None,
+                          notify: Callable[[str, int, int], None] | None = None, *,
+                          durable: bool = False) -> None:
+        directories = [entry for entry in tree.entries if entry.snapshot.kind == "dir"]
         for entry in sorted(directories, key=lambda value: (value.relative_path.count("/"),
                                                              _case_key(value.relative_path))):
             _cancelled(cancel)
@@ -1335,10 +1419,9 @@ class DeploymentEngine:
                 raise DeploymentError(f"暂存目录出现意外项目：{destination}")
             os.mkdir(native(destination))
         completed_bytes = 0
-        total_bytes = item.source_tree.total_bytes
-        for number, entry in enumerate(files, 1):
+        for number, entry in enumerate(tree.files, 1):
             _cancelled(cancel)
-            source = checked_child(item.source_path, entry.relative_path)
+            source = checked_child(tree.root, entry.relative_path)
             destination = checked_child(stage, entry.relative_path)
             if not _entry_matches(_entry_state(source), entry.snapshot):
                 raise DeploymentError(f"暂存前来源文件已改变：{entry.relative_path}")
@@ -1357,6 +1440,9 @@ class DeploymentEngine:
                             entry.snapshot.size,
                             check_cancel=lambda: _cancelled(cancel),
                         )
+                        if durable:
+                            output_stream.flush()
+                            os.fsync(output_stream.fileno())
                     finished = os.fstat(input_stream.fileno())
                     if (finished.st_size, finished.st_mtime_ns,
                             finished.st_ino, finished.st_dev) != expected_tuple:
@@ -1375,25 +1461,15 @@ class DeploymentEngine:
             if not _entry_matches(_entry_state(source), entry.snapshot):
                 raise DeploymentError(f"暂存后来源文件已改变：{entry.relative_path}")
             completed_bytes += copied
-            _emit(progress, "stage", batch_id=plan.batch_id,
-                  selection_id=item.selection_id, component_id=item.component_id,
-                  target_id=item.target_id, relative_path=entry.relative_path,
-                  completed_files=number, total_files=len(files),
-                  completed_bytes=completed_bytes, total_bytes=total_bytes,
-                  message="已暂存，正在准备整体验证")
+            if notify:
+                notify(entry.relative_path, number, completed_bytes)
         # One stable whole-tree pass verifies every staged byte and the final
         # directory manifest.  A second per-file target hash immediately before
         # this pass read every staged file twice without strengthening the
         # transaction boundary.
         manifest, _ = _manifest_tree(stage, cancel)
-        if manifest != item.source_tree.manifest():
-            raise DeploymentError(f"目标卷暂存目录校验不一致：{item.target_id}")
-        _emit(progress, "stage", batch_id=plan.batch_id,
-              selection_id=item.selection_id, component_id=item.component_id,
-              target_id=item.target_id, completed_files=len(files),
-              total_files=len(files), completed_bytes=completed_bytes,
-              total_bytes=total_bytes,
-              message="暂存目录已完成 SHA-256 整体验证")
+        if manifest != tree.manifest():
+            raise DeploymentError(f"暂存目录校验不一致：{stage}")
 
     def _cleanup_stage(self, batch_id: str, record: JournalTarget) -> None:
         if not record.stage_path or snapshot(record.stage_path) is None:
@@ -1402,6 +1478,229 @@ class DeploymentEngine:
         _remove_owned_tree(record.stage_path, record.deployed_manifest,
                            record.stage_identity, "暂存目录", allow_subset=True,
                            allow_incomplete_files=True)
+
+    def _archive_copy(self, batch: JournalBatch, target: JournalTarget, suffix: str,
+                      cancel: threading.Event | None) -> bool:
+        if suffix == "backup":
+            local, local_id, manifest = target.backup_path, target.backup_identity, target.original_manifest
+        else:
+            local, local_id, manifest = target.rollback_path, target.rollback_identity, target.preserved_manifest
+        if not local or not manifest or local_id is None:
+            return False
+        field = f"managed_{suffix}"
+        copy = getattr(target, field)
+        path = self._managed_path(batch, target, suffix)
+        self._assert_owned_path(batch.batch_id, target, local, suffix)
+        self._validate_target_disk(target)
+        local_exists = snapshot(local) is not None
+        if not local_exists and (copy is None or copy.ready):
+            return False
+        root = os.path.dirname(path)
+        assert_plain_chain(root)
+        root_state = snapshot(root)
+        if root_state is None:
+            os.mkdir(native(root))
+            root_state = snapshot(root)
+        assert_plain_chain(root)
+        if root_state is None or root_state["kind"] != "dir" or not root_state["inode"]:
+            raise DeploymentError("程序备份位置必须是普通目录。")
+        root_id = identity(root_state)
+        _cancelled(cancel)
+        if copy is None:
+            if snapshot(path) is not None:
+                raise DeploymentError(f"程序备份位置已被未登记内容占用：{path}")
+            tree = _assert_manifest(local, manifest, local_id, "待迁移副本")
+            same_volume = tree.volume == volume_identity(root)
+            if same_volume:
+                destination_id = local_id
+            else:
+                _assert_portable_copy(tree)
+                os.mkdir(native(path))
+                destination = _entry_state(path)
+                if destination is None or destination.kind != "dir":
+                    raise DeploymentError(f"无法核验新建的备份目录：{path}")
+                destination_id = destination.identity
+            copy = ManagedCopy(destination_id, False, batch.updated_at)
+            try:
+                self.journal.set_target(batch.batch_id, target.selection_id, **{field: copy})
+            except JournalError:
+                if not same_volume:
+                    _remove_owned_tree(path, {"": {"kind": "dir"}}, destination_id, "未登记的备份目录")
+                raise
+        if not copy.ready:
+            if local_exists and copy.identity == local_id:
+                if snapshot(path) is not None:
+                    raise DeploymentError(f"程序备份位置已被占用：{path}")
+                self._validate_target_disk(target)
+                _assert_manifest(local, manifest, local_id, "待迁移副本")
+                _cancelled(cancel)
+                _assert_identity(root, root_id, "程序备份目录")
+                _rename_directory(local, path)
+            elif local_exists:
+                # Retry a registered cross-volume copy. The source remains
+                # authoritative until the complete destination is verified.
+                tree = _assert_manifest(local, manifest, local_id, "待迁移副本")
+                _assert_portable_copy(tree)
+                staged = self._read_copy_stage(path, manifest, copy.identity, "未完成的程序备份")
+                if staged.manifest() != manifest:
+                    if staged.entries:
+                        self._reset_copy_stage(staged, manifest, "未完成的程序备份")
+                    self._copy_frozen_tree(tree, path, cancel, durable=True)
+                _assert_portable_copy(_assert_manifest(local, manifest, local_id, "迁移后原副本"))
+            _assert_manifest(path, manifest, copy.identity, "程序备份")
+            _assert_identity(root, root_id, "程序备份目录")
+            copy = replace(copy, ready=True)
+            self.journal.set_target(batch.batch_id, target.selection_id, **{field: copy})
+        if snapshot(local) is not None:
+            _cancelled(cancel)
+            _assert_manifest(path, manifest, copy.identity, "程序备份")
+            self._validate_target_disk(target)
+            _assert_identity(root, root_id, "程序备份目录")
+            observed = _assert_manifest(local, manifest, local_id, "原位置副本", allow_subset=True)
+            _assert_portable_copy(observed)
+            _remove_owned_tree(local, manifest, local_id, "原位置副本", allow_subset=True, observed=observed)
+        return True
+
+    @staticmethod
+    def _read_copy_stage(path: str, manifest: dict[str, dict[str, Any]], root_id: tuple,
+                         description: str) -> FrozenTree:
+        tree = _assert_manifest(path, manifest, root_id, description,
+                                allow_subset=True, allow_incomplete_files=True)
+        for entry in tree.files:
+            expected = manifest[entry.relative_path]
+            if (entry.snapshot.size >= expected["size"]
+                    and (entry.snapshot.size, entry.snapshot.sha256) != (expected["size"], expected["sha256"])):
+                raise DeploymentError(f"{description}包含改变的文件：{entry.relative_path}")
+        return tree
+
+    @classmethod
+    def _reset_copy_stage(cls, tree: FrozenTree, manifest: dict[str, dict[str, Any]], description: str) -> None:
+        # Keep the registered root identity stable over retries. Drop only
+        # entries seen under that root and authorized by the stage manifest.
+        actual = cls._read_copy_stage(tree.root, manifest, tree.root_snapshot.identity, description)
+        if not _tree_matches(actual, tree):
+            raise DeploymentError(f"{description}在重试前改变：{tree.root}")
+        for entry in actual.files:
+            path = checked_child(tree.root, entry.relative_path)
+            if not _entry_matches(_entry_state(path), entry.snapshot):
+                raise DeploymentError(f"{description}的文件在清理前改变：{path}")
+            _unlink_owned_file(path, entry.snapshot)
+        for entry in sorted(actual.entries, key=lambda item: -item.relative_path.count("/")):
+            if entry.snapshot.kind == "dir":
+                path = checked_child(tree.root, entry.relative_path)
+                _assert_identity(path, entry.snapshot.identity, description)
+                _rmdir_owned(path, entry.snapshot.identity)
+
+    def _archive_batch_locked(self, batch: JournalBatch, cancel: threading.Event | None
+                              ) -> BackupMaintenanceResult:
+        if batch.status not in _ARCHIVABLE_BATCH_STATUSES:
+            return BackupMaintenanceResult()
+        self._validate_record(batch, check_disk=False)
+        moved, errors = 0, []
+        for target in batch.targets:
+            for suffix in ("backup", "rollback"):
+                _cancelled(cancel)
+                try:
+                    moved += self._archive_copy(batch, target, suffix, cancel)
+                except SyncCancelled:
+                    raise
+                except (OSError, ValueError, SyncError) as exc:
+                    errors.append(f"备份迁移未完成（{batch.batch_id[:8]}）：{exc}")
+        return BackupMaintenanceResult(moved, errors=tuple(errors))
+
+    def _expire_backups_locked(self, batch: JournalBatch, cutoff: float,
+                               cancel: threading.Event) -> bool:
+        if batch.status not in _ARCHIVABLE_BATCH_STATUSES:
+            return False
+        copies = tuple(copy for target in batch.targets
+                       for copy in (target.managed_backup, target.managed_rollback) if copy is not None)
+        if not copies or any(not copy.ready or copy.retained_since > cutoff for copy in copies):
+            return False
+        self._validate_record(batch)
+        committed = batch.status == "committed"
+        candidates = []
+        for target in batch.targets:
+            _cancelled(cancel)
+            local_paths = [target.backup_path, target.stage_path, target.rollback_path]
+            if target.restore_identity:
+                local_paths.append(self._restore_path(batch, target))
+            # Retention only authorizes removal of the managed copies. A
+            # remaining repository artifact must go through migration or recovery.
+            if any(path and snapshot(path) is not None for path in local_paths):
+                return False
+            if committed and target.phase == "committed":
+                if target.original_manifest is not None and target.managed_backup is None:
+                    raise DeploymentError(f"到期事务缺少已登记的程序备份：{target.target_path}")
+            for label, path, manifest, root_id, _ in self._managed_copies(batch, target):
+                assert_plain_chain(os.path.dirname(path))
+                if snapshot(path) is None:
+                    if committed:
+                        raise DeploymentError(f"到期事务的程序备份已丢失：{path}")
+                    continue
+                tree = _assert_manifest(path, manifest, root_id, label, allow_subset=not committed)
+                _assert_no_named_streams(tree)
+                candidates.append((path, manifest, root_id, tree))
+        _cancelled(cancel)
+        if committed:
+            for target in batch.targets:
+                if target.phase == "committed":
+                    self._validate_target_disk(target)
+                    assert_plain_chain(target.target_path)
+                    deployed_id = target.deployed_identity or target.stage_identity
+                    if deployed_id is None:
+                        raise DeploymentError(f"无法核验到期事务的目标目录身份：{target.target_path}")
+                    _assert_identity(target.target_path, deployed_id, "到期事务的部署目录")
+            # Expiry opts in to ending verified, successfully installed
+            # batches. Record the end before removing the first undo copy.
+            self.journal.set_batch(batch.batch_id, status="resolved",
+                                   error="已达到用户设置的备份保留期限，结束本次已完成的部署。")
+        for path, manifest, root_id, tree in candidates:
+            _cancelled(cancel)
+            _remove_owned_tree(path, manifest, root_id, "已到期的程序备份", allow_subset=True,
+                               observed=tree)
+        for target in batch.targets:
+            for _, path, _, _, _ in self._managed_copies(batch, target):
+                if snapshot(path) is not None:
+                    raise DeploymentError(f"仍有事务副本，保留记录：{path}")
+        self.journal.discard(batch.batch_id)
+        return True
+
+    def maintain_backups(self, retention_days: int | None, cancel: threading.Event,
+                         progress: Callable[[Progress], None] | None = None) -> BackupMaintenanceResult:
+        if retention_days is not None and (type(retention_days) is not int
+                                           or not 1 <= retention_days <= MAX_BACKUP_RETENTION_DAYS):
+            raise ValueError("自动清理的保留天数无效。")
+        if not self._lock.acquire(blocking=False):
+            raise DeploymentError("已有仓库管理任务正在运行。")
+        moved, removed, errors = 0, 0, []
+        cutoff = time.time() - retention_days * 86_400 if retention_days is not None else None
+        try:
+            for batch in self.journal.list():
+                _cancelled(cancel)
+                if batch.status not in _ARCHIVABLE_BATCH_STATUSES:
+                    continue
+                locks = _InterprocessLockSet(self.state_dir, (t.target_root for t in batch.targets),
+                                             (root for t in batch.targets
+                                              for root in (t.source_path, t.source_authorization_root)))
+                try:
+                    locks.acquire()
+                    current = self.journal.get(batch.batch_id)
+                    archive = self._archive_batch_locked(current, cancel)
+                    moved += archive.moved
+                    errors.extend(archive.errors)
+                    if cutoff is not None and not archive.errors:
+                        removed += self._expire_backups_locked(self.journal.get(batch.batch_id), cutoff, cancel)
+                except SyncCancelled:
+                    raise
+                except (OSError, ValueError, SyncError) as exc:
+                    errors.append(f"备份维护未完成（{batch.batch_id[:8]}）：{exc}")
+                finally:
+                    locks.release()
+            if progress and (moved or removed):
+                progress(Progress("backup_maintenance", f"已集中保存 {moved} 份副本，清除 {removed} 条到期事务。"))
+            return BackupMaintenanceResult(moved, removed, tuple(errors))
+        finally:
+            self._lock.release()
 
     def _prepare(self, plan: DeploymentPlan, cancel: threading.Event | None,
                  progress: ProgressCallback) -> int:
@@ -1618,6 +1917,15 @@ class DeploymentEngine:
                 committed += 1
             self.journal.set_batch(plan.batch_id, status="committed")
             status = "success"
+            try:
+                # Publication of the deployed tree is already complete. A disk
+                # or storage fault here leaves an authenticated backup for retry.
+                migration = self._archive_batch_locked(self.journal.get(plan.batch_id), cancel)
+                errors.extend(migration.errors)
+            except SyncCancelled:
+                errors.append("备份迁移已暂停，已登记的副本将由下次维护继续处理。")
+            except (OSError, ValueError, SyncError) as exc:
+                errors.append(f"原副本保留，备份迁移将在下次维护重试：{exc}")
             _emit(progress, "done", batch_id=plan.batch_id,
                   completed_files=committed, total_files=prepared,
                   message="全部限定子树已部署；可确认保留或撤销本批次")
@@ -1714,13 +2022,16 @@ class DeploymentEngine:
         if (len(parts) != 1 or parts[0] in ("", ".", "..") or ":" in parts[0]
                 or _path_key(os.path.dirname(canonical_path)) != _path_key(target.target_root)):
             raise DeploymentError("事务日志中的暂存或备份路径越出目标仓库。")
-        expected_name = (
-            f"{_OWNED_PREFIX}{batch_id.replace('-', '')}-"
-            f"{target.selection_id.replace('-', '')}.{suffix}"
-        )
-        expected_path = canonical(os.path.join(target.target_root, expected_name))
+        expected_path = self._copy_path(target.target_root, batch_id, target.selection_id, suffix)
         if _path_key(canonical_path) != _path_key(expected_path):
             raise DeploymentError("事务日志中的暂存或备份路径名称无效。")
+
+    @staticmethod
+    def _validate_target_disk(target: JournalTarget) -> None:
+        assert_plain_chain(target.target_root)
+        if volume_identity(target.target_root) != target.target_volume:
+            raise DeploymentError(f"目标磁盘身份已改变：{target.target_root}")
+        _assert_identity(target.target_root, target.target_root_identity, "目标仓库")
 
     def _validate_record(self, batch: JournalBatch, *, check_disk: bool = True) -> None:
         sources = tuple(
@@ -1773,10 +2084,7 @@ class DeploymentEngine:
                 seen_parents.add(parent_key)
                 previous_depth = len(parent_parts)
             if check_disk:
-                assert_plain_chain(target.target_root)
-                if volume_identity(target.target_root) != target.target_volume:
-                    raise DeploymentError(f"目标磁盘身份已改变：{target.target_root}")
-                _assert_identity(target.target_root, target.target_root_identity, "目标仓库")
+                self._validate_target_disk(target)
             for path, suffix in ((target.stage_path, "stage"),
                                  (target.backup_path, "backup"),
                                  (target.rollback_path, "rollback")):
@@ -1803,7 +2111,7 @@ class DeploymentEngine:
             return "missing"
         manifest, root_identity = tree.manifest(), tree.root_snapshot.identity
         if (target.original_manifest is not None and manifest == target.original_manifest
-                and (target.original_identity is None or root_identity == target.original_identity)):
+                and root_identity in (target.original_identity, target.restore_identity)):
             return "original"
         expected_deployed_identity = target.deployed_identity or target.stage_identity
         if (manifest == target.deployed_manifest and
@@ -1841,24 +2149,18 @@ class DeploymentEngine:
                 details.append(f"{target.target_path}\n  {label}；阶段：{target.phase}")
                 if tree and state in {"changed", "deployed"} and batch.status not in TERMINAL_BATCH_STATUSES:
                     details.append(f"  回退将保全当前 {len(tree.files)} 个文件、{tree.total_bytes} 字节至："
-                                   f"{self._rollback_path(batch, target)}")
+                                   f"{self._managed_path(batch, target, 'rollback')}")
             self._preflight_rollback(batch, preserve=dict(trees))
             if batch.status in TERMINAL_BATCH_STATUSES:
                 error = "事务已结束；保留的副本可供手动取回，不能覆盖后续任务。"
         except (OSError, ValueError, SyncError) as exc:
             error = str(exc)
         for target in batch.targets:
-            for label, path, manifest, root_identity, incomplete in (
-                ("同步前备份", target.backup_path, target.original_manifest or {}, target.backup_identity, False),
-                ("暂存", target.stage_path, target.deployed_manifest, target.stage_identity, True),
-                ("回退保全/隔离", target.rollback_path,
-                 target.preserved_manifest if target.preserved_manifest is not None else target.deployed_manifest,
-                 target.rollback_identity, False),
-            ):
+            for label, path, manifest, root_identity, incomplete in self._transaction_copies(batch, target):
                 if path:
                     details.append(f"{label}：{path}")
-                    if target.preserved_manifest is not None and path == target.rollback_path:
-                        details.append("  保全内容仅在明确确认清除整个事务时删除。")
+                    if target.preserved_manifest is not None and label in ("同卷回退保全/隔离", "程序保全副本"):
+                        details.append("  可手动清理，集中副本也适用已启用的保留期限。")
                     if disk_safe:
                         try:
                             if snapshot(path) is None:
@@ -1882,13 +2184,71 @@ class DeploymentEngine:
         return RecoveryPreview(batch_id, batch.revision, tuple(trees), tuple(details), error,
                                tuple(cleanup_trees), "\n".join(cleanup_errors))
 
-    @staticmethod
-    def _rollback_path(batch: JournalBatch, target: JournalTarget) -> str:
-        return target.rollback_path or canonical(os.path.join(
-            target.target_root,
-            f"{_OWNED_PREFIX}{batch.batch_id.replace('-', '')}-"
-            f"{target.selection_id.replace('-', '')}.rollback",
-        ))
+    def _rollback_path(self, batch: JournalBatch, target: JournalTarget) -> str:
+        return target.rollback_path or self._copy_path(target.target_root, batch.batch_id,
+                                                       target.selection_id, "rollback")
+
+    def _transaction_copies(self, batch: JournalBatch, target: JournalTarget):
+        yield "同卷旧版本", target.backup_path, target.original_manifest or {}, target.backup_identity, False
+        yield "暂存", target.stage_path, target.deployed_manifest, target.stage_identity, True
+        yield ("同卷回退保全/隔离", target.rollback_path,
+               target.preserved_manifest or target.deployed_manifest, target.rollback_identity, False)
+        if target.restore_identity is not None:
+            yield ("恢复暂存", self._restore_path(batch, target), target.original_manifest or {},
+                   target.restore_identity, True)
+        yield from self._managed_copies(batch, target)
+
+    def _managed_copies(self, batch: JournalBatch, target: JournalTarget):
+        if target.managed_backup is not None:
+            yield ("程序备份", self._managed_path(batch, target, "backup"),
+                   target.original_manifest, target.managed_backup.identity, False)
+        if target.managed_rollback is not None:
+            yield ("程序保全副本", self._managed_path(batch, target, "rollback"),
+                   target.preserved_manifest, target.managed_rollback.identity, False)
+
+    def _backup_for_restore(self, batch: JournalBatch, target: JournalTarget) -> tuple[str, tuple] | None:
+        managed = target.managed_backup
+        if managed is not None:
+            path = self._managed_path(batch, target, "backup")
+            assert_plain_chain(os.path.dirname(path))
+            if snapshot(path) is not None and (managed.ready or not target.backup_path
+                                               or snapshot(target.backup_path) is None):
+                return path, managed.identity
+        if target.backup_path and snapshot(target.backup_path) is not None:
+            return target.backup_path, target.backup_identity or target.original_identity
+        return None
+
+    def _prepare_restore(self, batch: JournalBatch, target: JournalTarget,
+                         backup: tuple[str, tuple]) -> tuple[str, tuple]:
+        path, backup_id = backup
+        manifest = target.original_manifest or {}
+        tree = _assert_manifest(path, manifest, backup_id, "恢复前原目标备份")
+        if tree.volume == target.target_volume:
+            return backup
+        _assert_portable_copy(tree)
+        stage = self._restore_path(batch, target)
+        stage_id = target.restore_identity
+        self._validate_target_disk(target)
+        if stage_id is None:
+            if snapshot(stage) is not None:
+                raise DeploymentError(f"恢复暂存位置已被未登记内容占用：{stage}")
+            os.mkdir(native(stage))
+            stage_id = identity(snapshot(stage))
+            if stage_id is None or stage_id[0] != "dir":
+                raise DeploymentError(f"恢复暂存目录不安全：{stage}")
+            try:
+                self.journal.set_target(batch.batch_id, target.selection_id, restore_identity=stage_id)
+            except JournalError:
+                _remove_owned_tree(stage, {"": {"kind": "dir"}}, stage_id, "未登记的恢复暂存目录")
+                raise
+        staged = self._read_copy_stage(stage, manifest, stage_id, "恢复暂存目录")
+        if staged.manifest() != manifest:
+            if staged.entries:
+                self._reset_copy_stage(staged, manifest, "恢复暂存目录")
+            self._copy_frozen_tree(tree, stage, None, durable=True)
+            _assert_manifest(path, manifest, backup_id, "恢复复制后的原目标备份")
+        _assert_manifest(stage, manifest, stage_id, "完整恢复暂存目录")
+        return stage, stage_id
 
     def _preflight_rollback(self, batch: JournalBatch, *,
                             preserve: dict[str, FrozenTree | None] | None = None
@@ -1904,12 +2264,9 @@ class DeploymentEngine:
                 _assert_manifest(target.stage_path, target.deployed_manifest,
                                  target.stage_identity, "事务暂存目录", allow_subset=True,
                                  allow_incomplete_files=True)
-            backup_exists = bool(target.backup_path and snapshot(target.backup_path) is not None)
-            if backup_exists:
-                self._assert_owned_path(batch.batch_id, target, target.backup_path or "", "backup")
-                _assert_manifest(target.backup_path or "", target.original_manifest or {},
-                                 target.backup_identity or target.original_identity,
-                                 "事务备份目录")
+            backup = self._backup_for_restore(batch, target)
+            if backup:
+                _assert_manifest(backup[0], target.original_manifest or {}, backup[1], "事务备份目录")
             rollback_exists = bool(target.rollback_path and snapshot(target.rollback_path) is not None)
             if rollback_exists:
                 self._assert_owned_path(batch.batch_id, target, target.rollback_path or "", "rollback")
@@ -1936,11 +2293,11 @@ class DeploymentEngine:
             else:
                 state, current = self._classify_current(target)
             if target.original_manifest is not None:
-                if backup_exists and state not in ("deployed", "missing", "original"):
+                if backup and state not in ("deployed", "missing", "original"):
                     raise DeploymentError(f"无法判断目标恢复状态：{target.target_path}")
-                if not backup_exists and state != "original":
+                if not backup and state != "original":
                     raise DeploymentError(f"原目标备份不可用，已拒绝删除当前部署：{target.target_path}")
-            elif backup_exists:
+            elif backup:
                 raise DeploymentError(f"新增目标不应存在旧目录备份：{target.target_path}")
             elif state not in ("deployed", "missing"):
                 raise DeploymentError(f"新增目标已被其他内容替换：{target.target_path}")
@@ -1991,7 +2348,7 @@ class DeploymentEngine:
                 affected = tuple(dict.fromkeys(
                     target.target_root for target in batch.targets
                     if states[target.selection_id][0] == "deployed"
-                    or (target.backup_path and snapshot(target.backup_path) is not None)
+                    or self._backup_for_restore(batch, target) is not None
                     or target.created_parents
                 ))
                 safety_check(affected)
@@ -2011,7 +2368,14 @@ class DeploymentEngine:
                 if target.phase in ("unchanged", "rolled_back"):
                     self.journal.set_target(batch_id, target.selection_id, phase="rolled_back")
                     continue
-                backup_exists = bool(target.backup_path and snapshot(target.backup_path) is not None)
+                backup = self._backup_for_restore(batch, target)
+                restore = None
+                if target.original_manifest is not None and state != "original":
+                    if backup is None:
+                        raise DeploymentError(f"回退前原备份已消失：{target.target_path}")
+                    if safety_check is not None:
+                        safety_check((target.target_root,))
+                    restore = self._prepare_restore(batch, target, backup)
                 rollback_path = self._rollback_path(batch, target)
                 if snapshot(rollback_path) is not None:
                     self._assert_owned_path(batch.batch_id, target, rollback_path, "rollback")
@@ -2054,23 +2418,24 @@ class DeploymentEngine:
                     _assert_identity(
                         rollback_path, authorized_rollback_identity, "回滚隔离目录"
                     )
-                if target.original_manifest is not None and backup_exists:
+                if restore is not None:
+                    restore_path, restore_id = restore
                     self._validate_record(batch)
                     if snapshot(target.target_path) is not None:
                         raise DeploymentError(f"恢复位置已经出现内容，已保留两份副本：{target.target_path}")
-                    _assert_manifest(target.backup_path or "", target.original_manifest,
-                                     target.backup_identity or target.original_identity,
+                    _assert_manifest(restore_path, target.original_manifest,
+                                     restore_id,
                                      "恢复前原目标备份")
                     if safety_check is not None:
                         safety_check((target.target_root,))
                     try:
-                        _rename_directory(target.backup_path or "", target.target_path)
+                        _rename_directory(restore_path, target.target_path)
                     except OSError:
-                        if moved_current:
+                        if moved_current and snapshot(target.target_path) is None:
                             _rename_directory(rollback_path, target.target_path)
                         raise
                     _assert_manifest(target.target_path, target.original_manifest,
-                                     target.original_identity, "已恢复的原目标")
+                                     restore_id, "已恢复的原目标")
                 if moved_current and snapshot(rollback_path) is not None and preserved_manifest is None:
                     if authorized_rollback_identity is None:
                         raise DeploymentError("回滚隔离目录缺少已认证身份。")
@@ -2083,7 +2448,7 @@ class DeploymentEngine:
                     safety_check((target.target_root,))
                 target_residuals = self._remove_created_parents(target)
                 if preserved_manifest is not None:
-                    target_residuals += (f"回退前的当前内容已完整保留，请按需手动取回：{rollback_path}",)
+                    target_residuals += ("回退前的当前内容已完整保全，副本位置见事务详情。",)
                 self.journal.set_target(batch_id, target.selection_id,
                                         phase="rolled_back", rollback_path=rollback_path if preserved_manifest is not None else None,
                                         rollback_identity=authorized_rollback_identity if preserved_manifest is not None else None,
@@ -2100,6 +2465,11 @@ class DeploymentEngine:
                 batch_id, status=terminal_status,
                 error="\n".join(residuals) if residuals else None,
             )
+            try:
+                migration = self._archive_batch_locked(self.journal.get(batch_id), None)
+                residuals += migration.errors
+            except (OSError, ValueError, SyncError) as exc:
+                residuals += (f"回退副本迁移将在下次维护重试：{exc}",)
             return DeploymentResult(batch_id, "success", terminal_status,
                                     rolled_back_targets=restored,
                                     errors=tuple(residuals),
@@ -2114,7 +2484,8 @@ class DeploymentEngine:
                                     rolled_back_targets=restored, errors=tuple(errors),
                                     duration_seconds=time.monotonic() - started)
 
-    def rollback(self, batch_id: str, *, preview: RecoveryPreview | None = None) -> DeploymentResult:
+    def rollback(self, batch_id: str, *, preview: RecoveryPreview | None = None,
+                 safety_check: Callable[[tuple[str, ...]], None] | None = None) -> DeploymentResult:
         if not self._lock.acquire(blocking=False):
             return DeploymentResult(batch_id, "failed", errors=("已有仓库管理任务正在运行。",))
         process_locks: _InterprocessLockSet | None = None
@@ -2127,8 +2498,7 @@ class DeploymentEngine:
                      for root in (target.source_path, target.source_authorization_root)),
                 )
                 process_locks.acquire()
-                return (self._rollback_locked(batch_id, preview=preview) if preview is not None
-                        else self._rollback_locked(batch_id))
+                return self._rollback_locked(batch_id, preview=preview, safety_check=safety_check)
             except (OSError, ValueError, SyncError) as exc:
                 return DeploymentResult(batch_id, "failed", errors=(str(exc),))
         finally:
@@ -2177,15 +2547,10 @@ class DeploymentEngine:
         candidates = []
         observed = {tree.root: tree for tree in preview.cleanup_trees} if preview is not None else {}
         for target in batch.targets:
-            for path, suffix, manifest, root_identity, incomplete in (
-                (target.backup_path, "backup", target.original_manifest or {},
-                 target.backup_identity, False),
-                (target.stage_path, "stage", target.deployed_manifest, target.stage_identity, True),
-                (target.rollback_path if target.preserved_manifest is None else None,
-                 "rollback", target.deployed_manifest, target.rollback_identity, False),
-            ):
+            for label, path, manifest, root_identity, incomplete in self._transaction_copies(batch, target):
+                if target.preserved_manifest is not None and label in ("同卷回退保全/隔离", "程序保全副本"):
+                    continue
                 if path and snapshot(path) is not None:
-                    self._assert_owned_path(batch.batch_id, target, path, suffix)
                     tree = _assert_manifest(path, manifest, root_identity, "待清理事务副本",
                                             allow_subset=True, allow_incomplete_files=incomplete)
                     if preview is not None and (path not in observed or not _tree_matches(tree, observed[path])):
@@ -2247,39 +2612,31 @@ class DeploymentEngine:
                         f"{target.target_path}"
                     )
             # Validate every cleanup candidate before removing the first one.
+            candidates = {}
             for target in batch.targets:
                 if target.phase == "finalized":
                     continue
-                if target.backup_path:
-                    if snapshot(target.backup_path) is None:
-                        if target.phase == "finalizing" and (
-                                not target.stage_path or snapshot(target.stage_path) is None):
-                            continue
-                        raise DeploymentError(f"事务备份已丢失，无法安全确认：{target.backup_path}")
-                    self._assert_owned_path(batch.batch_id, target, target.backup_path, "backup")
-                    _assert_manifest(target.backup_path, target.original_manifest or {},
-                                     target.backup_identity or target.original_identity,
-                                     "事务备份目录",
-                                     allow_subset=target.phase == "finalizing")
-                if target.stage_path and snapshot(target.stage_path) is not None:
-                    self._assert_owned_path(batch.batch_id, target, target.stage_path, "stage")
-                    _assert_manifest(target.stage_path, target.deployed_manifest,
-                                     target.stage_identity, "事务暂存目录",
-                                     allow_subset=target.phase == "finalizing")
+                backup = self._backup_for_restore(batch, target)
+                if target.original_manifest is not None and target.phase == "committed":
+                    if backup is None:
+                        raise DeploymentError(f"事务备份已丢失，无法安全确认：{target.target_path}")
+                    _assert_manifest(backup[0], target.original_manifest, backup[1], "事务备份目录")
+                copies = []
+                for label, path, manifest, root_identity, _ in self._transaction_copies(batch, target):
+                    if label in ("同卷旧版本", "程序备份", "暂存") and path and snapshot(path) is not None:
+                        _assert_manifest(path, manifest, root_identity, label,
+                                         allow_subset=target.phase == "finalizing" or
+                                         (label == "同卷旧版本" and bool(target.managed_backup and target.managed_backup.ready)))
+                        copies.append((path, manifest, root_identity))
+                candidates[target.selection_id] = copies
             self.journal.set_batch(batch_id, status="finalizing")
             for target in batch.targets:
                 if target.phase == "finalized":
                     continue
                 self.journal.set_target(batch_id, target.selection_id, phase="finalizing")
-                if target.backup_path and snapshot(target.backup_path) is not None:
-                    _remove_owned_tree(target.backup_path, target.original_manifest or {},
-                                       target.backup_identity or target.original_identity,
-                                       "事务备份目录", allow_subset=True)
+                for path, manifest, root_identity in candidates[target.selection_id]:
+                    _remove_owned_tree(path, manifest, root_identity, "事务副本", allow_subset=True)
                     cleaned += 1
-                if target.stage_path and snapshot(target.stage_path) is not None:
-                    _remove_owned_tree(target.stage_path, target.deployed_manifest,
-                                       target.stage_identity, "事务暂存目录",
-                                       allow_subset=True)
                 self.journal.set_target(batch_id, target.selection_id, phase="finalized")
             self.journal.set_batch(batch_id, status="finalized")
             return DeploymentResult(batch_id, "success", "finalized",
@@ -2321,13 +2678,7 @@ class DeploymentEngine:
             observed = {tree.root: tree for tree in preview.cleanup_trees}
             candidates = []
             for target in batch.targets:
-                for path, manifest, root_identity, incomplete in (
-                    (target.backup_path, target.original_manifest or {}, target.backup_identity, False),
-                    (target.stage_path, target.deployed_manifest, target.stage_identity, True),
-                    (target.rollback_path,
-                     target.preserved_manifest if target.preserved_manifest is not None else target.deployed_manifest,
-                     target.rollback_identity, False),
-                ):
+                for _, path, manifest, root_identity, incomplete in self._transaction_copies(batch, target):
                     if path and snapshot(path) is not None:
                         tree = _assert_manifest(path, manifest, root_identity, "待清除事务副本",
                                                 allow_subset=True, allow_incomplete_files=incomplete)
@@ -2341,7 +2692,7 @@ class DeploymentEngine:
                                    observed=observed[path])
             # Never forget an unexpected/reappearing copy; retain the record for retry.
             for target in batch.targets:
-                for path in (target.backup_path, target.stage_path, target.rollback_path):
+                for _, path, _, _, _ in self._transaction_copies(batch, target):
                     if path and snapshot(path) is not None:
                         raise DeploymentError(f"仍有事务副本，保留记录：{path}")
             self.journal.discard(batch_id)

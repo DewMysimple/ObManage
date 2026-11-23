@@ -1,3 +1,4 @@
+from pathlib import Path
 from threading import Event
 
 import pytest
@@ -40,6 +41,11 @@ def deploy(root, *, end=True, name=""):
     return engine, plan.batch_id, target
 
 
+def deployment_backup(engine, batch_id):
+    record = engine.get_batch(batch_id).targets[0]
+    return Path(engine.state_dir) / "backups" / Path(record.backup_path).name
+
+
 def test_bulk_clear_removes_all_three_completed_records_and_paths(tmp_path, seed_legacy_quarantine):
     trash = TrashCleanupEngine(tmp_path / "state")
     seeds = [make_quarantine(tmp_path, seed_legacy_quarantine, str(i)) for i in range(3)]
@@ -65,7 +71,7 @@ def test_pending_deployment_is_excluded_but_all_other_records_clear(tmp_path, se
     assert preview.count == 1 and preview.pending_deployments == 1
     assert clear_transactions(tmp_path / "state", preview, Event()).success
     assert engine.get_batch(batch_id).revision == revision
-    assert tuple(target.glob(".obmanage-deploy-*.backup"))
+    assert deployment_backup(engine, batch_id).is_dir()
     assert not backup.exists()
     assert (target / ".obsidian/config.json").read_text() == "new"
 
@@ -99,11 +105,11 @@ def test_changed_deployment_copy_keeps_failed_record_but_clears_other_records(
     identifier, backup, _ = make_quarantine(tmp_path, seed_legacy_quarantine)
     engine, batch_id, target = deploy(tmp_path)
     preview = inspect_transaction_clear(tmp_path / "state", Event())
-    deployment_backup = next(target.glob(".obmanage-deploy-*.backup"))
-    (deployment_backup / "new-unknown.md").write_text("keep")
+    backup_copy = deployment_backup(engine, batch_id)
+    (backup_copy / "new-unknown.md").write_text("keep")
     result = clear_transactions(tmp_path / "state", preview, Event())
     assert not result.success and result.removed == 1 and result.total == 2
-    assert (deployment_backup / "new-unknown.md").read_text() == "keep"
+    assert (backup_copy / "new-unknown.md").read_text() == "keep"
     assert engine.get_batch(batch_id).status == "resolved"
     assert not backup.exists()
     assert TrashCleanupEngine(tmp_path / "state").list_operations() == ()
@@ -148,6 +154,8 @@ def test_inspection_counts_remaining_copies_and_transaction_directories(tmp_path
 
 def test_complete_pending_transaction_keeps_current_content_and_removes_copies_and_record(tmp_path):
     engine, batch_id, target = deploy(tmp_path, end=False)
+    backup = deployment_backup(engine, batch_id)
+    assert backup.is_dir()
     (target / ".obsidian/config.json").write_text("work after synchronization")
     recovery = engine.inspect_recovery(batch_id)
     before = {p: p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()}
@@ -162,6 +170,7 @@ def test_complete_pending_transaction_keeps_current_content_and_removes_copies_a
 
     assert result.success and result.removed == 1
     assert engine.list_batches() == ()
+    assert not backup.exists()
     assert not tuple(target.glob(".obmanage-deploy-*"))
     assert (target / ".obsidian/config.json").read_text() == "work after synchronization"
     assert (tmp_path / "source/.obsidian/config.json").read_text() == "new"
@@ -197,7 +206,7 @@ def test_complete_does_not_adopt_pending_deployment_created_after_preview(tmp_pa
     assert old_id != new_id
     assert [batch.batch_id for batch in engine.list_batches()] == [new_id]
     assert engine.get_batch(new_id).status == "committed"
-    assert tuple(target.glob(".obmanage-deploy-*.backup"))
+    assert deployment_backup(engine, new_id).is_dir()
 
 
 @pytest.mark.parametrize("condition", ["stale", "cancelled"])
@@ -241,7 +250,7 @@ def test_complete_retains_ended_record_on_cleanup_failure_and_allows_retry(tmp_p
     assert not result.success and result.removed == 0
     assert "injected deletion failure" in result.errors[0]
     assert engine.get_batch(batch_id).status == "resolved"
-    assert tuple(target.glob(".obmanage-deploy-*.backup"))
+    assert deployment_backup(engine, batch_id).is_dir()
     monkeypatch.setattr(deployment, "_remove_owned_tree", original)
     retry = inspect_transaction_completion(tmp_path / "state", Event())
     assert retry.selected is None
@@ -254,7 +263,7 @@ def test_complete_retains_unknown_backup_content_but_clears_other_transactions(
         tmp_path, seed_legacy_quarantine, when):
     _, quarantine, _ = make_quarantine(tmp_path, seed_legacy_quarantine)
     engine, batch_id, target = deploy(tmp_path, end=False)
-    backup = next(target.glob(".obmanage-deploy-*.backup"))
+    backup = deployment_backup(engine, batch_id)
     unknown = backup / "unknown.md"
     if when == "before-preview":
         unknown.write_text("keep")
@@ -333,7 +342,7 @@ def test_complete_does_not_adopt_a_later_revision_after_resolve(
 
     assert not result.success and result.removed == 1 and result.total == 2
     assert engine.get_batch(batch_id).status == "resolved"
-    assert tuple(target.glob(".obmanage-deploy-*.backup"))
+    assert deployment_backup(engine, batch_id).is_dir()
     assert not quarantine.exists()
 
 
@@ -341,7 +350,7 @@ def test_bad_ended_copy_does_not_block_completing_another_pending_deployment(tmp
     from obmanage.management.recovery import require_recovery_clear
 
     engine, old_id, old_target = deploy(tmp_path, name="ended")
-    old_backup = next(old_target.glob(".obmanage-deploy-*.backup"))
+    old_backup = deployment_backup(engine, old_id)
     unknown = old_backup / "unknown.md"
     unknown.write_text("keep")
     _, selected_id, selected_target = deploy(tmp_path, name="pending", end=False)

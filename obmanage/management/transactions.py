@@ -3,7 +3,10 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 from threading import Event
 
-from .deployment import DeploymentEngine, RecoveryPreview, TERMINAL_BATCH_STATUSES
+from .deployment import (
+    BackupMaintenanceResult, DeploymentEngine, RecoveryPreview, TERMINAL_BATCH_STATUSES,
+    managed_backup_dir,
+)
 from .trash import TrashCleanupEngine, TrashClearPreview
 from ..models import SyncCancelled, SyncError
 
@@ -57,6 +60,12 @@ class TransactionClearResult:
 def _check_cancel(cancel: Event) -> None:
     if cancel.is_set():
         raise SyncCancelled("清除已取消。")
+
+
+def maintain_transaction_backups(state_dir: Path, retention_days: int | None, cancel: Event,
+                                 progress=None) -> BackupMaintenanceResult:
+    """Migrate authenticated deployment copies and apply the opt-in retention policy."""
+    return DeploymentEngine(state_dir).maintain_backups(retention_days, cancel, progress)
 
 
 def inspect_transaction_clear(state_dir: Path, cancel: Event) -> TransactionClearPreview:

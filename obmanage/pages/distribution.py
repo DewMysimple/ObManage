@@ -1119,10 +1119,17 @@ class DistributionPage(FeaturePage):
         self._reset_recovery_preview()
 
         def operation(cancel, progress):
-            opened = self._read_open_state(cancel, progress)
-            if self._open_selected_targets(opened, target_paths):
-                raise DeploymentError("目标仓库仍在 Obsidian 中打开，请关闭后重新检查。")
-            return DeploymentEngine(state_dir).rollback(preview.batch_id, preview=preview)
+            def check_open(paths, *, report=None):
+                opened = self._read_open_state(None, report)
+                if self._open_selected_targets(opened, paths):
+                    raise DeploymentError("目标仓库仍在 Obsidian 中打开，请关闭后重新检查。")
+
+            if cancel.is_set():
+                raise SyncCancelled("已取消读取 Obsidian 当前打开仓库。")
+            check_open(target_paths, report=progress)
+            return DeploymentEngine(state_dir).rollback(
+                preview.batch_id, preview=preview, safety_check=check_open
+            )
 
         self.start_task("rollback", operation)
 

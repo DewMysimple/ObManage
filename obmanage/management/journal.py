@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import hmac
 import json
+import math
 import os
 import secrets
 import stat
@@ -58,6 +59,15 @@ class OwnedDirectory:
 
 
 @dataclass(frozen=True)
+class ManagedCopy:
+    """Authenticated identity and publication state for a program-managed copy."""
+
+    identity: tuple[str, int, int]
+    ready: bool
+    retained_since: float
+
+
+@dataclass(frozen=True)
 class JournalTarget:
     """Durable state for one component-to-vault selection."""
 
@@ -90,6 +100,9 @@ class JournalTarget:
     created_parents: tuple[OwnedDirectory, ...] = ()
     residuals: tuple[str, ...] = ()
     error: str = ""
+    managed_backup: ManagedCopy | None = None
+    managed_rollback: ManagedCopy | None = None
+    restore_identity: tuple[str, int, int] | None = None
 
 
 @dataclass(frozen=True)
@@ -122,6 +135,32 @@ def _owned_from_json(value: Any) -> OwnedDirectory:
         path=canonical(value["path"]),
         identity=_identity_from_json(value.get("identity")),
     )
+
+
+def _managed_identity_from_json(value: Any, description: str) -> tuple[str, int, int]:
+    if (not isinstance(value, list) or len(value) != 3 or value[0] != "dir"
+            or type(value[1]) is not int or value[1] < 0
+            or type(value[2]) is not int or value[2] <= 0):
+        raise JournalError(f"事务日志中的{description}目录缺少可信身份。")
+    return value[0], value[1], value[2]
+
+
+def _managed_copy_from_json(value: Any, description: str) -> ManagedCopy | None:
+    if value is None:
+        return None
+    if not isinstance(value, dict) or set(value) != {"identity", "ready", "retained_since"}:
+        raise JournalError(f"事务日志中的{description}记录无效。")
+    ready, retained_since = value["ready"], value["retained_since"]
+    if type(ready) is not bool or type(retained_since) not in (int, float):
+        raise JournalError(f"事务日志中的{description}状态或保留时间无效。")
+    try:
+        retained_since = float(retained_since)
+    except OverflowError as exc:
+        raise JournalError(f"事务日志中的{description}保留时间无效。") from exc
+    if not math.isfinite(retained_since) or retained_since < 0:
+        raise JournalError(f"事务日志中的{description}状态或保留时间无效。")
+    return ManagedCopy(_managed_identity_from_json(value["identity"], description),
+                       ready, retained_since)
 
 
 def _relative_parts(value: Any, description: str) -> tuple[str, ...]:
@@ -264,8 +303,18 @@ def _target_from_json(value: Any) -> JournalTarget:
         raise JournalError("事务日志中的回滚隔离目录缺少可信身份。")
     original_manifest = _manifest_from_json(value.get("original_manifest"), optional=True)
     preserved_manifest = _manifest_from_json(value.get("preserved_manifest"), optional=True)
-    if preserved_manifest is not None and (rollback_path is None or rollback_identity is None):
+    managed_backup = _managed_copy_from_json(value.get("managed_backup"), "程序备份")
+    managed_rollback = _managed_copy_from_json(value.get("managed_rollback"), "程序回退保全")
+    restore_identity = value.get("restore_identity")
+    if restore_identity is not None:
+        restore_identity = _managed_identity_from_json(restore_identity, "恢复暂存")
+    if (preserved_manifest is not None and rollback_path is None
+            and (managed_rollback is None or not managed_rollback.ready)):
         raise JournalError("事务日志中的保全内容缺少路径或身份。")
+    if managed_rollback is not None and preserved_manifest is None:
+        raise JournalError("事务日志中的程序回退保全缺少清单。")
+    if (managed_backup is not None or restore_identity is not None) and original_manifest is None:
+        raise JournalError("事务日志中的程序备份或恢复暂存缺少原目标清单。")
     if original_manifest is not None and (original_identity is None or original_identity[0] != "dir"):
         raise JournalError("事务日志中的原目标目录缺少可信身份。")
     return JournalTarget(
@@ -295,6 +344,9 @@ def _target_from_json(value: Any) -> JournalTarget:
         created_parents=created_parents,
         residuals=tuple(residuals),
         error=str(value.get("error", "")),
+        managed_backup=managed_backup,
+        managed_rollback=managed_rollback,
+        restore_identity=restore_identity,
     )
 
 

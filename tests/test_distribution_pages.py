@@ -283,7 +283,8 @@ def test_execute_and_new_page_can_finalize_persistent_batch(application, tmp_pat
         prepare_config_plan(page, operations)
         result = run_last_operation(page, operations, page._start_execute)
         assert result.success
-        assert tuple(target.glob(".obmanage-deploy-*.backup"))
+        assert not tuple(target.glob(".obmanage-deploy-*.backup"))
+        assert tuple((state / "backups").glob(".obmanage-deploy-*.backup"))
 
         recovered = ComSyncPage(
             state, settings, str(root), opened_vault_reader=closed_vault_reader
@@ -297,7 +298,7 @@ def test_execute_and_new_page_can_finalize_persistent_batch(application, tmp_pat
         recovered.resolve_confirm.setChecked(True)
         resolved = run_last_operation(recovered, recovered_operations, recovered._start_resolve)
         assert resolved.success
-        assert tuple(target.glob(".obmanage-deploy-*.backup"))
+        assert tuple((state / "backups").glob(".obmanage-deploy-*.backup"))
         run_last_operation(recovered, recovered_operations, recovered._start_inspect_recovery)
         recovered.finalize_confirm.setChecked(True)
         assert recovered.finalize_button.isEnabled()
@@ -313,6 +314,7 @@ def test_execute_and_new_page_can_finalize_persistent_batch(application, tmp_pat
         assert finalized.success
         assert snapshot_tree(target / ".obsidian") == snapshot_tree(source / ".obsidian")
         assert not tuple(target.glob(".obmanage-deploy-*.backup"))
+        assert not tuple((state / "backups").glob("*.backup"))
         assert recovered.current_batch is not None
         assert recovered.current_batch.status == "resolved"
         assert not recovered.has_pending_recovery()
