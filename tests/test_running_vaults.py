@@ -1,3 +1,4 @@
+from dataclasses import replace
 from pathlib import Path
 from threading import Event
 
@@ -98,10 +99,21 @@ def test_unregistered_target_with_same_name_is_also_ambiguous(tmp_path):
 
 
 def test_hidden_vault_window_can_be_matched(tmp_path):
-    from dataclasses import replace
     root = vault(tmp_path / "Hidden")
     hidden = replace(window("Hidden - Obsidian"), visible=False)
     observed = runtime.match_runtime_sessions((hidden,), OpenedVaultCandidates((root,)))
     assert not runtime._auxiliary(hidden)
     assert observed.session(root).windows == (hidden,)
     assert observed.session(root).directory_identity == runtime.vault_identity(root)
+
+
+def test_only_the_stock_hidden_ownerless_gdi_hook_window_is_auxiliary():
+    helper = replace(window("GDI+ Window (Obsidian.exe)"),
+                     window_class="GDI+ Hook Window Class", visible=False)
+
+    assert runtime._auxiliary(helper)
+    for candidate in (replace(helper, window_class="Chrome_WidgetWin_1"),
+                      replace(helper, title=""),
+                      replace(helper, visible=True),
+                      replace(helper, owner=2)):
+        assert not runtime._auxiliary(candidate)

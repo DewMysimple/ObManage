@@ -235,6 +235,11 @@ def _auxiliary(window: ObsidianWindow) -> bool:
         "UAC Input Indicator",
     }:
         return True
+    # GDI+ creates a hidden notification window in the Obsidian browser process.
+    if (not window.visible and not window.owner
+            and window.window_class == "GDI+ Hook Window Class"
+            and window.title == f"GDI+ Window ({ntpath.basename(window.executable)})"):
+        return True
     return not window.visible and (
         (window.window_class == "Chrome_WidgetWin_0" and not window.title)
         or (re.fullmatch(r"temp_d3d_window_\d+", window.window_class) and window.title == "Temp Window"))
