@@ -31,7 +31,7 @@ def mechanism():
 - `execute` 在 execute_preflight 内真实重扫两端；新建目标及目录后，`_start_copy` 登记同目标卷临时文件；`_write_copy_temp` 使用 `copying.copy_stream_and_hash` 读取、暂存并同步计算来源摘要。异卷单来源 worker 最多提前一文件；主线程同时校验当前暂存，顺序发布、更新基线。线程上下文显式传播，source_to_stage 与 staged_sha256 可重叠。
 - `_verify_commit_copy` 完整读取 staged_sha256，设置时间戳，atomic_publish 替换目标。若最终身份/时间变化，postwrite_recheck 再读最终目标。copy_baseline 包含 BaselineStore.finalize_copy 的逐文件事务；sqlite_finalize 与 sqlite_commit 嵌套，不可相加。
 - copy_pipeline 覆盖复制循环及 worker 汇合/暂存清理，是不重叠的全复制流水线墙钟；不含目录准备和最终屏障。source_read 和 stage_write 是其内 Python 流调用累计时间，不能反推外接盘标称速度。
-- 有复制、改名或建目录时，final_barrier 重扫来源并检查预期目标。纯删除且没有登记暂存时，紧邻删除的 execute_preflight 同时完成双端检查，计入 predelete_reused_preflight。delete_stage 按原计划逐项删除。删除后的 post_delete_source 和 post_delete_target 分别计量两端的终态清单检查。
+- 有复制、改名或建目录时，final_barrier 复核来源并检查预期目标。本地 exFAT 来源可凭本轮持续有效的目录及文件读取缓存复核，仅重读未覆盖的范围；source_reused_skipped_files 记录该阶段免查的跳过文件数。纯删除且没有登记暂存时，紧邻删除的 execute_preflight 同时完成双端检查，计入 predelete_reused_preflight。delete_stage 按原计划逐项删除。删除后的 post_delete_source 和 post_delete_target 分别计量两端的终态清单检查。
 - 后验 post_quick_rescan 与 post_deep_verify 分开调用普通镜像 analyze，独立墙钟，不计入 execute。对来源前后清单只能说明受检元数据稳定；初始未读取的内容没有前测摘要，不声称证明绝对零写入，读取可能触发系统访问时间更新。
 - ScanMetrics 的可选 detail_phases 只保留固定范围的计数和首末时点汇总；perf_counter_ns 计算耗时，自然时间仅作索引。API 调用可能来自 OS 缓存，fstat 和卷 WinAPI 等并非全部包含在 metadata_queries。所有结果必须以本轮 JSON 为准，未发生阶段为 null / NOT_RUN。
 """
@@ -76,8 +76,14 @@ def summary(data):
                     "post_delete_source", "post_delete_target", "sqlite_open", "sqlite_read", "sqlite_write", "sqlite_commit"):
             if key in metric.get("timing_ms", {}):
                 counts = metric.get("scopes", {}).get(key, {})
-                work = (f"枚举 {counts['directory_enumerations']} 个目录" if "directory_enumerations" in counts
-                        else f"{counts.get('hash_bytes', '—')} hash bytes")
+                if counts.get("source_selective_checks"):
+                    work = (f"枚举 {counts.get('directory_enumerations', 0)} 个目录，"
+                            f"单查 {counts.get('source_rechecked_paths', 0)} 个文件，"
+                            f"复用 {counts['source_reused_skipped_files']} 个跳过文件")
+                elif "directory_enumerations" in counts:
+                    work = f"枚举 {counts['directory_enumerations']} 个目录"
+                else:
+                    work = f"{counts.get('hash_bytes', '—')} hash bytes"
                 phases.append(f"| ↳ {key} | {number(metric['timing_ms'][key])} | "
                               f"{work} | 是，嵌套/可能并行 |")
     top = hotspots(data)[:5]

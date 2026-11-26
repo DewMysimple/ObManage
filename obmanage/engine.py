@@ -1,8 +1,8 @@
 """Incremental, one-way mirror engine; deliberately independent of Qt.
 
 The preview carries a snapshot that is revalidated before execution. Only fully
-verified copies establish baselines, and deletion starts only after all copies
-have succeeded and the complete source has been scanned again.
+verified copies establish baselines. Deletion starts only after all copies have
+succeeded and the complete source inventory has been revalidated.
 """
 from __future__ import annotations
 
@@ -36,6 +36,7 @@ from .paths import (assert_plain_chain, canonical, checked_child, checked_child_
                     publish_windows_stage, revalidate_roots, set_windows_stage_times, snapshot,
                     validate_roots, validate_state_separation)
 from .store import BaselineStore
+from .source_recheck import SourceRecheck
 
 HASH_PROGRESS_INTERVAL = 0.08
 ProgressCallback = Callable[[Progress], None] | None
@@ -135,7 +136,7 @@ def _require_manifest(expected: Mapping[str, Mapping], current: Mapping[str, Map
 
 @measured("inventory")
 def _scan(root: str, cancel: threading.Event | None, progress: ProgressCallback, *,
-          mode: str = SYNC_MODE_MIRROR) -> tuple[dict[str, dict], dict[str, dict]]:
+          mode: str = SYNC_MODE_MIRROR, capture=None) -> tuple[dict[str, dict], dict[str, dict]]:
     if mode not in _SYNC_MODES:
         raise SyncError("同步模式无效。")
     _cancelled(cancel)
@@ -149,11 +150,14 @@ def _scan(root: str, cancel: threading.Event | None, progress: ProgressCallback,
         folder_state = assert_plain_chain(folder, attributes_only_ancestors=True)
         if folder_state is None and not prefix:
             return {}, {}
+        watch_files = capture is not None and capture.watch_directory(prefix.rstrip("/"), folder)
         try:
             with scandir(native(folder)) as iterator:
                 for entry in iterator:
                     _cancelled(cancel)
                     relative = prefix + entry.name
+                    if watch_files:
+                        capture.watch_file(relative, entry.path)
                     state = snapshot(entry.path)
                     if state is None:
                         raise SyncError(f"扫描时文件消失，请重新分析：{relative}")
@@ -198,10 +202,68 @@ def _profile_pair_id(pair_id: str, mode: str) -> str:
     ).encode("utf-8")).hexdigest()
 
 
-def _scan_side(name, root, cancel, progress, *, mode):
-    """Attribute a real scan; no cached observations or alternate scanner."""
+def _scan_side(name, root, cancel, progress, *, mode, capture=None):
+    """Attribute a real directory walk to its endpoint and phase."""
     with phase(name):
+        if capture is not None:
+            return _scan(root, cancel, progress, mode=mode, capture=capture)
         return _scan(root, cancel, progress, mode=mode)
+
+
+def _require_current_source(plan, cancel, progress, phase_name, message, source_cache):
+    expected = plan.context["source_entries"]
+    with phase(phase_name):
+        dirty = source_cache.dirty_directories() if source_cache is not None else {""}
+        if "" in dirty:
+            count("source_full_rechecks")
+            actual, _ = _scan(plan.source, cancel, progress, mode=plan.mode)
+            _require_manifest(expected, actual, root=plan.source, side="源端", message=message)
+            return
+
+        # A broken directory lease may mean a replaced subtree. Re-read it
+        # including unknown children. Nested dirty roots need just one walk.
+        def dirty_ancestor(name):
+            while name:
+                if name in dirty:
+                    return name
+                name = name.rpartition("/")[0]
+            return None
+
+        partial_expected = {}
+        observed = {}
+        if dirty:
+            for name, state in expected.items():
+                if dirty_ancestor(name) is not None:
+                    partial_expected[name] = state
+            for name in dirty:
+                if dirty_ancestor(name.rpartition("/")[0]) is not None:
+                    continue
+                _cancelled(cancel)
+                path, state = checked_child_snapshot(plan.source, name)
+                if state is not None:
+                    observed[name] = state
+                if state is not None and state["kind"] == "dir":
+                    subtree, _ = _scan(path, cancel, progress, mode=plan.mode)
+                    observed.update((name + "/" + child, value) for child, value in subtree.items())
+                count("source_rechecked_subtrees")
+
+        # Directory leases protect their immediate listings. File leases also
+        # detect buffered data writes while the writer's handle is still open.
+        # Each clean directory's own entry belongs to its parent's protected
+        # listing. Root/volume checks and the live chains of accessed paths remain.
+        for name in source_cache.files_to_check(expected):
+            if dirty and dirty_ancestor(name) is not None:
+                continue
+            _cancelled(cancel)
+            partial_expected[name] = expected[name]
+            _, state = checked_child_snapshot(plan.source, name)
+            if state is not None:
+                observed[name] = state
+            count("source_rechecked_paths")
+        _require_manifest(partial_expected, observed, root=plan.source, side="源端", message=message)
+        count("source_reused_skipped_files", len(source_cache.skipped)
+              - sum(name in source_cache.skipped for name in partial_expected))
+        count("source_selective_checks")
 
 
 def _hash_side(side, *args):
@@ -1198,13 +1260,17 @@ class SyncEngine:
         self._check_state_location(plan.source, plan.target)
 
     def _validate_plan(self, plan: SyncPlan, cancel: threading.Event | None,
-                       progress: ProgressCallback) -> None:
+                       progress: ProgressCallback, source_cache=None) -> None:
         """Observe both current inventories after checking scope and preparing local state."""
         context = plan.context
         revalidate_roots(context)
         for key, side, label in (("source", "源端", "源"), ("target", "目标端", "目标")):
             root = getattr(plan, key)
-            entries, excluded = _scan_side("preflight_" + key, root, cancel, progress, mode=plan.mode)
+            capture = source_cache if key == "source" else None
+            entries, excluded = _scan_side("preflight_" + key, root, cancel, progress, mode=plan.mode,
+                                           capture=capture)
+            if capture is not None:
+                capture.seal()
             _require_manifest(context[key + "_entries"], entries,
                               root=root, side=side,
                               message=f"{label}目录在预览后发生变化，请重新分析差异。")
@@ -1275,7 +1341,10 @@ class SyncEngine:
                     # the ordinary pre-delete barrier, then verify these exact live manifests.
                     self._require_target_names(plan, context["target_entries"])
                 expected_targets = {_key(path): state for path, state in context["target_entries"].items()}
-                self._validate_plan(plan, cancel, progress)
+                source_cache = SourceRecheck.for_plan(plan)
+                if source_cache is not None:
+                    pinned.callback(source_cache.close)
+                self._validate_plan(plan, cancel, progress, source_cache)
             preflight_complete = True
             self._execution_target_states = expected_targets
             if registered:
@@ -1438,10 +1507,8 @@ class SyncEngine:
                 if preflight_is_predelete:
                     count("predelete_reused_preflight")
                 else:
-                    _require_manifest(context["source_entries"],
-                                      _scan_side("barrier_source", plan.source, cancel, progress, mode=plan.mode)[0],
-                                      root=plan.source, side="源端",
-                                      message="源目录在同步期间发生变化，已停止删除；请重新分析差异。")
+                    _require_current_source(plan, cancel, progress, "barrier_source",
+                                            "源目录在同步期间发生变化，已停止删除；请重新分析差异。", source_cache)
                     with phase("barrier_target"):
                         self._verify_target(plan, expected_targets, cancel)
             if deletions:
@@ -1491,10 +1558,8 @@ class SyncEngine:
                 with phase("post_delete_revalidation"):
                     _cancelled(cancel)
                     revalidate_roots(context, target_root=target_root)
-                    _require_manifest(context["source_entries"],
-                                      _scan_side("post_delete_source", plan.source, cancel, None, mode=plan.mode)[0],
-                                      root=plan.source, side="源端",
-                                      message="同步结束时源目录发生变化，本次仅部分完成，请重新分析差异。")
+                    _require_current_source(plan, cancel, None, "post_delete_source",
+                                            "同步结束时源目录发生变化，本次仅部分完成，请重新分析差异。", source_cache)
                     with phase("post_delete_target"):
                         self._verify_target(plan, expected_targets, cancel)
             result.status = "success"
