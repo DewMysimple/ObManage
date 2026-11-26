@@ -53,6 +53,7 @@ DETAIL_PHASES = frozenset((
     "preflight_source", "preflight_target", "target_mkdir", "copy_pipeline", "source_to_stage",
     "staged_sha256", "set_timestamps", "atomic_publish", "postwrite_recheck", "copy_baseline",
     "final_barrier", "barrier_source", "barrier_target", "delete_stage", "post_delete_revalidation",
+    "post_delete_source", "post_delete_target",
     "sqlite_open", "sqlite_read", "sqlite_write", "sqlite_commit", "sqlite_finalize",
     "sqlite_register_temp", "sqlite_unregister_temp", "sqlite_close"))
 STAGES = ("precheck", "analysis", "space_check", "confirmation", "confirmed_plan_revalidation", "target_parent_prepare",

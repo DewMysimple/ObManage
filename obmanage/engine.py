@@ -19,6 +19,7 @@ import tempfile
 import threading
 import time
 import uuid
+import weakref
 from concurrent.futures import FIRST_EXCEPTION, Future, ThreadPoolExecutor, TimeoutError, wait
 from contextlib import ExitStack, nullcontext
 from contextvars import copy_context
@@ -481,7 +482,13 @@ class SyncEngine:
         # The desktop product promises one active analysis/sync task. Keep that
         # invariant even when callers accidentally construct multiple engines.
         self._lock = _ENGINE_TASK_LOCK
-        self._execution_candidate: SyncPlan | None = None
+        # The page owns a reviewed plan. Discarding it must also release its inventories.
+        self._execution_candidate: weakref.ReferenceType[SyncPlan] | None = None
+
+    def prepared(self, plan: SyncPlan) -> bool:
+        """Recognize a checked plan or the exact observation awaiting this engine's preflight."""
+        return (bool(plan.context.get("validated"))
+                or (self._execution_candidate is not None and self._execution_candidate() is plan))
 
     def _check_state_location(self, source: str, target: str) -> None:
         self.state_dir = Path(
@@ -490,17 +497,17 @@ class SyncEngine:
 
     @scan_task("mirror")
     def analyze(self, source: str, target: str, *, deep: bool = False,
-                mode: str = SYNC_MODE_MIRROR, for_execution: bool = False,
+                mode: str = SYNC_MODE_MIRROR, for_execution: bool = False, for_review: bool = False,
                 cancel: threading.Event | None = None, progress: ProgressCallback = None) -> SyncPlan:
-        """Standalone previews finish both inventories. For immediate execution the same
-        engine can finish a nonempty candidate's checks in the write preflight instead.
+        """Default and deep previews verify the end inventories. An interactive quick
+        preview can bind the observed inventories for full verification when clicked.
         """
         return self._analyze(source, target, deep=deep, mode=mode, cancel=cancel, progress=progress,
-                             for_execution=for_execution)
+                             for_execution=for_execution, for_review=for_review)
 
     def _analyze(self, source, target, *, deep=False, mode=SYNC_MODE_MIRROR,
                  cancel=None, progress=None, views=None, shared_store=None,
-                 defer_final=False, for_execution=False):
+                 defer_final=False, for_execution=False, for_review=False):
         if not self._lock.acquire(blocking=False):
             raise SyncError("已有同步任务运行中。")
         plan = SyncPlan(source=str(source), target=str(target), mode=mode)
@@ -542,15 +549,16 @@ class SyncEngine:
             self._plan_from_manifests(plan, source_entries, target_entries,
                 source_excluded, target_excluded, store, deep=deep, cancel=cancel, progress=progress)
             _cancelled(cancel)
-            if for_execution and not defer_final and not plan.source_empty and plan.can_execute and plan.has_changes:
-                # The worker will execute this exact plan on this engine. Its first write
-                # barrier checks both manifests after the user's decision. Independent
-                # previews, no-op results and batch analysis retain their own end checks.
-                self._execution_candidate = plan
-            elif not defer_final:
-                revalidate_roots(context)
-                self._validate_analysis_manifests(plan, cancel)
-                context["validated"] = True
+            if not defer_final:
+                review = for_review and not deep
+                immediate_write = for_execution and not plan.source_empty and plan.can_execute and plan.has_changes
+                if not immediate_write:
+                    revalidate_roots(context)
+                if immediate_write or (review and plan.can_execute):
+                    self._execution_candidate = weakref.ref(plan)
+                else:
+                    self._validate_analysis_manifests(plan, cancel)
+                    context["validated"] = True
             _emit(progress, "done" if not defer_final else "compare",
                   message="差异分析完成" if not defer_final else "内容比较完成，等待集合复核",
                   completed_files=len(plan.items), total_files=len(plan.items))
@@ -1051,19 +1059,24 @@ class SyncEngine:
         scanned, _excluded = _scan(
             plan.target, cancel, None, mode=plan.context["mode"]
         )
-        actual = {_key(path): state for path, state in scanned.items()}
-        actual_names = {_key(path): path for path in scanned}
-        if actual.keys() != expected.keys():
+        if len(scanned) != len(expected):
             raise SyncError("目标目录在同步期间出现或丢失了项目，请重新分析差异。")
-        for relative, state in expected.items():
-            current = actual[relative]
+        # The scanner rejects colliding names. Equal counts and a match for every
+        # observed key establish the full set without duplicating either inventory.
+        for relative, current in scanned.items():
+            state = expected.get(_key(relative))
+            if state is None:
+                raise SyncError("目标目录在同步期间出现或丢失了项目，请重新分析差异。")
             matches = identity(current) == identity(state) if state["kind"] == "dir" else current == state
             if not matches:
                 raise SyncError(f"目标项目在同步期间发生变化，请重新分析差异：{relative}")
+        self._require_target_names(plan, scanned)
+
+    @staticmethod
+    def _require_target_names(plan: SyncPlan, entries: dict[str, dict]) -> None:
         protected = plan.context.get("protected_target_directories", set())
         for source_name in plan.context["source_entries"]:
-            key = _key(source_name)
-            if actual_names.get(key) != source_name and not _inside_protected_directory(key, protected):
+            if source_name not in entries and not _inside_protected_directory(_key(source_name), protected):
                 raise SyncError(f"目标文件名的大小写与源端不同，请重新分析差异：{source_name}")
 
     def _rename(self, plan: SyncPlan, item: PlanItem, expected: dict[str, dict],
@@ -1138,11 +1151,12 @@ class SyncEngine:
 
     def _recover_temps(self, plan: SyncPlan, store: BaselineStore, deletions: list[PlanItem],
                        expected: dict[str, dict], result: SyncResult,
-                       cancel: threading.Event | None, progress: ProgressCallback) -> list[PlanItem]:
+                       cancel: threading.Event | None, progress: ProgressCallback,
+                       registered: list[tuple[str, tuple]]) -> list[PlanItem]:
         """Free crash-left staging space only after the complete preview is checked."""
         planned = {_key(item.relative_path): item for item in deletions if item.action == "delete"}
         recovered: set[str] = set()
-        for recorded_path, recorded_identity in store.temps(plan.pair_id):
+        for recorded_path, recorded_identity in registered:
             _cancelled(cancel)
             path = canonical(recorded_path)
             try:
@@ -1155,7 +1169,7 @@ class SyncEngine:
                 if os.path.normcase(path) != os.path.normcase(safe_path):
                     continue
                 revalidate_roots(plan.context)
-                if snapshot(checked_child(plan.source, item.relative_path)) is not None:
+                if checked_child_snapshot(plan.source, item.relative_path)[1] is not None:
                     raise SyncError(f"源端出现了暂存文件，已停止清理：{item.relative_path}")
                 state = snapshot(safe_path)
                 if identity(state) != recorded_identity or state != expected[key]:
@@ -1171,21 +1185,22 @@ class SyncEngine:
                 continue
         return [item for item in deletions if _key(item.relative_path) not in recovered]
 
-    @measured("execute_preflight")
-    def _validate_plan(self, plan: SyncPlan, cancel: threading.Event | None,
-                       progress: ProgressCallback) -> None:
-        """Read-only preflight shared by single-vault and batch execution."""
+    def _check_plan_scope(self, plan: SyncPlan, cancel: threading.Event | None) -> None:
         _cancelled(cancel)
-        candidate = self._execution_candidate is plan
-        if candidate:
-            self._execution_candidate = None
-        if not plan.can_execute or not (plan.context.get("validated") or candidate):
+        if not self.prepared(plan) or not plan.can_execute:
             raise SyncError("当前预览存在错误或不完整，请重新分析差异。")
+        if not plan.context.get("validated"):
+            self._execution_candidate = None
         context = plan.context
         if ((plan.source, plan.target, plan.pair_id, plan.mode)
                 != (context["source"], context["target"], context["pair_id"], context["mode"])):
             raise SyncError("预览路径已改变，请重新分析差异。")
         self._check_state_location(plan.source, plan.target)
+
+    def _validate_plan(self, plan: SyncPlan, cancel: threading.Event | None,
+                       progress: ProgressCallback) -> None:
+        """Observe both current inventories after checking scope and preparing local state."""
+        context = plan.context
         revalidate_roots(context)
         for key, side, label in (("source", "源端", "源"), ("target", "目标端", "目标")):
             root = getattr(plan, key)
@@ -1198,8 +1213,7 @@ class SyncEngine:
                 if any(item.action in ("rename", "rmdir") and _key(item.relative_path) in protected
                        for item in plan.items):
                     raise SyncError("预览中将改名或删除的目标目录现含视频，请重新分析差异。")
-        if candidate:
-            plan.context["validated"] = True
+        context["validated"] = True
 
     def validate_plan(self, plan: SyncPlan, *, cancel: threading.Event | None = None,
                       progress: ProgressCallback = None) -> None:
@@ -1207,7 +1221,9 @@ class SyncEngine:
         if not self._lock.acquire(blocking=False):
             raise SyncError("已有同步任务运行中。")
         try:
-            self._validate_plan(plan, cancel, progress)
+            with phase("execute_preflight"):
+                self._check_plan_scope(plan, cancel)
+                self._validate_plan(plan, cancel, progress)
         finally:
             self._lock.release()
 
@@ -1237,20 +1253,34 @@ class SyncEngine:
         pinned = ExitStack()
         preflight_complete = False
         try:
-            self._validate_plan(plan, cancel, progress)
+            with phase("execute_preflight"):
+                self._check_plan_scope(plan, cancel)
+                context = plan.context
+                if create_only:
+                    self.require_new_target(plan)
+                    if allow_empty:
+                        raise SyncError("首次复制不能授权清空目标。")
+                deletions = [item for item in plan.items if item.action in ("delete", "rmdir")]
+                if plan.source_empty and deletions and not allow_empty:
+                    raise SyncError("源目录为空。清空目标前必须在界面手动确认。")
+                # Open/read application state outside both vaults before sampling either endpoint.
+                store = BaselineStore(self.state_dir)
+                registered = store.temps(plan.pair_id)
+                counts = plan.counts
+                writes_before_delete = any(counts[action] for action in ("add", "update", "rename", "mkdir"))
+                preflight_is_predelete = (bool(deletions) and context["target_root"] is not None
+                                          and not registered and not writes_before_delete)
+                if preflight_is_predelete:
+                    # The next vault operation is deletion. Check the same spelling rule as
+                    # the ordinary pre-delete barrier, then verify these exact live manifests.
+                    self._require_target_names(plan, context["target_entries"])
+                expected_targets = {_key(path): state for path, state in context["target_entries"].items()}
+                self._validate_plan(plan, cancel, progress)
             preflight_complete = True
-            context = plan.context
-            if create_only:
-                self.require_new_target(plan)
-                if allow_empty:
-                    raise SyncError("首次复制不能授权清空目标。")
-            deletions = [item for item in plan.items if item.action in ("delete", "rmdir")]
-            if plan.source_empty and deletions and not allow_empty:
-                raise SyncError("源目录为空。清空目标前必须在界面手动确认。")
-            store = BaselineStore(self.state_dir)
-            expected_targets = {_key(path): state for path, state in context["target_entries"].items()}
             self._execution_target_states = expected_targets
-            deletions = self._recover_temps(plan, store, deletions, expected_targets, result, cancel, progress)
+            if registered:
+                deletions = self._recover_temps(plan, store, deletions, expected_targets, result,
+                                                cancel, progress, registered)
             copy_items = [item for item in plan.items if item.action in ("add", "update")]
             total_copy_bytes = sum(item.size for item in copy_items)
             if total_copy_bytes:
@@ -1384,7 +1414,6 @@ class SyncEngine:
                         copy_pool.shutdown(wait=True, cancel_futures=True)
                     for pending in pending_copies:
                         self._cleanup_pending_copy(pending, store)
-            counts = plan.counts
             result.skipped_files = counts["skip"]
             _cancelled(cancel)
             # A case-only rename retains content identity. Update its own and
@@ -1406,12 +1435,15 @@ class SyncEngine:
             # source is still exactly the snapshot that was previewed.
             with phase("final_barrier"):
                 root_checkpoint(True)
-                _require_manifest(context["source_entries"],
-                                  _scan_side("barrier_source", plan.source, cancel, progress, mode=plan.mode)[0],
-                                  root=plan.source, side="源端",
-                                  message="源目录在同步期间发生变化，已停止删除；请重新分析差异。")
-                with phase("barrier_target"):
-                    self._verify_target(plan, expected_targets, cancel)
+                if preflight_is_predelete:
+                    count("predelete_reused_preflight")
+                else:
+                    _require_manifest(context["source_entries"],
+                                      _scan_side("barrier_source", plan.source, cancel, progress, mode=plan.mode)[0],
+                                      root=plan.source, side="源端",
+                                      message="源目录在同步期间发生变化，已停止删除；请重新分析差异。")
+                    with phase("barrier_target"):
+                        self._verify_target(plan, expected_targets, cancel)
             if deletions:
                 with phase("delete_stage"):
                     for item in sorted(
@@ -1422,12 +1454,10 @@ class SyncEngine:
                         _cancelled(cancel)
                         revalidate_roots(context, target_root=target_root)
                         relative = item.relative_path
-                        source_path = checked_child(plan.source, relative)
-                        if snapshot(source_path) is not None:
+                        if checked_child_snapshot(plan.source, relative)[1] is not None:
                             raise SyncError(f"源端重新出现此项目，已停止删除：{relative}")
-                        target_path = checked_child(plan.target, relative)
+                        target_path, actual = checked_child_snapshot(plan.target, relative)
                         expected = context["target_entries"][relative]
-                        actual = snapshot(target_path)
                         if item.action == "delete":
                             if actual != expected:
                                 raise SyncError(f"待删除文件在预览后发生变化，已停止删除：{relative}")
@@ -1462,10 +1492,11 @@ class SyncEngine:
                     _cancelled(cancel)
                     revalidate_roots(context, target_root=target_root)
                     _require_manifest(context["source_entries"],
-                                      _scan(plan.source, cancel, None, mode=plan.mode)[0],
+                                      _scan_side("post_delete_source", plan.source, cancel, None, mode=plan.mode)[0],
                                       root=plan.source, side="源端",
                                       message="同步结束时源目录发生变化，本次仅部分完成，请重新分析差异。")
-                    self._verify_target(plan, expected_targets, cancel)
+                    with phase("post_delete_target"):
+                        self._verify_target(plan, expected_targets, cancel)
             result.status = "success"
             _emit(progress, "done", message="镜像同步完成", completed_bytes=result.copied_bytes,
                   total_bytes=total_copy_bytes)

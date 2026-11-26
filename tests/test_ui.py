@@ -94,14 +94,14 @@ def test_manual_preview_then_sync_and_repeat(application, window, monkeypatch, d
     preview.parent.mkdir(exist_ok=True)
     assert widget.grab().save(str(preview))
     scans = []
-    original = engine_module._scan_side
-    def trace(name, *args, **kwargs):
-        scans.append(name)
-        return original(name, *args, **kwargs)
-    monkeypatch.setattr(engine_module, "_scan_side", trace)
+    original = engine_module._scan
+    def trace(root, *args, **kwargs):
+        scans.append(Path(root))
+        return original(root, *args, **kwargs)
+    monkeypatch.setattr(engine_module, "_scan", trace)
     QTest.mouseClick(widget.sync_button, Qt.MouseButton.LeftButton)
     pump_until(application, lambda: not widget.busy)
-    assert scans == ["preflight_source", "preflight_target", "barrier_source"]
+    assert scans == [source, target] * 3
     assert widget.last_result.status == "success"
     assert widget.last_result.copied_files == 2
     assert not (target / "源端已经删除.md").exists()

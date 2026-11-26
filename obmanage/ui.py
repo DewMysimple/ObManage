@@ -319,12 +319,12 @@ class SyncWorker(QThread):
 
     def __init__(
         self,
-        state_dir: Path,
+        engine: SyncEngine,
         request: SyncRequest,
         cancel: threading.Event,
     ) -> None:
         super().__init__()
-        self.state_dir = state_dir
+        self.engine = engine
         self.request = request
         self.cancel = cancel
         self.confirmation_exchange = (
@@ -368,7 +368,7 @@ class SyncWorker(QThread):
     @Slot()
     def run(self) -> None:
         try:
-            result = run_sync(SyncEngine(self.state_dir), self.request, self.cancel, self._progress,
+            result = run_sync(self.engine, self.request, self.cancel, self._progress,
                               confirm=self._confirm, executing=self._executing)
             self.completed.emit(("ok", result))
         except SyncCancelled:
@@ -469,6 +469,7 @@ class MainWindow(QMainWindow):
         self.settings_document = self.store.load_document()
         self.settings = self.settings_document.mirror
         self.scheduler = Scheduler()
+        self._mirror_engine = SyncEngine(self.state_dir)
         self.plan: SyncPlan | None = None
         self._preview_request: SyncRequest | None = None
         self._reviewed_plan: SyncPlan | None = None
@@ -1633,7 +1634,7 @@ class MainWindow(QMainWindow):
         self.progress_bar.setRange(0, 0)
         self.current_file.setText("正在准备…")
         self.speed_label.setText("")
-        worker = SyncWorker(self.state_dir, request, self._cancel_event)
+        worker = SyncWorker(self._mirror_engine, request, self._cancel_event)
         worker.setParent(self)
         worker.progress.connect(self._on_progress)
         worker.completed.connect(self._on_completed)
@@ -1716,7 +1717,7 @@ class MainWindow(QMainWindow):
             self._notify("本轮同步未完成", str(payload), warning=True)
         elif isinstance(payload, SyncPlan):
             if request.intent is not SyncIntent.PREVIEW or self._preview_request is request:
-                if self._preview_request is request and payload.context.get("validated") and payload.can_execute:
+                if self._preview_request is request and self._mirror_engine.prepared(payload) and payload.can_execute:
                     self._reviewed_plan = payload
                 self._accept_plan(preview_copy(payload), scheduled)
         else:
@@ -1759,7 +1760,7 @@ class MainWindow(QMainWindow):
             f"跳过 {counts['skip']}，待复制 {format_bytes(plan.bytes_to_copy)}。"
         )
         if not plan.has_changes:
-            self._set_status(f"{target_name}与{source_name}已经一致，本轮复制 0 字节。", "success")
+            self._set_status(f"本轮扫描中{target_name}与{source_name}一致，待复制 0 字节。", "success")
             self.empty_title.setText("两端已经一致")
             self.empty_detail.setText("没有需要同步的变化。")
             return

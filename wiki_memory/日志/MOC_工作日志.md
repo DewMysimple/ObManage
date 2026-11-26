@@ -16,6 +16,7 @@ supersedes: null
 | 时间 | 类型 | 目标 | 状态 | 主题 | 日志 |
 | --- | --- | --- | --- | --- | --- |
 | 2026-11-26 | feature | - | archived | reviewed-sync-inventory-reuse | [预览复用与同步扫描优化](./2026-11-26-预览复用与同步扫描优化.md) |
+| 2026-11-26 | feature | - | archived | mirror-inventory-passes | [镜像逐阶段遍历与删除复核合并](./2026-11-26-镜像逐阶段遍历与删除复核合并.md) |
 | 2026-11-23 | feature | - | archived | managed-deployment-backup-retention | [集中管理部署备份](./2026-11-23-集中管理部署备份.md) |
 | 2026-11-23 | bug | - | archived | comsync-gdiplus-window-false-blocker | [.comSync 会话核验误拦截](./2026-11-23-comSync会话核验误拦截.md) |
 | 2026-11-21 | feature | - | archived | direct-sync-vault-sessions-delivery | [直接同步与目标会话](./2026-11-21-直接同步与目标会话.md) |

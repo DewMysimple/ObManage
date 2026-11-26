@@ -31,7 +31,7 @@ def mechanism():
 - `execute` 在 execute_preflight 内真实重扫两端；新建目标及目录后，`_start_copy` 登记同目标卷临时文件；`_write_copy_temp` 使用 `copying.copy_stream_and_hash` 读取、暂存并同步计算来源摘要。异卷单来源 worker 最多提前一文件；主线程同时校验当前暂存，顺序发布、更新基线。线程上下文显式传播，source_to_stage 与 staged_sha256 可重叠。
 - `_verify_commit_copy` 完整读取 staged_sha256，设置时间戳，atomic_publish 替换目标。若最终身份/时间变化，postwrite_recheck 再读最终目标。copy_baseline 包含 BaselineStore.finalize_copy 的逐文件事务；sqlite_finalize 与 sqlite_commit 嵌套，不可相加。
 - copy_pipeline 覆盖复制循环及 worker 汇合/暂存清理，是不重叠的全复制流水线墙钟；不含目录准备和最终屏障。source_read 和 stage_write 是其内 Python 流调用累计时间，不能反推外接盘标称速度。
-- final_barrier 真实重扫来源并调用 `_verify_target` 完整重扫目标。所有复制成功且通过此屏障后，delete_stage 才逐项删除原计划目标文件/空目录。若有删除，post_delete_revalidation 再检查根及两端完整清单；无删除无需重复该轮。原有失败/取消停删规则不变。
+- 有复制、改名或建目录时，final_barrier 重扫来源并检查预期目标。纯删除且没有登记暂存时，紧邻删除的 execute_preflight 同时完成双端检查，计入 predelete_reused_preflight。delete_stage 按原计划逐项删除。删除后的 post_delete_source 和 post_delete_target 分别计量两端的终态清单检查。
 - 后验 post_quick_rescan 与 post_deep_verify 分开调用普通镜像 analyze，独立墙钟，不计入 execute。对来源前后清单只能说明受检元数据稳定；初始未读取的内容没有前测摘要，不声称证明绝对零写入，读取可能触发系统访问时间更新。
 - ScanMetrics 的可选 detail_phases 只保留固定范围的计数和首末时点汇总；perf_counter_ns 计算耗时，自然时间仅作索引。API 调用可能来自 OS 缓存，fstat 和卷 WinAPI 等并非全部包含在 metadata_queries。所有结果必须以本轮 JSON 为准，未发生阶段为 null / NOT_RUN。
 """
@@ -69,13 +69,17 @@ def summary(data):
         phases.append(f"| {name} | {number(stage['duration_ms'])} | {stage['status']} | 否（顶层） |")
         metric = stage.get("metrics", {})
         for key in ("source_scan", "target_scan", "planning", "source_sha256", "target_sha256",
-                    "final_revalidation", "execute_preflight", "copy_pipeline", "source_to_stage",
-                    "staged_sha256", "atomic_publish", "copy_baseline", "final_barrier", "delete_stage",
-                    "post_delete_revalidation", "sqlite_open", "sqlite_read", "sqlite_write", "sqlite_commit"):
+                    "final_revalidation", "analysis_final_source", "analysis_final_target",
+                    "execute_preflight", "preflight_source", "preflight_target", "copy_pipeline",
+                    "source_to_stage", "staged_sha256", "atomic_publish", "copy_baseline", "final_barrier",
+                    "barrier_source", "barrier_target", "delete_stage", "post_delete_revalidation",
+                    "post_delete_source", "post_delete_target", "sqlite_open", "sqlite_read", "sqlite_write", "sqlite_commit"):
             if key in metric.get("timing_ms", {}):
                 counts = metric.get("scopes", {}).get(key, {})
+                work = (f"枚举 {counts['directory_enumerations']} 个目录" if "directory_enumerations" in counts
+                        else f"{counts.get('hash_bytes', '—')} hash bytes")
                 phases.append(f"| ↳ {key} | {number(metric['timing_ms'][key])} | "
-                              f"{counts.get('hash_bytes', '—')} hash bytes | 是，嵌套/可能并行 |")
+                              f"{work} | 是，嵌套/可能并行 |")
     top = hotspots(data)[:5]
     ranking = "\n".join(f"| {i} | {row['stage']} | {number(row['duration_ms'])} ms | 本轮计量 JSON | "
                         f"{'实测总墙钟' if row['scope'] == 'top_level_wall' else '实测累计，范围重叠'} |"
@@ -102,7 +106,7 @@ def summary(data):
 实际复制/删除文件/删除目录：{number(result.get('copied_files'))} / {number(result.get('deleted_files'))} / {number(result.get('deleted_dirs'))}。未执行时 null 不代表已运行零耗时。
 
 ## 3. 各阶段实测耗时
-| 阶段 | 总墙钟或累计 ms | 状态/实际字节 | 是否与其他阶段重叠 |
+| 阶段 | 总墙钟或累计 ms | 状态或读取量 | 是否与其他阶段重叠 |
 | --- | ---: | --- | --- |
 {chr(10).join(phases)}
 

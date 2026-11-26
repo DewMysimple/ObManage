@@ -210,6 +210,9 @@ def test_ordinary_mirror_all_actions_and_both_worker_contexts(service, monkeypat
     assert metrics["timing_ms"]["copy_pipeline"] > 0
     assert metrics["timing_ms"]["delete_stage"] > 0
     assert metrics["spans"]["post_delete_revalidation"]["succeeded"] == 1
+    for side in ("source", "target"):
+        assert metrics["spans"]["post_delete_" + side]["succeeded"] == 1
+        assert metrics["scopes"]["post_delete_" + side]["directory_enumerations"] > 0
     deep = data["stages"]["post_deep_verify"]["metrics"]
     assert deep["scopes"]["source_sha256"]["hash_bytes"] == deep["scopes"]["target_sha256"]["hash_bytes"]
     with pytest.raises(profile.Blocked, match="ALREADY_CALLED"):

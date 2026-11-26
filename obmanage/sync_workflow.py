@@ -66,15 +66,18 @@ def run_sync(
     if plan is None:
         plan = engine.analyze(request.source, request.target, deep=request.deep, mode=request.mode,
                               for_execution=request.intent is not SyncIntent.PREVIEW,
+                              for_review=request.intent is SyncIntent.PREVIEW,
                               cancel=cancel, progress=progress)
     else:
         if (request.intent is not SyncIntent.MANUAL or request.deep or plan.mode != request.mode
-                or not plan.context.get("validated") or not plan.can_execute):
+                or not engine.prepared(plan) or not plan.can_execute):
             raise SyncError("预览与本轮同步不匹配，请重新预览变更。")
-        # Resolve the configured paths again, including short-name aliases and link boundaries.
-        roots = validate_roots(request.source, request.target)
-        if roots["pair_id"] != plan.context.get("base_pair_id"):
-            raise SyncError("预览后路径、方向或磁盘已改变，请重新预览变更。")
+        # For the same two paths, preflight already checks live volumes, roots and link
+        # boundaries. Aliases need resolution, and an empty-source prompt needs its own binding.
+        if would_empty_target(plan) or (request.source, request.target) != (plan.source, plan.target):
+            roots = validate_roots(request.source, request.target)
+            if roots["pair_id"] != plan.context.get("base_pair_id"):
+                raise SyncError("预览后路径、方向或磁盘已改变，请重新预览变更。")
         if not plan.has_changes:
             engine.validate_plan(plan, cancel=cancel, progress=progress)
     if cancel.is_set():

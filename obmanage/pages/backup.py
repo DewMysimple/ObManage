@@ -256,6 +256,7 @@ class VaultBackupPage(FeaturePage):
             "在笔记本与移动硬盘之间同步非视频内容；视频不会复制、覆盖或删除。",
         )
         self.state_dir = Path(state_dir)
+        self._engine = SyncEngine(self.state_dir)
         self.plan: SyncPlan | None = None
         self._reviewed_plan: SyncPlan | None = None
         self.last_result: SyncResult | None = None
@@ -580,7 +581,7 @@ class VaultBackupPage(FeaturePage):
             self._invalidate_plan("正在读取两个仓库。")
         self.last_result = None
         self._refresh_direction_text()
-        state_dir = self.state_dir
+        engine = self._engine
         source_name, target_name = self._endpoint_names()
         request = SyncRequest(source, target, source_name, target_name, SYNC_MODE_NO_VIDEO, intent, deep, reviewed)
 
@@ -589,7 +590,7 @@ class VaultBackupPage(FeaturePage):
                 return confirm(TaskConfirmation(*confirmation_text(request, plan), payload=preview_copy(plan)))
 
             return run_sync(
-                SyncEngine(state_dir), request, cancel, progress,
+                engine, request, cancel, progress,
                 confirm=approve if confirm is not None else None,
                 executing=lambda _: progress(Progress("execute", "正在同步非视频内容。")),
             )
@@ -654,7 +655,7 @@ class VaultBackupPage(FeaturePage):
             self.set_status(f"本轮无法备份：{detail}", "error")
         elif not plan.has_changes:
             self.set_status(
-                f"两端非视频内容已经一致；已排除 {counts['exclude']:,} 个视频"
+                f"本轮扫描中两端非视频内容一致，已排除 {counts['exclude']:,} 个视频"
                 f"（约 {format_bytes(excluded_bytes)}）。",
                 "success",
             )
@@ -707,7 +708,7 @@ class VaultBackupPage(FeaturePage):
             if isinstance(payload, SyncPlan):
                 if self._sync_request is not None:
                     if (self._sync_request.intent is SyncIntent.PREVIEW
-                            and payload.context.get("validated") and payload.can_execute):
+                            and self._engine.prepared(payload) and payload.can_execute):
                         self._reviewed_plan = payload
                     self._accept_plan(preview_copy(payload))
             elif kind == "sync":

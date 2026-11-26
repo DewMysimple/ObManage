@@ -435,8 +435,10 @@ def revalidate_roots(context: dict, *, target_root: dict | None = None) -> None:
     if identity(snapshot(source)) != identity(context["source_root"]):
         raise SyncError("源目录已被替换或移除，请重新分析差异。")
     expected = target_root if target_root is not None else context["target_root"]
-    if identity(snapshot(target)) != identity(expected):
+    target_state = snapshot(target)
+    if identity(target_state) != identity(expected):
         raise SyncError("目标目录已被替换或移除，请重新分析差异。")
     anchor = context["target_anchor"]
-    if identity(snapshot(anchor)) != identity(context["target_anchor_state"]):
+    anchor_state = target_state if anchor == target else snapshot(anchor)
+    if identity(anchor_state) != identity(context["target_anchor_state"]):
         raise SyncError("目标目录所在位置已改变，请重新分析差异。")
