@@ -230,12 +230,13 @@ class PlanTableModel(QAbstractTableModel):
         item = self.items[index.row()]
         column = index.column()
         if role == Qt.ItemDataRole.DisplayRole:
-            return (
-                self.action_text(item),
-                absolute_item_path(self.target_path, item.relative_path),
-                "—" if item.action in ("mkdir", "rmdir") else format_bytes(item.size),
-                self.reason_text(item),
-            )[column]
+            if column == self.ACTION_COLUMN:
+                return self.action_text(item)
+            if column == self.TARGET_COLUMN:
+                return absolute_item_path(self.target_path, item.relative_path)
+            if column == self.SIZE_COLUMN:
+                return "—" if item.action in ("mkdir", "rmdir") else format_bytes(item.size)
+            return self.reason_text(item)
         if role == Qt.ItemDataRole.UserRole:
             return item.action
         if role == Qt.ItemDataRole.ToolTipRole:
@@ -270,8 +271,7 @@ class PlanFilterModel(QSortFilterProxyModel):
     def filterAcceptsRow(self, row: int, parent: QModelIndex) -> bool:
         if self.actions is None:
             return True
-        model = self.sourceModel()
-        return model.data(model.index(row, 0, parent), Qt.ItemDataRole.UserRole) in self.actions
+        return self.sourceModel().items[row].action in self.actions
 
 
 class ResponsivePlanTableView(QTableView):
@@ -470,6 +470,8 @@ class MainWindow(QMainWindow):
         self.settings = self.settings_document.mirror
         self.scheduler = Scheduler()
         self.plan: SyncPlan | None = None
+        self._preview_request: SyncRequest | None = None
+        self._reviewed_plan: SyncPlan | None = None
         self.last_result: SyncResult | None = None
         self._thread: QThread | None = None
         self._worker: SyncWorker | None = None
@@ -575,7 +577,7 @@ class MainWindow(QMainWindow):
         self.logs_button = QPushButton("查看操作日志")
         self.logs_button.setObjectName("NavUtility")
         nav_layout.addWidget(self.logs_button)
-        nav_hint = QLabel("手动写入前会分析并确认")
+        nav_hint = QLabel("可先预览，再按方向同步")
         nav_hint.setObjectName("NavCaption")
         nav_hint.setWordWrap(True)
         nav_layout.addWidget(nav_hint)
@@ -994,6 +996,9 @@ class MainWindow(QMainWindow):
             return
         current = self.pages.get(self._current_page_key)
         if current is self.mirror_page and page is not current:
+            if self._reviewed_plan is not None or self._preview_request is not None:
+                self._invalidate_plan()
+                self._set_status("可重新预览，或直接同步并确认本轮差异。")
             if getattr(self._worker, "confirmation_exchange", None) is not None:
                 self._cancel_event.set()
                 self._dismiss_worker_confirmation()
@@ -1365,10 +1370,12 @@ class MainWindow(QMainWindow):
 
     def _invalidate_plan(self) -> None:
         self.plan = None
+        self._preview_request = None
+        self._reviewed_plan = None
         self.table_model.set_items([])
         self.preview_stack.setCurrentIndex(0)
         self.empty_title.setText("等待分析仓库差异")
-        self.empty_detail.setText("点击同步会自动分析差异，并在写入前确认本轮方向与删除范围。")
+        self.empty_detail.setText("可先预览变更，再点击同步执行。直接同步会先显示本轮差异。")
         self.copy_summary.setText("待复制  —")
         for action in self.stat_values:
             self.stat_values[action].setText("—")
@@ -1594,20 +1601,25 @@ class MainWindow(QMainWindow):
             or (source, target) != (self.settings.bound_source, self.settings.bound_target)
         ):
             return
-        self._invalidate_plan()
+        reviewed = self._reviewed_plan if intent is SyncIntent.MANUAL else None
+        self._reviewed_plan = None
+        if reviewed is None:
+            self._invalidate_plan()
         self.last_result = None
         self._persist(remember_target=True)
-        self.empty_title.setText("正在读取仓库变化…")
-        self.empty_detail.setText(
-            "完整校验仍会读取两端全部内容；不同磁盘会并行进行，速度取决于较慢一端。"
-            if deep
-            else "已有副本首次需要比较内容；完成的校验记录会保留，可随时取消。"
-        )
         source_name, target_name = self._endpoint_names()
-        scheduled = intent is SyncIntent.SCHEDULED
-        self._set_status(f"正在{'完整校验内容' if deep else '分析差异'}：{source_name} → {target_name}（分析不修改文件）", "busy")
-        self._log(f"{'定时' if scheduled else '手动'}{'完整内容校验' if deep else '分析差异'}：以 {source_name} {source} 为准 → 仅修改 {target_name} {target}；分析阶段不修改仓库。", feature="mirror", event="分析差异")
-        request = SyncRequest(source, target, source_name, target_name, SYNC_MODE_MIRROR, intent, deep)
+        if reviewed is None:
+            self.empty_title.setText("正在读取仓库变化…")
+            self.empty_detail.setText(
+                "完整校验会重新读取两端需要比较的内容，可随时取消。" if deep
+                else "首次比较会读取文件内容，完成的校验记录可供下次使用。"
+            )
+        action = "复核已预览的变更" if reviewed is not None else "完整内容校验" if deep else "分析差异"
+        self._set_status(f"正在{action} · {source_name} → {target_name}", "busy")
+        self._log(f"{'定时' if intent is SyncIntent.SCHEDULED else '手动'}{action}：{source} → {target}",
+                  feature="mirror", event=action)
+        request = SyncRequest(source, target, source_name, target_name, SYNC_MODE_MIRROR, intent, deep, reviewed)
+        self._preview_request = request if intent is SyncIntent.PREVIEW else None
         self._start_worker(request)
 
     def _start_worker(self, request: SyncRequest) -> None:
@@ -1703,9 +1715,13 @@ class MainWindow(QMainWindow):
             self._log(str(payload), level="error")
             self._notify("本轮同步未完成", str(payload), warning=True)
         elif isinstance(payload, SyncPlan):
-            self._accept_plan(payload, scheduled)
+            if request.intent is not SyncIntent.PREVIEW or self._preview_request is request:
+                if self._preview_request is request and payload.context.get("validated") and payload.can_execute:
+                    self._reviewed_plan = payload
+                self._accept_plan(preview_copy(payload), scheduled)
         else:
             self._accept_result(payload, request)
+        self._preview_request = None
         self._end_log_task(log_context, outcome)
         self.pages["transactions"].refresh_records()
         self._refresh_actions()
@@ -1753,7 +1769,9 @@ class MainWindow(QMainWindow):
             self._log(f"{source_name}来源仓库为空，本轮未清空{target_name}。需要手动确认后同步。")
             self._notify(f"需要确认：{source_name}来源仓库为空", f"定时已暂停，{target_name}内容已保留。请检查来源仓库后手动同步。", warning=True)
             return
-        self._set_status(f"预览已就绪。同步前会确认本轮最终差异；{source_name}只读取。", "success")
+        if self._reviewed_plan is not None:
+            hint = "同步时需确认清空目标。" if would_empty_target(plan) else f"点击“同步到{target_name}”即可执行。"
+            self._set_status(f"预览已就绪。{hint}", "success")
         self._refresh_actions()
 
     def _update_counts(self, plan: SyncPlan) -> None:
@@ -1800,7 +1818,12 @@ class MainWindow(QMainWindow):
             self._set_status(f"已取消更新{target_name}，已完成部分保留；{source_name}只读取。请重新分析。", "warning")
             self._log(f"同步已取消：{summary}")
         else:
-            self._set_status(f"{target_name}本轮部分完成，已停止后续操作；{source_name}只读取。请查看日志并重新分析。", "error")
+            if result.preflight_failed:
+                self._set_status("执行前复核失败，仓库尚未修改。请重新预览变更。", "warning")
+                self.current_file.setText(result.errors[0])
+                self.current_file.setToolTip(result.errors[0])
+            else:
+                self._set_status(f"{target_name}本轮同步未完成，已停止后续操作。请查看日志并重新分析。", "error")
             self._log(f"同步未完成：{summary}")
             self._notify(f"{target_name}更新未完成", result.errors[0] if result.errors else "请查看日志。", warning=True)
         for error in result.errors:

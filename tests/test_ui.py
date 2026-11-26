@@ -10,8 +10,9 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest
 from PySide6.QtCore import QCoreApplication, QEvent, Qt
 from PySide6.QtTest import QTest
-from PySide6.QtWidgets import QApplication, QDialogButtonBox, QPlainTextEdit
+from PySide6.QtWidgets import QApplication, QDialogButtonBox
 
+import obmanage.engine as engine_module
 from obmanage.models import SyncCancelled
 from obmanage.settings import SettingsStore
 from obmanage.ui import FILTERS, MainWindow
@@ -62,7 +63,8 @@ def window(application, tmp_path):
     QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
 
 
-def test_manual_preview_then_sync_and_repeat(application, window):
+@pytest.mark.parametrize("deep_after_preview", [False, True])
+def test_manual_preview_then_sync_and_repeat(application, window, monkeypatch, deep_after_preview):
     widget, source, target = window
     (source / "新增笔记.md").write_text("今天的记录", encoding="utf-8")
     (source / "更新笔记.md").write_text("修订后的内容", encoding="utf-8")
@@ -79,6 +81,11 @@ def test_manual_preview_then_sync_and_repeat(application, window):
     assert widget.plan.counts["delete"] == 1
     assert widget.plan.counts["skip"] == 1
     assert widget.sync_button.isEnabled()
+    if deep_after_preview:
+        widget.deep_button.click()
+        pump_until(application, lambda: not widget.busy)
+        assert widget.plan.counts["delete"] == 1
+        assert (target / "源端已经删除.md").exists()
     widget.filter_tabs.setCurrentIndex(next(i for i, (_, actions) in enumerate(FILTERS)
                                            if actions == {"delete", "rmdir"}))
     assert widget.table.model().rowCount() == 1
@@ -86,13 +93,15 @@ def test_manual_preview_then_sync_and_repeat(application, window):
     preview = Path(__file__).resolve().parents[1] / "artifacts" / "ui-preview-test.png"
     preview.parent.mkdir(exist_ok=True)
     assert widget.grab().save(str(preview))
+    scans = []
+    original = engine_module._scan_side
+    def trace(name, *args, **kwargs):
+        scans.append(name)
+        return original(name, *args, **kwargs)
+    monkeypatch.setattr(engine_module, "_scan_side", trace)
     QTest.mouseClick(widget.sync_button, Qt.MouseButton.LeftButton)
-    dialog = wait_for_confirmation(application, widget)
-    details = dialog.findChild(QPlainTextEdit).toPlainText()
-    assert str(source) in details and str(target) in details
-    assert (target / "源端已经删除.md").exists()
-    dialog.accept()
     pump_until(application, lambda: not widget.busy)
+    assert scans == ["preflight_source", "preflight_target", "barrier_source"]
     assert widget.last_result.status == "success"
     assert widget.last_result.copied_files == 2
     assert not (target / "源端已经删除.md").exists()
@@ -171,6 +180,8 @@ def test_scheduled_empty_source_pauses_without_deleting(application, window):
 def test_empty_source_manual_no_then_yes(application, window):
     widget, source, target = window
     (target / "删除.md").write_text("old", encoding="utf-8")
+    widget.analyze()
+    pump_until(application, lambda: not widget.busy)
     widget.start_sync()
     dialog = wait_for_confirmation(application, widget)
     assert "为空" in dialog.windowTitle()

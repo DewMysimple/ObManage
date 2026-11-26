@@ -55,6 +55,28 @@ def test_preview_is_read_only_under_same_request(sample):
     assert DeploymentEngine(state).list_batches() == ()
 
 
+@pytest.mark.parametrize("changed", [False, True])
+def test_closed_targets_use_one_fresh_analysis_and_prompt_only_for_changed_preview(sample, monkeypatch, changed):
+    state, vaults, freeze = sample
+    request = freeze("B", open_after=False)
+    seen = workflow.preview(state, request, Event(), None)
+    if changed:
+        _workspace(vaults["B"]).write_text("edited after preview", encoding="utf-8")
+    analyses, prompts = [], []
+    original = DeploymentEngine.analyze
+    def analyze(engine, *args, **kwargs):
+        analyses.append(kwargs)
+        return original(engine, *args, **kwargs)
+    monkeypatch.setattr(DeploymentEngine, "analyze", analyze)
+    monkeypatch.setattr(workflow, "close_target_sessions", lambda *_args, **_kwargs: ())
+    monkeypatch.setattr(workflow, "assert_target_sessions_closed", lambda *_args, **_kwargs: None)
+    result = workflow.synchronize(state, None, request, Event(), None,
+                                  lambda approval: prompts.append(approval) or True, reviewed=(request, seen))
+    assert result.status == "success", result.error
+    assert len(analyses) == 1 and len(prompts) == int(changed)
+    assert _workspace(vaults["B"]).read_text() == "Source"
+
+
 def test_close_save_and_final_confirmation_apply_only_frozen_write_vaults(sample, monkeypatch):
     state, vaults, freeze = sample
     for relative in (".obsidian/workspace.json", ".claude/settings.json"):

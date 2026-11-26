@@ -148,6 +148,14 @@ class BaselineStore:
     def remove(self, pair_id: str, path: str) -> None:
         self.invalidate([(pair_id, path)])
 
+    @measured("sqlite_write", calls=True)
+    def reset_pair(self, forward: str, reverse: str) -> None:
+        """Retire both directions of one profile before a deep comparison."""
+        with self._write_transaction():
+            self.connection.execute("DELETE FROM baselines WHERE pair_id IN (?, ?)", (forward, reverse))
+        self._paths_by_pair[forward] = {}
+        self._paths_by_pair[reverse] = {}
+
     @measured("sqlite_register_temp", calls=True)
     def register_temp(self, pair_id: str, path: str, identity: tuple) -> None:
         self.connection.execute("INSERT INTO owned_temps VALUES (?, ?, ?)",

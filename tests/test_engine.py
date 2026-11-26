@@ -1101,6 +1101,8 @@ def test_unchanged_deep_verification_reestablishes_retired_baseline(mirror, monk
         return real_save(self, *args, **kwargs)
 
     monkeypatch.setattr(BaselineStore, "save", record_save)
+    monkeypatch.setattr(BaselineStore, "records",
+                        lambda *_: pytest.fail("A deep scan need not load the records it retires"))
 
     plan = analyze(engine, source, target, deep=True)
 

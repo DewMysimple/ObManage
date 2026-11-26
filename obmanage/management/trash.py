@@ -29,7 +29,7 @@ from typing import Callable, Iterable, Literal
 
 from ..copying import copy_stream_and_hash
 from ..models import SyncCancelled, SyncError
-from ..paths import assert_plain_chain, canonical, checked_child, identity, native, snapshot
+from ..paths import assert_plain_chain, canonical, checked_child_snapshot, identity, native, snapshot
 from ..reading import hash_stream
 
 
@@ -281,13 +281,17 @@ def _same_identity(left: PathSnapshot, right: PathSnapshot) -> bool:
     return (left.kind, left.device, left.inode) == (right.kind, right.device, right.inode)
 
 
-def _safe_child(root: str, relative_path: str) -> str:
+def _safe_child_snapshot(root: str, relative_path: str) -> tuple[str, dict | None]:
     # Roots have already been resolved. Full live ancestor checks reject links,
     # so resolving each root/child again cannot add a containment guarantee.
     try:
-        return checked_child(root, relative_path)
+        return checked_child_snapshot(root, relative_path)
     except (ValueError, SyncError) as exc:
         raise TrashSafetyError(f"回收站路径无法安全访问：{relative_path}（{exc}）") from exc
+
+
+def _safe_child(root: str, relative_path: str) -> str:
+    return _safe_child_snapshot(root, relative_path)[0]
 
 
 def _validate_relative(relative_path: str) -> tuple[str, ...]:
@@ -344,8 +348,7 @@ def _directory_digest(children: list[tuple[str, str, int, str]]) -> str:
 def _scan_content(root: str, cancel: Event | None = None,
                   progress: ProgressCallback = None, vault_root: str = "") -> tuple[tuple[TrashEntry, ...], str]:
     root = canonical(root)
-    assert_plain_chain(root)
-    root_before = _read_snapshot(root, "dir")
+    root_before = _to_snapshot(assert_plain_chain(root), root, "dir")
     entries: list[TrashEntry] = []
     seen: set[str] = set()
 
@@ -367,8 +370,8 @@ def _scan_content(root: str, cancel: Event | None = None,
             if normalized in seen:
                 raise TrashSafetyError(f"存在仅大小写不同的冲突路径：{relative}")
             seen.add(normalized)
-            child = _safe_child(root, relative)
-            child_state = _read_snapshot(child)
+            child, state = _safe_child_snapshot(root, relative)
+            child_state = _to_snapshot(state, child)
             if child_state.kind == "file":
                 child_digest = _hash_file(
                     child, child_state, cancel, progress, vault_root, relative

@@ -10,6 +10,7 @@ import hashlib
 import json
 import os
 import stat
+from collections.abc import Iterable
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -383,6 +384,21 @@ def validate_root_pair(source: str, target: str) -> None:
         common = ""
     if common in (src_key, dst_key):
         raise SyncError("源目录与目标目录不能相同，也不能互相包含。")
+
+
+def overlapping_roots(normalized_paths: Iterable[str]) -> tuple[int, int] | None:
+    """Find equal or nested scopes among already normalized absolute paths."""
+    owners: dict[Path, int] = {}
+    for index, value in enumerate(normalized_paths):
+        path = Path(value)
+        if path in owners:
+            return owners[path], index
+        owners[path] = index
+    for path, index in owners.items():
+        for parent in path.parents:
+            if parent in owners:
+                return owners[parent], index
+    return None
 
 
 def validate_roots(source: str, target: str) -> dict:

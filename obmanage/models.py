@@ -79,3 +79,4 @@ class SyncResult:
     errors: list[str] = field(default_factory=list)
     duration_seconds: float = 0.0
     renamed_items: int = 0
+    preflight_failed: bool = False

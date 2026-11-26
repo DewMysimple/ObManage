@@ -16,7 +16,7 @@ from ..store import BaselineStore
 from contextlib import ExitStack
 from ..models import Progress, SyncCancelled, SyncError, SyncPlan, SyncResult
 from ..paths import (
-    canonical, checked_child, revalidate_roots, snapshot,
+    canonical, checked_child, overlapping_roots, revalidate_roots, snapshot,
     validate_roots, validate_state_separation,
 )
 from .deployment import DeploymentEngine
@@ -95,21 +95,13 @@ def selected_plans(analysis: IncrementalAnalysis, choices: Mapping[str, str]) ->
         if (plan.source, plan.target) != expected or plan.mode != "mirror":
             raise SyncError("仓库来源或目标与预览不一致，请重新分析。")
         selected.append((pair, plan))
-    scopes: list[tuple[str, str]] = []
-    for pair, plan in selected:
-        for path in (plan.source, plan.target):
-            key = os.path.normcase(canonical(path))
-            for previous, label in scopes:
-                try:
-                    common = os.path.commonpath((key, previous))
-                except ValueError:
-                    continue
-                if common in (key, previous):
-                    raise SyncError(
-                        f"{pair.relative_path} 与 {label} 的仓库范围重叠；"
-                        "父仓库已包含子仓库，请分批选择。"
-                    )
-            scopes.append((key, pair.relative_path))
+    scopes = [(os.path.normcase(canonical(path)), pair.relative_path)
+              for pair, plan in selected for path in (plan.source, plan.target)]
+    overlap = overlapping_roots(key for key, _ in scopes)
+    if overlap is not None:
+        first, second = overlap
+        raise SyncError(f"{scopes[first][1]} 与 {scopes[second][1]} 的仓库范围重叠；"
+                        "父仓库已包含子仓库，请分批选择。")
     return selected
 
 
@@ -341,11 +333,13 @@ class IncrementalEngine:
                 if (plan.source_empty and any(item.action in {"delete", "rmdir"}
                                               for item in plan.items) and not allow_empty):
                     raise SyncError("来源为空，清空目标前需要额外确认。")
-            total_bytes = sum(plan.bytes_to_copy for _, plan in selected)
+            copy_sizes = [plan.bytes_to_copy for _, plan in selected]
+            total_bytes = sum(copy_sizes)
             completed_bytes = 0
             reported_bytes = 0
             for index, (pair, plan) in enumerate(selected):
                 _cancelled(cancel)
+                vault_bytes = copy_sizes[index]
                 revalidate_roots(analysis.context)
                 self._check_recovery()
 
@@ -353,7 +347,7 @@ class IncrementalEngine:
                     nonlocal reported_bytes
                     if progress:
                         reported_bytes = max(reported_bytes, completed_bytes + min(
-                            event.completed_bytes, plan.bytes_to_copy))
+                            event.completed_bytes, vault_bytes))
                         progress(replace(event, phase="incremental_execute",
                                          message=f"{index + 1}/{len(selected)} · {pair.relative_path} · {event.message}",
                                          completed_bytes=reported_bytes, total_bytes=total_bytes,

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime
 from enum import IntEnum
@@ -152,8 +153,7 @@ def _absolute_change_path(target_root: str, relative_path: str) -> str:
 
 def _confirmation_prompt(approval: SyncApproval) -> TaskConfirmation:
     request = approval.request
-    counts = {action: sum(change.action == action for change in approval.plan.changes)
-              for action in ("add", "update", "delete")}
+    counts = Counter(change.action for target in approval.plan.targets for change in target.changes)
     detail = [
         f"来源：{request.source}",
         f"组件：{'、'.join(request.component_names)}",
@@ -403,6 +403,7 @@ class DistributionPage(FeaturePage):
         self.obsidian_config_path = obsidian_config_path
         self.opened_vault_reader = opened_vault_reader or read_opened_vault_candidates
         self.plan: DeploymentPlan | None = None
+        self._reviewed: tuple[ComSyncRequest, DeploymentPlan] | None = None
         self.catalog: VaultCatalogResult | None = None
         self._catalog_root_binding: DirectoryBinding | None = None
         self._catalog_bindings: dict[str, DirectoryBinding] = {}
@@ -937,6 +938,7 @@ class DistributionPage(FeaturePage):
         self._reset_recovery_preview()
         self._reset_finalize_confirmation()
         self.plan = None
+        self._reviewed = None
         self.preview_model.set_rows(())
         self.preview_empty.setVisible(self.compact_sync)
         self.preview_summary.setText("新增 — · 更新 — · 删除：尚未分析 · 跳过 —")
@@ -944,6 +946,8 @@ class DistributionPage(FeaturePage):
             self.set_status(message)
 
     def invalidate_confirmation(self) -> None:
+        if self._reviewed is not None or (self._task_active and self._task_kind == "analyze"):
+            self._invalidate_plan()
         self._reset_recovery_preview()
         blocker = QSignalBlocker(self.finalize_confirm)
         self.finalize_confirm.setChecked(False)
@@ -1035,18 +1039,19 @@ class DistributionPage(FeaturePage):
     def _freeze_request(self) -> ComSyncRequest:
         assert self._catalog_root_binding is not None
         source = str(source_root(self.source_picker.value))
+        paths = self._selected_target_paths()
         return ComSyncRequest(
             version=self._request_version,
             source=source,
             collection=self._catalog_root_binding,
             selected_targets=tuple(
                 ComSyncTarget(_target_id(path), self._catalog_bindings[path])
-                for path in self._selected_target_paths()
+                for path in paths
             ),
             component_names=tuple(self.component_boxes[key].text() for key in self.selected_component_ids()),
             components=self._components(),
             label=self.batch_label,
-            open_after_sync=len(self._selected_target_paths()) == 1,
+            open_after_sync=len(paths) == 1,
         )
 
     @Slot()
@@ -1058,7 +1063,7 @@ class DistributionPage(FeaturePage):
         state_dir = self.state_dir
 
         def operation(cancel, progress):
-            return request.version, preview(state_dir, request, cancel, progress)
+            return request, preview(state_dir, request, cancel, progress)
 
         self.start_task("analyze", operation)
 
@@ -1069,13 +1074,16 @@ class DistributionPage(FeaturePage):
             return
         if not self.execute_button.isEnabled():
             return
-        self._invalidate_plan("正在准备本轮同步。")
+        reviewed = self._reviewed
+        self._reviewed = None
+        if reviewed is None:
+            self._invalidate_plan("正在准备本轮同步。")
         request = self._freeze_request()
         state_dir, config_path = self.state_dir, self.obsidian_config_path
 
         def operation(cancel, progress, confirm):
             return synchronize(state_dir, config_path, request, cancel, progress,
-                               lambda approval: confirm(_confirmation_prompt(approval)))
+                               lambda approval: confirm(_confirmation_prompt(approval)), reviewed=reviewed)
 
         self.start_task("execute", ConfirmableOperation(operation))
 
@@ -1434,9 +1442,10 @@ class DistributionPage(FeaturePage):
         elif kind == "running_targets":
             self._accept_running_targets(payload)
         elif kind == "analyze":
-            version, plan = payload
-            if version == self._request_version:
+            request, plan = payload
+            if request.version == self._request_version:
                 self._accept_plan(plan)
+                self._reviewed = request, plan
         elif kind == "execute":
             self._accept_sync_result(payload)
         elif kind == "inspect_recovery":

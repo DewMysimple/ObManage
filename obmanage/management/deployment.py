@@ -21,13 +21,14 @@ import threading
 import time
 import uuid
 from dataclasses import dataclass, field, replace
+from functools import cached_property
 from pathlib import Path
 from typing import Any, Callable, Iterable
 
 from ..copying import copy_stream_and_hash
 from ..reading import ReadScope, hash_stream
 from ..models import Progress, SyncCancelled, SyncError
-from ..paths import (assert_plain_chain, canonical, checked_child, identity, native,
+from ..paths import (assert_plain_chain, canonical, checked_child, identity, native, overlapping_roots,
                      snapshot, volume_identity)
 from .journal import (DeploymentJournal, JournalBatch, JournalError, JournalTarget,
                       ManagedCopy, OwnedDirectory)
@@ -308,11 +309,11 @@ class FrozenTree:
     root_snapshot: EntrySnapshot
     entries: tuple[TreeEntry, ...]
 
-    @property
+    @cached_property
     def files(self) -> tuple[TreeEntry, ...]:
         return tuple(item for item in self.entries if item.snapshot.kind == "file")
 
-    @property
+    @cached_property
     def total_bytes(self) -> int:
         return sum(item.snapshot.size for item in self.files)
 
@@ -768,20 +769,14 @@ def _directory_tree(root: str) -> FrozenTree:
     return FrozenTree(root, volume_identity(root), state, ())
 
 
-def _portable_equal(first: FrozenTree | None, second: FrozenTree | None) -> bool:
-    if first is None or second is None:
-        return first is second
-    return first.manifest() == second.manifest()
-
-
-def _compare_entries(source: FrozenTree, target: FrozenTree | None) -> tuple[FileChange, ...]:
+def _compare_entries(source: FrozenTree, target: FrozenTree | None) -> tuple[tuple[FileChange, ...], bool]:
     source_entries = {_case_key(item.relative_path): item for item in source.entries}
     target_entries = ({_case_key(item.relative_path): item for item in target.entries}
                       if target is not None else {})
     changes: list[FileChange] = []
     if target is None:
         changes.append(FileChange("add", "", 0, "限定目标根目录不存在", kind="dir"))
-    for key in sorted(set(source_entries) | set(target_entries)):
+    for key in sorted(source_entries.keys() | target_entries.keys()):
         source_item, target_item = source_entries.get(key), target_entries.get(key)
         if source_item is None:
             changes.append(FileChange("delete", target_item.relative_path, target_item.snapshot.size,
@@ -797,8 +792,10 @@ def _compare_entries(source: FrozenTree, target: FrozenTree | None) -> tuple[Fil
             ))
         elif source_item.snapshot.kind == "file" and (
                 source_item.relative_path != target_item.relative_path
+                or source_item.snapshot.size != target_item.snapshot.size
                 or source_item.snapshot.sha256 != target_item.snapshot.sha256):
-            reason = ("文件名大小写不同" if source_item.snapshot.sha256 == target_item.snapshot.sha256
+            reason = ("文件名大小写不同" if source_item.snapshot.size == target_item.snapshot.size
+                      and source_item.snapshot.sha256 == target_item.snapshot.sha256
                       else "完整内容不同")
             changes.append(FileChange("update", source_item.relative_path,
                                       source_item.snapshot.size, reason, kind="file"))
@@ -810,7 +807,7 @@ def _compare_entries(source: FrozenTree, target: FrozenTree | None) -> tuple[Fil
                                       source_item.snapshot.size,
                                       "完整内容相同" if source_item.snapshot.kind == "file" else "目录已存在",
                                       kind=source_item.snapshot.kind))
-    needs_deploy = not _portable_equal(source, target)
+    needs_deploy = any(change.action != "skip" for change in changes)
     if needs_deploy:
         changes = [replace(
             change,
@@ -818,7 +815,7 @@ def _compare_entries(source: FrozenTree, target: FrozenTree | None) -> tuple[Fil
                     if change.action == "skip" else change.reason),
             will_replace_entity=True,
         ) for change in changes]
-    return tuple(changes)
+    return tuple(changes), needs_deploy
 
 
 def _tree_payload(tree: FrozenTree | None) -> Any:
@@ -1199,14 +1196,13 @@ class DeploymentEngine:
             self._check_state_location(source_roots, dict.fromkeys(target_roots))
             source_keys = {_path_key(root) for root in source_roots}
             target_keys = tuple(_path_key(path) for path in logical_targets)
-            for index, target_key in enumerate(target_keys):
+            for target_key in target_keys:
                 _cancelled(cancel)
                 for source_key in source_keys:
                     if _path_keys_overlap(source_key, target_key):
                         raise DeploymentError("组件来源与任一限定目标不能相同或互相包含。")
-                for other_key in target_keys[index + 1:]:
-                    if _path_keys_overlap(target_key, other_key):
-                        raise DeploymentError("多个限定目标不能相同或互相包含。")
+            if overlapping_roots(target_keys) is not None:
+                raise DeploymentError("多个限定目标不能相同或互相包含。")
             source_cache: dict[str, FrozenTree] = {}
             target_plans: list[DeploymentTargetPlan] = []
             for index, (
@@ -1235,11 +1231,15 @@ class DeploymentEngine:
                 selection_id = str(uuid.uuid5(uuid.UUID(batch_id), f"{index}:{selection.component.component_id}:"
                                                                    f"{selection.target.target_id}"))
                 desired_target = logical_targets[index]
-                changes = ((FileChange(
-                    "skip" if existing else "add", "", 0,
-                    "目录已存在，保留其全部内容" if existing else "仅创建空目录，不复制来源内容",
-                    kind="dir",
-                ),) if directory_only else _compare_entries(source_tree, target_tree))
+                if directory_only:
+                    needs_deploy = not existing
+                    changes = (FileChange(
+                        "skip" if existing else "add", "", 0,
+                        "目录已存在，保留其全部内容" if existing else "仅创建空目录，不复制来源内容",
+                        kind="dir",
+                    ),)
+                else:
+                    changes, needs_deploy = _compare_entries(source_tree, target_tree)
                 item = DeploymentTargetPlan(
                     selection_id=selection_id,
                     component_id=selection.component.component_id,
@@ -1250,7 +1250,7 @@ class DeploymentEngine:
                     target_path=desired_target,
                     existing_target_path=existing or None,
                     changes=changes,
-                    needs_deploy=not _portable_equal(source_tree, target_tree),
+                    needs_deploy=needs_deploy,
                     source_tree=source_tree,
                     target_tree=target_tree,
                     target_volume=volume_identity(target_root),
@@ -1295,6 +1295,14 @@ class DeploymentEngine:
                 or (original_tree is not None and current_tree is not None
                     and original_tree.root_snapshot.identity != current_tree.root_snapshot.identity)):
             raise DeploymentError(f"关闭窗口期间，限定目标目录身份已改变：{current.target_path}")
+
+    def writes_only(self, plan: DeploymentPlan) -> DeploymentPlan:
+        """Keep the original batch and seal only the components that need a write."""
+        targets = tuple(item for item in plan.targets if item.needs_deploy)
+        if len(targets) == len(plan.targets):
+            return plan
+        self._validate_plan(plan)
+        return replace(plan, targets=targets, seal=_seal_plan(plan.batch_id, plan.label, targets, plan.created_at))
 
     def _validate_plan(self, plan: DeploymentPlan) -> None:
         try:

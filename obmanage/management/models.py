@@ -92,18 +92,14 @@ class VaultStatisticsResult:
     @property
     def file_types(self) -> tuple[FileTypeStatistics, ...]:
         """Aggregate category totals across every returned vault."""
-        totals: dict[str, FileTypeStatistics] = {}
+        groups: dict[str, list[FileTypeStatistics]] = {}
         for vault in self.statistics:
             for item in vault.file_types:
-                current = totals.get(item.category)
-                totals[item.category] = FileTypeStatistics(
-                    category=item.category,
-                    label=item.label,
-                    files=item.files + (current.files if current else 0),
-                    total_bytes=item.total_bytes + (current.total_bytes if current else 0),
-                    extensions=tuple(sorted(
-                        set(item.extensions) | (set(current.extensions) if current else set()),
-                        key=lambda value: (value.casefold(), value),
-                    )),
-                )
-        return tuple(totals.values())
+                groups.setdefault(item.category, []).append(item)
+        return tuple(FileTypeStatistics(
+            category=category, label=items[-1].label,
+            files=sum(item.files for item in items),
+            total_bytes=sum(item.total_bytes for item in items),
+            extensions=tuple(sorted({ext for item in items for ext in item.extensions},
+                                    key=lambda ext: (ext.casefold(), ext))),
+        ) for category, items in groups.items())

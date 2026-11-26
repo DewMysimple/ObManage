@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Callable
 
 from ..models import Progress, SyncCancelled
@@ -113,8 +113,17 @@ def _select_writes(targets, plan) -> tuple[ComSyncTarget, ...]:
     return tuple(target for target in targets if target.target_id in write_ids)
 
 
+def _same_preview(previous: DeploymentPlan, current: DeploymentPlan) -> bool:
+    # Each fresh analysis assigns new batch-specific selection IDs. Compare every
+    # other field, including full trees, SHA-256, directory identities and changes.
+    return (previous.label == current.label and len(previous.targets) == len(current.targets)
+            and all(old == replace(new, selection_id=old.selection_id)
+                    for old, new in zip(previous.targets, current.targets)))
+
+
 def synchronize(state_dir, config_path, request: ComSyncRequest, cancel, progress,
-                confirm: Callable[[SyncApproval], bool]) -> ComSyncOutcome:
+                confirm: Callable[[SyncApproval], bool], *,
+                reviewed: tuple[ComSyncRequest, DeploymentPlan] | None = None) -> ComSyncOutcome:
     """Keep the close ledger alive through errors, cancellation and rollback."""
     if progress is None:
         progress = lambda _event: None
@@ -151,9 +160,12 @@ def synchronize(state_dir, config_path, request: ComSyncRequest, cancel, progres
                                   expected_identities={target.path: target.binding.identity for target in writes})
             _check_cancel(cancel)
             _check_bindings(request.collection, source, writes)
-            progress(Progress("final-analysis", "正在检查窗口关闭后保存的配置…"))
-            plan = engine.analyze(request.deployment(writes), cancel=cancel,
-                                  progress=progress, before_close=before)
+            if closed:
+                progress(Progress("final-analysis", "正在检查窗口关闭后保存的配置…"))
+                plan = engine.analyze(request.deployment(writes), cancel=cancel,
+                                      progress=progress, before_close=before)
+            else:
+                plan = engine.writes_only(before)
             final_writes = _select_writes(writes, plan)
             skip_reasons.update((target.path, "窗口关闭后复核一致，已跳过")
                                 for target in writes if target not in final_writes)
@@ -163,7 +175,9 @@ def synchronize(state_dir, config_path, request: ComSyncRequest, cancel, progres
                     request, plan, final_paths, _skip_summary(skip_reasons), tuple(closed)
                 )
                 _check_bindings(request.collection, source, final_writes)
-                if not confirm(approval):
+                already_reviewed = (not closed and reviewed is not None and reviewed[0] == request
+                                    and _same_preview(reviewed[1], before))
+                if not already_reviewed and not confirm(approval):
                     raise SyncCancelled("已撤销本轮确认。")
                 _check_cancel(cancel)
                 require_recovery_clear(state_dir)

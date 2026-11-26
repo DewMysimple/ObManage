@@ -123,8 +123,7 @@ def _inventory(source, exclude_videos, cancel):
     while stack:
         _cancel(cancel)
         folder, prefix = stack.pop()
-        assert_plain_chain(folder)
-        before = snapshot(folder)
+        before = assert_plain_chain(folder, attributes_only_ancestors=True)
         if before is None or before["kind"] != "dir":
             raise SyncError(f"目录已改变：{folder}")
         with scandir(native(folder)) as iterator:
@@ -141,14 +140,16 @@ def _inventory(source, exclude_videos, cancel):
             rows.append(ArchiveEntry(relative, state, reason))
             if state["kind"] == "dir" and not reason:
                 stack.append((path, relative + "/"))
-        assert_plain_chain(folder)
-        if snapshot(folder) != before:
+        if assert_plain_chain(folder, attributes_only_ancestors=True) != before:
             raise SyncError(f"枚举期间目录改变：{folder}")
     return tuple(sorted(rows, key=lambda e: e.path))
 
 
 def _same_inventory(first, second):
-    return tuple((e.path, e.state, e.excluded) for e in first) == tuple((e.path, e.state, e.excluded) for e in second)
+    return len(first) == len(second) and all(
+        a.path == b.path and a.state == b.state and a.excluded == b.excluded
+        for a, b in zip(first, second)
+    )
 
 
 def _verify_zip(path, entries, cancel, progress=None):
@@ -228,8 +229,7 @@ class ArchiveEngine:
         validate_state_separation(self.state_dir, (plan.source,))
         for path, state, volume in ((plan.source, plan.source_state, plan.source_volume),
                                     (str(Path(plan.output).parent), plan.output_state, plan.output_volume)):
-            assert_plain_chain(path)
-            if identity(snapshot(path)) != identity(state) or volume_identity(path) != volume:
+            if identity(assert_plain_chain(path)) != identity(state) or volume_identity(path) != volume:
                 raise SyncError("来源或保存位置的磁盘/目录身份改变，请重新预览。")
         if snapshot(checked_child(str(Path(plan.output).parent), Path(plan.output).name)) is not None:
             raise SyncError("输出位置已有同名文件，已停止，旧文件保持不变。")
@@ -241,7 +241,8 @@ class ArchiveEngine:
         _cancel(cancel)
         self._validate(plan, cancel)
         directory = str(Path(plan.output).parent)
-        files, total_bytes = plan.files, plan.total_bytes
+        files = plan.files
+        total_bytes = sum(entry.state["size"] for entry in files)
         if shutil.disk_usage(native(directory)).free < total_bytes + len(plan.entries) * 512 + 1024 * 1024:
             raise SyncError("保存位置可用空间不足；请预留未压缩大小及 ZIP 目录空间。")
         started = time.monotonic()

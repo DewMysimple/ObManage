@@ -37,7 +37,9 @@ from PySide6.QtWidgets import (
 from ..engine import SYNC_MODE_NO_VIDEO, SyncEngine
 from ..file_types import VIDEO_EXTENSIONS
 from ..models import PlanItem, Progress, SyncPlan, SyncResult
-from ..sync_workflow import SyncIntent, SyncRequest, confirmation_text, preview_copy, run_sync, sync_input_error
+from ..sync_workflow import (
+    SyncIntent, SyncRequest, confirmation_text, preview_copy, run_sync, sync_input_error, would_empty_target,
+)
 from ..tasking import ConfirmableOperation, TaskConfirmation
 from .common import FeaturePage, PathPicker, format_bytes, panel
 
@@ -155,16 +157,14 @@ class BackupPlanTableModel(QAbstractTableModel):
         if not index.isValid() or not 0 <= index.row() < len(self.rows):
             return None
         item = self.rows[index.row()]
-        source_path = _absolute_path(self.source, item.relative_path)
-        target_path = _absolute_path(self.target, item.relative_path)
-        values = (
-            self._action_text(item),
-            target_path,
-            "—" if item.action in {"mkdir", "rmdir"} else format_bytes(item.size),
-            item.reason,
-        )
         if role == Qt.ItemDataRole.DisplayRole:
-            return values[index.column()]
+            if index.column() == self.ACTION_COLUMN:
+                return self._action_text(item)
+            if index.column() == self.TARGET_COLUMN:
+                return _absolute_path(self.target, item.relative_path)
+            if index.column() == self.SIZE_COLUMN:
+                return "—" if item.action in {"mkdir", "rmdir"} else format_bytes(item.size)
+            return item.reason
         if role == Qt.ItemDataRole.UserRole:
             return item.action
         if role == Qt.ItemDataRole.ToolTipRole:
@@ -174,7 +174,8 @@ class BackupPlanTableModel(QAbstractTableModel):
                 else f"所有实际修改只发生在{self.target_name}。"
             )
             return (
-                f"{values[0]}\n目标位置：{target_path}\n对应来源：{source_path}\n"
+                f"{self._action_text(item)}\n目标位置：{_absolute_path(self.target, item.relative_path)}\n"
+                f"对应来源：{_absolute_path(self.source, item.relative_path)}\n"
                 f"{item.reason}\n{effect}\n{self.source_name}只读取。"
             )
         if role == Qt.ItemDataRole.ForegroundRole and index.column() == 0:
@@ -197,8 +198,7 @@ class BackupPlanFilterModel(QSortFilterProxyModel):
     def filterAcceptsRow(self, row: int, parent: QModelIndex) -> bool:
         if self.actions is None:
             return True
-        model = self.sourceModel()
-        return model.data(model.index(row, 0, parent), Qt.ItemDataRole.UserRole) in self.actions
+        return self.sourceModel().rows[row].action in self.actions
 
 
 class BackupPlanTableView(QTableView):
@@ -257,6 +257,7 @@ class VaultBackupPage(FeaturePage):
         )
         self.state_dir = Path(state_dir)
         self.plan: SyncPlan | None = None
+        self._reviewed_plan: SyncPlan | None = None
         self.last_result: SyncResult | None = None
         self._sync_request: SyncRequest | None = None
         direction = settings.get("direction", "to_local")
@@ -524,10 +525,13 @@ class VaultBackupPage(FeaturePage):
 
     def _invalidate_plan(self, message: str) -> None:
         self.plan = None
+        self._reviewed_plan = None
+        if self._sync_request is not None and self._sync_request.intent is SyncIntent.PREVIEW:
+            self._sync_request = None
         self.model.set_rows([])
         self.preview_stack.setCurrentIndex(0)
         self.empty_title.setText("等待分析非视频差异")
-        self.empty_detail.setText("分析只读取两端。同步前会确认方向与删除范围。")
+        self.empty_detail.setText("可先预览非视频变更，再点击同步执行。直接同步会先显示本轮差异。")
         for value in self.summary_values.values():
             value.setText("—")
         for index, (name, _actions) in enumerate(BACKUP_FILTERS):
@@ -535,6 +539,11 @@ class VaultBackupPage(FeaturePage):
         if not self._task_active:
             self.set_status(message)
         self.refresh_actions()
+
+    def invalidate_confirmation(self) -> None:
+        if self._reviewed_plan is not None or (
+                self._sync_request is not None and self._sync_request.intent is SyncIntent.PREVIEW):
+            self._invalidate_plan("可重新预览，或直接同步并确认本轮非视频差异。")
 
     @Slot(int)
     def _filter_changed(self, index: int) -> None:
@@ -565,12 +574,15 @@ class VaultBackupPage(FeaturePage):
         if intent is SyncIntent.MANUAL and (input_error := sync_input_error(source, target)):
             self.set_status(input_error, "warning")
             return
-        self._invalidate_plan("正在分析；此阶段只读取两个仓库。")
+        reviewed = self._reviewed_plan if intent is SyncIntent.MANUAL else None
+        self._reviewed_plan = None
+        if reviewed is None:
+            self._invalidate_plan("正在读取两个仓库。")
         self.last_result = None
         self._refresh_direction_text()
         state_dir = self.state_dir
         source_name, target_name = self._endpoint_names()
-        request = SyncRequest(source, target, source_name, target_name, SYNC_MODE_NO_VIDEO, intent, deep)
+        request = SyncRequest(source, target, source_name, target_name, SYNC_MODE_NO_VIDEO, intent, deep, reviewed)
 
         def operation(cancel, progress, confirm=None):
             def approve(plan):
@@ -590,14 +602,9 @@ class VaultBackupPage(FeaturePage):
         if not self._task_active:
             self._sync_request = None
             return
-        self.set_status(
-            f"正在以{source_name}为准分析非视频差异；{target_name}尚未修改。",
-            "busy",
-        )
-        self.message_logged.emit(
-            f"开始{'完整校验' if deep else '分析'}无视频备份：{source} → {target}；"
-            "视频不复制、不覆盖、不删除。"
-        )
+        action = "复核已预览的变更" if reviewed is not None else "完整内容校验" if deep else "分析非视频差异"
+        self.set_status(f"正在{action} · {source_name} → {target_name}", "busy")
+        self.message_logged.emit(f"无视频备份{action}：{source} → {target}")
 
     def task_confirmation(self, prompt: TaskConfirmation) -> bool:
         plan = prompt.payload
@@ -652,11 +659,8 @@ class VaultBackupPage(FeaturePage):
                 "success",
             )
         else:
-            self.set_status(
-                f"预览已就绪：仅修改{target_name}的非视频内容；"
-                f"已排除 {counts['exclude']:,} 个视频。",
-                "success",
-            )
+            hint = "同步时需确认清空非视频内容。" if would_empty_target(plan) else f"点击“同步到{target_name}”即可执行。"
+            self.set_status(f"已排除 {counts['exclude']:,} 个视频。{hint}", "success")
         self.message_logged.emit(
             f"无视频备份分析完成：新增 {counts['add']} 文件 / {counts['mkdir']} 文件夹，"
             f"更新 {counts['update']}，重命名 {counts['rename']}，"
@@ -687,10 +691,10 @@ class VaultBackupPage(FeaturePage):
             )
         else:
             detail = result.errors[0] if result.errors else "未知错误"
-            self.set_status(
-                f"备份未完整完成：{summary}。首个问题：{detail}",
-                "error",
-            )
+            if result.preflight_failed:
+                self.set_status(f"执行前复核失败，仓库尚未修改。请重新预览。{detail}", "warning")
+            else:
+                self.set_status(f"备份未完整完成：{summary}。首个问题：{detail}", "error")
         self.message_logged.emit(self.status_label.text())
         self.preview_title.setText(
             f"本轮执行前记录 · {datetime.now():%H:%M:%S} · 视频未处理"
@@ -701,7 +705,11 @@ class VaultBackupPage(FeaturePage):
         super().task_finished(status, payload)
         if status == "ok":
             if isinstance(payload, SyncPlan):
-                self._accept_plan(payload)
+                if self._sync_request is not None:
+                    if (self._sync_request.intent is SyncIntent.PREVIEW
+                            and payload.context.get("validated") and payload.can_execute):
+                        self._reviewed_plan = payload
+                    self._accept_plan(preview_copy(payload))
             elif kind == "sync":
                 self._accept_result(payload)
         elif kind.startswith("analyze"):

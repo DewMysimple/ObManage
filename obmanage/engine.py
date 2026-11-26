@@ -89,6 +89,20 @@ def _key(relative: str) -> str:
     return os.path.normcase(relative)
 
 
+def _matching_baselines(records, source_by_key, target_by_key):
+    matched, stale_paths = set(), []
+    for path, (source, target, _digest) in records.items():
+        key = _key(path)
+        if (key in source_by_key and source == source_by_key[key]
+                and key in target_by_key and target == target_by_key[key]):
+            matched.add(key)
+        else:
+            stale_paths.append(path)
+    # Retiring one spelling also retires all case-only aliases in the store.
+    matched.difference_update(_key(path) for path in stale_paths)
+    return matched, stale_paths
+
+
 def _require_manifest(expected: Mapping[str, Mapping], current: Mapping[str, Mapping], *,
                       root: str, side: str, message: str) -> None:
     """Explain the exact failed snapshot comparison without rereading or relaxing it."""
@@ -124,10 +138,6 @@ def _scan(root: str, cancel: threading.Event | None, progress: ProgressCallback,
     if mode not in _SYNC_MODES:
         raise SyncError("同步模式无效。")
     _cancelled(cancel)
-    root_state = snapshot(root)
-    if root_state is None:
-        return {}, {}
-    assert_plain_chain(root)
     entries: dict[str, dict] = {}
     excluded: dict[str, dict] = {}
     seen: set[str] = set()
@@ -135,7 +145,9 @@ def _scan(root: str, cancel: threading.Event | None, progress: ProgressCallback,
     while stack:
         _cancelled(cancel)
         folder, prefix = stack.pop()
-        assert_plain_chain(folder)
+        folder_state = assert_plain_chain(folder, attributes_only_ancestors=True)
+        if folder_state is None and not prefix:
+            return {}, {}
         try:
             with scandir(native(folder)) as iterator:
                 for entry in iterator:
@@ -155,9 +167,10 @@ def _scan(root: str, cancel: threading.Event | None, progress: ProgressCallback,
                         # the mirror namespace so a later mirror cannot copy or
                         # delete the only recoverable original.
                         continue
-                    if _key(relative) in seen:
+                    key = _key(relative)
+                    if key in seen:
                         raise SyncError(f"存在 Windows 无法区分的大小写重名路径：{relative}")
-                    seen.add(_key(relative))
+                    seen.add(key)
                     if (mode == SYNC_MODE_NO_VIDEO and state["kind"] == "file"
                             and is_video_filename(entry.name)):
                         excluded[relative] = state
@@ -468,6 +481,7 @@ class SyncEngine:
         # The desktop product promises one active analysis/sync task. Keep that
         # invariant even when callers accidentally construct multiple engines.
         self._lock = _ENGINE_TASK_LOCK
+        self._execution_candidate: SyncPlan | None = None
 
     def _check_state_location(self, source: str, target: str) -> None:
         self.state_dir = Path(
@@ -476,16 +490,21 @@ class SyncEngine:
 
     @scan_task("mirror")
     def analyze(self, source: str, target: str, *, deep: bool = False,
-                mode: str = SYNC_MODE_MIRROR,
+                mode: str = SYNC_MODE_MIRROR, for_execution: bool = False,
                 cancel: threading.Event | None = None, progress: ProgressCallback = None) -> SyncPlan:
-        return self._analyze(source, target, deep=deep, mode=mode, cancel=cancel, progress=progress)
+        """Standalone previews finish both inventories. For immediate execution the same
+        engine can finish a nonempty candidate's checks in the write preflight instead.
+        """
+        return self._analyze(source, target, deep=deep, mode=mode, cancel=cancel, progress=progress,
+                             for_execution=for_execution)
 
     def _analyze(self, source, target, *, deep=False, mode=SYNC_MODE_MIRROR,
                  cancel=None, progress=None, views=None, shared_store=None,
-                 defer_final=False):
+                 defer_final=False, for_execution=False):
         if not self._lock.acquire(blocking=False):
             raise SyncError("已有同步任务运行中。")
         plan = SyncPlan(source=str(source), target=str(target), mode=mode)
+        self._execution_candidate = None
         store = shared_store
         owns_store = shared_store is None
         try:
@@ -523,7 +542,12 @@ class SyncEngine:
             self._plan_from_manifests(plan, source_entries, target_entries,
                 source_excluded, target_excluded, store, deep=deep, cancel=cancel, progress=progress)
             _cancelled(cancel)
-            if not defer_final:
+            if for_execution and not defer_final and not plan.source_empty and plan.can_execute and plan.has_changes:
+                # The worker will execute this exact plan on this engine. Its first write
+                # barrier checks both manifests after the user's decision. Independent
+                # previews, no-op results and batch analysis retain their own end checks.
+                self._execution_candidate = plan
+            elif not defer_final:
                 revalidate_roots(context)
                 self._validate_analysis_manifests(plan, cancel)
                 context["validated"] = True
@@ -570,52 +594,21 @@ class SyncEngine:
             plan.excluded_target_bytes = sum(
                 state["size"] for state in target_excluded.values()
             )
-            baselines = store.records(plan.pair_id)
-            # Equality of two verified file versions is symmetric. Keep each
-            # direction's records separate, but reuse the opposite direction
-            # only when *both* exact snapshots still match after swapping. The
-            # reversed key includes the ordered canonical paths and volumes.
-            reverse_baselines = store.records(context["reverse_pair_id"])
-            source_by_key = {_key(path): state for path, state in source_entries.items()}
-            target_by_key = {_key(path): state for path, state in target_entries.items()}
-            stale_records = []
-            for path, record in baselines.items():
-                key = _key(path)
-                if (key not in source_by_key or key not in target_by_key
-                        or record[:2] != (source_by_key[key], target_by_key[key])):
-                    stale_records.append((plan.pair_id, path))
-            for path, record in reverse_baselines.items():
-                key = _key(path)
-                if (key not in source_by_key or key not in target_by_key
-                        or record[:2] != (target_by_key[key], source_by_key[key])):
-                    stale_records.append((context["reverse_pair_id"], path))
-            invalidated_records = list(stale_records)
-            count("baseline_stale_records", len(set(stale_records)))
+            reverse_pair = context["reverse_pair_id"]
             if deep:
-                # Retire old equality claims before reading content. A crash,
-                # cancellation, or later database error therefore cannot make
-                # a completed deep mismatch disappear into the old cache.
-                invalidated_records.extend(
-                    (plan.pair_id, path) for path in baselines
-                )
-                invalidated_records.extend(
-                    (context["reverse_pair_id"], path) for path in reverse_baselines
-                )
-            if invalidated_records:
-                # Once an observed file version no longer matches its equality
-                # claim, never let that claim become valid again by coincidence.
-                store.invalidate(invalidated_records)
-            stale_keys = {
-                (pair_id, _key(path)) for pair_id, path in invalidated_records
-            }
-            baseline_keys = {
-                _key(path): (path, record) for path, record in baselines.items()
-                if (plan.pair_id, _key(path)) not in stale_keys
-            }
-            reverse_keys = {
-                _key(path): (path, record) for path, record in reverse_baselines.items()
-                if (context["reverse_pair_id"], _key(path)) not in stale_keys
-            }
+                store.reset_pair(plan.pair_id, reverse_pair)
+                baseline_keys, reverse_keys = set(), set()
+            else:
+                source_by_key = {_key(path): state for path, state in source_entries.items()}
+                target_by_key = {_key(path): state for path, state in target_entries.items()}
+                baseline_keys, stale = _matching_baselines(
+                    store.records(plan.pair_id), source_by_key, target_by_key)
+                reverse_keys, reverse_stale = _matching_baselines(
+                    store.records(reverse_pair), target_by_key, source_by_key)
+                count("baseline_stale_records", len(stale) + len(reverse_stale))
+                if stale or reverse_stale:
+                    store.invalidate([(plan.pair_id, path) for path in stale]
+                                     + [(reverse_pair, path) for path in reverse_stale])
             if context["source_volume"] != context["target_volume"]:
                 # At most one sequential reader per volume: overlap C: and the
                 # portable disk without making either disk seek across files.
@@ -632,12 +625,13 @@ class SyncEngine:
             source_reads, target_reads = ReadScope(plan.source), ReadScope(plan.target)
             for relative, src in sorted(source_entries.items()):
                 _cancelled(cancel)
-                target_name = context["target_names"].get(_key(relative), relative)
+                key = _key(relative)
+                target_name = context["target_names"].get(key, relative)
                 dst = target_entries.get(target_name)
                 if (dst is not None and src["kind"] == dst["kind"] and os.name == "nt"
                         and relative.rsplit("/", 1)[-1] != target_name.rsplit("/", 1)[-1]
                         and not (src["kind"] == "dir"
-                                 and _key(relative) in protected_target_directories)):
+                                 and key in protected_target_directories)):
                     plan.items.append(PlanItem("rename", relative, reason="统一文件名大小写，无需复制内容"))
                 if dst is not None and src["kind"] != dst["kind"]:
                     item = PlanItem("error", relative, reason="源与目标存在文件/文件夹同名冲突")
@@ -650,12 +644,10 @@ class SyncEngine:
                     item = PlanItem("mkdir", relative, reason="创建空目录或父目录")
                 elif dst is None:
                     item = PlanItem("add", relative, src["size"], "目标中不存在")
-                elif (not deep and _key(relative) in baseline_keys
-                      and baseline_keys[_key(relative)][1][:2] == (src, dst)):
+                elif key in baseline_keys:
                     count("baseline_hits")
                     item = PlanItem("skip", relative, src["size"], "两端与上次校验记录一致")
-                elif (not deep and _key(target_name) in reverse_keys
-                      and reverse_keys[_key(target_name)][1][:2] == (dst, src)):
+                elif key in reverse_keys:
                     # The opposite direction already durably owns this exact
                     # equality claim. Do not duplicate N records/commits merely
                     # because the user switches direction; both are read each run.
@@ -670,9 +662,7 @@ class SyncEngine:
                         src_path, src, dst_path, dst, cancel, progress, relative, hash_pool
                     )
                     if src_digest == dst_digest:
-                        verified = (src, dst, src_digest)
                         store.save(plan.pair_id, relative, src, dst, src_digest)
-                        baseline_keys[_key(relative)] = (relative, verified)
                         item = PlanItem("skip", relative, src["size"], "SHA-256 内容相同")
                     else:
                         # A confirmed mismatch supersedes every prior equality
@@ -682,8 +672,6 @@ class SyncEngine:
                             (plan.pair_id, relative),
                             (context["reverse_pair_id"], target_name),
                         ])
-                        baseline_keys.pop(_key(relative), None)
-                        reverse_keys.pop(_key(target_name), None)
                         item = PlanItem("update", relative, src["size"], "内容不同，以源端为准")
                 plan.items.append(item)
                 _emit(progress, "compare", relative_path=relative,
@@ -1075,8 +1063,7 @@ class SyncEngine:
         protected = plan.context.get("protected_target_directories", set())
         for source_name in plan.context["source_entries"]:
             key = _key(source_name)
-            inside_protected = _inside_protected_directory(key, protected)
-            if actual_names.get(key) != source_name and not inside_protected:
+            if actual_names.get(key) != source_name and not _inside_protected_directory(key, protected):
                 raise SyncError(f"目标文件名的大小写与源端不同，请重新分析差异：{source_name}")
 
     def _rename(self, plan: SyncPlan, item: PlanItem, expected: dict[str, dict],
@@ -1189,7 +1176,10 @@ class SyncEngine:
                        progress: ProgressCallback) -> None:
         """Read-only preflight shared by single-vault and batch execution."""
         _cancelled(cancel)
-        if not plan.can_execute or not plan.context.get("validated"):
+        candidate = self._execution_candidate is plan
+        if candidate:
+            self._execution_candidate = None
+        if not plan.can_execute or not (plan.context.get("validated") or candidate):
             raise SyncError("当前预览存在错误或不完整，请重新分析差异。")
         context = plan.context
         if ((plan.source, plan.target, plan.pair_id, plan.mode)
@@ -1199,10 +1189,17 @@ class SyncEngine:
         revalidate_roots(context)
         for key, side, label in (("source", "源端", "源"), ("target", "目标端", "目标")):
             root = getattr(plan, key)
-            _require_manifest(context[key + "_entries"],
-                              _scan_side("preflight_" + key, root, cancel, progress, mode=plan.mode)[0],
+            entries, excluded = _scan_side("preflight_" + key, root, cancel, progress, mode=plan.mode)
+            _require_manifest(context[key + "_entries"], entries,
                               root=root, side=side,
                               message=f"{label}目录在预览后发生变化，请重新分析差异。")
+            if key == "target" and excluded:
+                protected = _protected_directory_keys(excluded)
+                if any(item.action in ("rename", "rmdir") and _key(item.relative_path) in protected
+                       for item in plan.items):
+                    raise SyncError("预览中将改名或删除的目标目录现含视频，请重新分析差异。")
+        if candidate:
+            plan.context["validated"] = True
 
     def validate_plan(self, plan: SyncPlan, *, cancel: threading.Event | None = None,
                       progress: ProgressCallback = None) -> None:
@@ -1238,8 +1235,10 @@ class SyncEngine:
             return result
         store: BaselineStore | None = None
         pinned = ExitStack()
+        preflight_complete = False
         try:
             self._validate_plan(plan, cancel, progress)
+            preflight_complete = True
             context = plan.context
             if create_only:
                 self.require_new_target(plan)
@@ -1252,10 +1251,12 @@ class SyncEngine:
             expected_targets = {_key(path): state for path, state in context["target_entries"].items()}
             self._execution_target_states = expected_targets
             deletions = self._recover_temps(plan, store, deletions, expected_targets, result, cancel, progress)
-            if plan.bytes_to_copy:
+            copy_items = [item for item in plan.items if item.action in ("add", "update")]
+            total_copy_bytes = sum(item.size for item in copy_items)
+            if total_copy_bytes:
                 free = shutil.disk_usage(native(context["target_anchor"])).free
-                if free < plan.bytes_to_copy:
-                    raise SyncError(f"目标磁盘空间不足：需要 {plan.bytes_to_copy:,} 字节，可用 {free:,} 字节。")
+                if free < total_copy_bytes:
+                    raise SyncError(f"目标磁盘空间不足：需要 {total_copy_bytes:,} 字节，可用 {free:,} 字节。")
             _cancelled(cancel)
             if context["target_root"] is None:
                 revalidate_roots(context)
@@ -1287,10 +1288,6 @@ class SyncEngine:
                         os.mkdir(native(directory))
                 count("created_directories")
                 expected_targets[_key(item.relative_path)] = snapshot(directory)
-            copy_items = [
-                item for item in plan.items if item.action in ("add", "update")
-            ]
-            total_copy_bytes = sum(item.size for item in copy_items)
             # The scans above can be long. Establish a fresh write-phase volume
             # and root checkpoint before the bounded copy loop starts.
             revalidate_roots(context, target_root=target_root)
@@ -1387,12 +1384,13 @@ class SyncEngine:
                         copy_pool.shutdown(wait=True, cancel_futures=True)
                     for pending in pending_copies:
                         self._cleanup_pending_copy(pending, store)
-            result.skipped_files = plan.counts["skip"]
+            counts = plan.counts
+            result.skipped_files = counts["skip"]
             _cancelled(cancel)
             # A case-only rename retains content identity. Update its own and
             # descendant skip baselines before the final filesystem barrier so
             # a no-deletion run is still checked at the last meaningful step.
-            if plan.counts.get("rename", 0):
+            if counts["rename"]:
                 baselines = store.records(plan.pair_id)
                 for item in (item for item in plan.items if item.action == "skip"):
                     record = baselines.get(item.relative_path)
@@ -1456,7 +1454,7 @@ class SyncEngine:
                             relative_path=relative,
                             message="已删除目标多余项目",
                             completed_bytes=result.copied_bytes,
-                            total_bytes=plan.bytes_to_copy,
+                            total_bytes=total_copy_bytes,
                             completed_files=result.deleted_files + result.deleted_dirs,
                             total_files=len(deletions),
                         )
@@ -1470,12 +1468,13 @@ class SyncEngine:
                     self._verify_target(plan, expected_targets, cancel)
             result.status = "success"
             _emit(progress, "done", message="镜像同步完成", completed_bytes=result.copied_bytes,
-                  total_bytes=plan.bytes_to_copy)
+                  total_bytes=total_copy_bytes)
         except SyncCancelled as exc:
             result.status = "cancelled"
             result.errors.append(str(exc))
         except (OSError, SyncError, ValueError, sqlite3.Error) as exc:
             result.status = "failed"
+            result.preflight_failed = not preflight_complete
             result.errors.append(str(exc))
         finally:
             pinned.close()

@@ -213,6 +213,36 @@ def test_backup_settings_persist_and_leaving_page_revokes_confirmation(
         dispose(application, window)
 
 
+@pytest.mark.parametrize("direction", ["to_local", "to_portable"])
+def test_reviewed_backup_applies_visible_changes_without_dialog(application, tmp_path, direction):
+    local, portable = tmp_path / "local", tmp_path / "portable"
+    local.mkdir()
+    portable.mkdir()
+    src, dst = (portable, local) if direction == "to_local" else (local, portable)
+    put(src, "note.md", b"new")
+    put(dst, "old.md", b"old")
+    video = put(dst, "keep.mp4", b"video")
+    window = MainWindow(tmp_path / "state")
+    try:
+        window._show_page("vault_backup")
+        page = window.pages["vault_backup"]
+        page.local_picker.set_value(str(local))
+        page.portable_picker.set_value(str(portable))
+        page.set_direction(direction)
+        page.deep_button.click()
+        wait_until(application, lambda: not window.busy)
+        assert page.plan.counts["exclude"] == 1
+        assert (dst / "old.md").exists()
+        page.execute_button.click()
+        wait_until(application, lambda: not window.busy)
+        assert page.last_result.status == "success"
+        assert (dst / "note.md").read_bytes() == b"new"
+        assert not (dst / "old.md").exists()
+        assert video.read_bytes() == b"video"
+    finally:
+        dispose(application, window)
+
+
 def test_empty_non_video_source_has_one_confirmation_and_preserves_videos(application, tmp_path):
     local, portable = tmp_path / "local", tmp_path / "portable"
     local.mkdir()
@@ -226,6 +256,8 @@ def test_empty_non_video_source_has_one_confirmation_and_preserves_videos(applic
         page = window.pages["vault_backup"]
         page.local_picker.set_value(str(local))
         page.portable_picker.set_value(str(portable))
+        page.analyze_button.click()
+        wait_until(application, lambda: not window.busy)
         page.execute_button.click()
         dialog = wait_for_confirmation(application, window)
         buttons = {button.text(): button for button in dialog.findChild(QDialogButtonBox).buttons()}

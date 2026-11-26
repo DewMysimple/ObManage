@@ -241,15 +241,22 @@ def test_endpoint_edit_revokes_confirmation(application, directional_window, cha
     assert list(local.iterdir()) == []
 
 
-def test_manual_execution_requires_acknowledgment_even_when_called_directly(application, directional_window):
+def test_stale_preview_stops_and_next_direct_sync_requires_confirmation(application, directional_window):
     widget, local, portable = directional_window
     (portable / "最新.md").write_text("便携来源", encoding="utf-8")
     (local / "应该删除.md").write_text("旧的本机副本", encoding="utf-8")
-    before_local, before_portable = snapshot(local), snapshot(portable)
+    before_portable = snapshot(portable)
     widget.set_direction("to_local")
     widget.analyze()
     wait_for_idle(application, widget)
     assert widget.sync_button.isEnabled()
+    (local / "预览后新增.md").write_bytes(b"keep")
+    before_local = snapshot(local)
+    widget.start_sync()
+    wait_for_idle(application, widget)
+    assert widget.last_result.preflight_failed
+    assert snapshot(local) == before_local
+    assert snapshot(portable) == before_portable
     widget.start_sync()
     dialog = wait_for_confirmation(application, widget)
     assert snapshot(local) == before_local
@@ -268,6 +275,20 @@ def test_manual_execution_requires_acknowledgment_even_when_called_directly(appl
     assert widget.last_result.status == "failed"
     assert snapshot(local) == expected_local
     assert snapshot(portable) == before_portable
+
+
+def test_leaving_mirror_discards_reviewed_plan(application, directional_window):
+    widget, local, portable = directional_window
+    widget.set_direction("to_local")
+    (portable / "新笔记.md").write_bytes(b"new")
+    analyze_changes(application, widget)
+    widget._show_page("statistics")
+    widget._show_page("mirror")
+    widget.start_sync()
+    dialog = wait_for_confirmation(application, widget)
+    assert not (local / "新笔记.md").exists()
+    dialog.reject()
+    wait_for_idle(application, widget)
 
 
 def test_busy_operation_cannot_change_direction(application, directional_window, monkeypatch):

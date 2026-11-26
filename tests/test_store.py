@@ -21,6 +21,23 @@ def file_state(marker: int) -> dict:
     }
 
 
+def test_reset_pair_removes_all_spellings_and_preserves_other_profiles_and_temp_ownership(tmp_path):
+    store = BaselineStore(tmp_path)
+    try:
+        state = file_state(1)
+        for pair in ("forward", "reverse", "no_video"):
+            store.save(pair, "Note.md", state, state, "old")
+        store.register_temp("forward", "staging.tmp", ("file", 1, 2))
+        store.reset_pair("forward", "reverse")
+        assert store.records("forward") == store.records("reverse") == {}
+        assert store.records("no_video")["Note.md"][2] == "old"
+        assert store.temps("forward") == [("staging.tmp", ("file", 1, 2))]
+        store.save("forward", "note.md", state, state, "new")
+        assert store.records("forward") == {"note.md": (state, state, "new")}
+    finally:
+        store.close()
+
+
 def test_existing_five_column_database_remains_compatible(tmp_path):
     state_dir = tmp_path / "state"
     state_dir.mkdir()
