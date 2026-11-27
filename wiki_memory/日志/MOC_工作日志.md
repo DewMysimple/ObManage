@@ -15,6 +15,7 @@ supersedes: null
 
 | 时间 | 类型 | 目标 | 状态 | 主题 | 日志 |
 | --- | --- | --- | --- | --- | --- |
+| 2026-11-27 | feature | - | archived | realtime-local-to-portable | [镜像与备份实时同步](./2026-11-27-镜像与备份实时同步.md) |
 | 2026-11-27 | feature | - | archived | exfat-source-revalidation | [exFAT 移动盘同步按变化复核](./2026-11-27-exFAT移动盘同步按变化复核.md) |
 | 2026-11-26 | feature | - | archived | reviewed-sync-inventory-reuse | [预览复用与同步扫描优化](./2026-11-26-预览复用与同步扫描优化.md) |
 | 2026-11-26 | feature | - | archived | mirror-inventory-passes | [镜像逐阶段遍历与删除复核合并](./2026-11-26-镜像逐阶段遍历与删除复核合并.md) |

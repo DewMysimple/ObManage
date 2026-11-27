@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import ctypes
+from ctypes import wintypes
 import ntpath
 import os
 import threading
@@ -74,6 +76,8 @@ from .pages.icons import action_icon
 from .pages.incremental import IncrementalPage
 from .pages.distribution import ComSyncPage
 from .pages.registry import FEATURES
+from .pages.realtime import RealtimePanel
+from .realtime import automatic_overlap
 from .pages.statistics import StatisticsPage
 from .pages.trash_cleanup import TrashCleanupPage
 from .pages.transactions import TransactionsPage
@@ -499,6 +503,8 @@ class MainWindow(QMainWindow):
         self._log_entries = []
         self._log_issues = []
         self._next_backup_maintenance = time.monotonic()
+        self.live_panels: dict[str, RealtimePanel] = {}
+        self._last_live_page = ""
         self._load_log()
 
         self.setWindowTitle("ObManage · Obsidian 仓库管理")
@@ -515,7 +521,7 @@ class MainWindow(QMainWindow):
         self._refresh_schedule_controls()
         self._refresh_actions()
         self._timer = QTimer(self)
-        self._timer.setInterval(1000)
+        self._timer.setInterval(500 if any(p.enabled for p in self.live_panels.values()) else 1000)
         self._timer.timeout.connect(self._timer_tick)
         self._timer.start()
         self._save_timer = QTimer(self)
@@ -849,6 +855,8 @@ class MainWindow(QMainWindow):
         self.next_run_label = QLabel()
         self.next_run_label.setObjectName("Muted")
         schedule_layout.addWidget(self.next_run_label)
+        self.live_panels["mirror"] = RealtimePanel(self, "mirror")
+        schedule_layout.addWidget(self.live_panels["mirror"])
         layout.addWidget(schedule_panel)
 
         progress_layout = QVBoxLayout()
@@ -963,6 +971,11 @@ class MainWindow(QMainWindow):
                     lambda operation, current=selection: self._start_feature_task(current, operation))
                 selection.status_changed.connect(page.set_status)
             self.pages[feature.key] = page
+            if feature.key == "vault_backup":
+                live = RealtimePanel(self, feature.key)
+                self.live_panels[feature.key] = live
+                page.body.addWidget(live)
+                page.settings_changed.connect(live.inputs_changed)
             page_scroll = QScrollArea()
             page_scroll.setObjectName(f"{feature.key}_scroll")
             page_scroll.setWidgetResizable(True)
@@ -996,6 +1009,10 @@ class MainWindow(QMainWindow):
         if page is None:
             return
         current = self.pages.get(self._current_page_key)
+        if (key != self._current_page_key and isinstance(self._feature_page, RealtimePanel)
+                and self._feature_worker.confirmation_exchange is not None):
+            self._feature_worker.request_cancel()
+            self._dismiss_worker_confirmation()
         if current is self.mirror_page and page is not current:
             if self._reviewed_plan is not None or self._preview_request is not None:
                 self._invalidate_plan()
@@ -1103,7 +1120,8 @@ class MainWindow(QMainWindow):
             page.refresh_actions()
             return
         if not isinstance(page, VaultSelection) and page._task_kind in {
-                "execute", "sync", "archive", "clear", "clear_all", "finalize", "resolve", "restore", "rollback"}:
+                "execute", "sync", "archive", "clear", "clear_all", "finalize", "resolve", "restore", "rollback",
+                "实时同步", "开启实时同步"}:
             # A failed or cancelled writer can still have changed the filesystem.
             self._catalog_display.invalidate()
         worker = FeatureWorker(operation, cancellable=page.task_cancellable())
@@ -1116,7 +1134,8 @@ class MainWindow(QMainWindow):
         self._feature_worker = worker
         self._feature_page = page
         self._feature_outcome = None
-        feature = next((key for key, value in self.pages.items() if value is page), self._current_page_key)
+        feature = (page.page_key if isinstance(page, RealtimePanel) else
+                   next((key for key, value in self.pages.items() if value is page), self._current_page_key))
         kind = "选择仓库" if isinstance(page, VaultSelection) else page._task_kind
         self._begin_log_task(feature, kind)
         self._refresh_actions()
@@ -1130,13 +1149,16 @@ class MainWindow(QMainWindow):
     @Slot(object)
     def _show_worker_confirmation(self, pending) -> None:
         worker = self.sender()
-        if self._exit_requested or worker is None:
+        if (self._exit_requested or worker is None or
+                (not self.isVisible() and any(p.enabled for p in self.live_panels.values()))):
             pending.resolve(False)
             return
         try:
             if worker is self._feature_worker:
+                owner = (self.pages.get(self._feature_page.page_key) if isinstance(self._feature_page, RealtimePanel)
+                         else self._feature_page)
                 valid = (
-                    self.pages.get(self._current_page_key) is self._feature_page
+                    self.pages.get(self._current_page_key) is owner
                     and not worker.cancel_event.is_set()
                     and self._feature_page.task_confirmation(pending.prompt)
                 )
@@ -1209,8 +1231,10 @@ class MainWindow(QMainWindow):
             elif status == "cancelled":
                 self._log("管理任务已取消。", level="cancelled")
         self._end_log_task(log_context, outcome)
-        if not isinstance(page, VaultSelection) and page is not transactions:
+        if not isinstance(page, (VaultSelection, RealtimePanel)) and page is not transactions:
             transactions.refresh_records()
+        if page is self.pages.get("vault_backup") and kind == "sync":
+            self.live_panels["vault_backup"].check_now()
         if ((page is self.pages["comsync"] and kind in {"execute", "sync"})
                 or (page is transactions and kind == "rollback")):
             self._next_backup_maintenance = time.monotonic()
@@ -1303,6 +1327,7 @@ class MainWindow(QMainWindow):
             return
         self.settings.set_endpoints(self.local_edit.text().strip(), self.portable_combo.currentText().strip())
         self.settings.set_direction(direction)
+        self.live_panels["mirror"].inputs_changed()
         self.local_selection.dismiss()
         self.portable_selection.dismiss()
         self._invalidate_plan()
@@ -1357,6 +1382,7 @@ class MainWindow(QMainWindow):
         self._invalidate_plan()
         was_enabled = self.schedule_toggle.isChecked()
         self.settings.set_endpoints(self.local_edit.text().strip(), self.portable_combo.currentText().strip())
+        self.live_panels["mirror"].inputs_changed()
         self.pause_schedule()
         self._refresh_direction_text()
         self.paths_panel.setToolTip(
@@ -1434,11 +1460,15 @@ class MainWindow(QMainWindow):
             return
         if self.schedule_toggle.isChecked():
             source, target = self._paths()
-            if not source or not target:
+            conflict = source and target and any(p.enabled and automatic_overlap(
+                source, target, p.config["source"], p.active_target or p.config["target"])
+                for p in self.live_panels.values())
+            if conflict or not source or not target:
                 blocker = QSignalBlocker(self.schedule_toggle)
                 self.schedule_toggle.setChecked(False)
                 del blocker
-                self._set_status("请先填写本机仓库和移动硬盘仓库的位置。", "warning")
+                self._set_status("此范围正在实时同步，请先暂停实时同步。" if conflict else
+                                 "请先填写本机仓库和移动硬盘仓库的位置。", "warning")
             else:
                 self.settings.bound_source = source
                 self.settings.bound_target = target
@@ -1469,9 +1499,12 @@ class MainWindow(QMainWindow):
             self.paths_panel.setToolTip("定时已暂停。手动同步会按上方方向更新接收端。")
 
     def _refresh_schedule_controls(self) -> None:
+        live = self.live_panels["mirror"].enabled
         interval = self.schedule_mode.currentData() == "interval"
-        self.interval_spin.setVisible(interval)
-        self.daily_time.setVisible(not interval)
+        self.schedule_mode.setVisible(not live)
+        self.interval_spin.setVisible(interval and not live)
+        self.daily_time.setVisible(not interval and not live)
+        self.next_run_label.setVisible(not live)
         enabled = self.schedule_toggle.isChecked()
         next_run = self.scheduler.next_run
         if enabled and next_run:
@@ -1479,14 +1512,19 @@ class MainWindow(QMainWindow):
         else:
             self.next_run_label.setText("已关闭 · 手动同步")
         self.tray_pause_action.setEnabled(enabled and not self._exit_requested)
-        self.tray.setToolTip(
-            f"ObManage · 下次同步 {next_run:%H:%M}" if enabled and next_run else "ObManage · 手动同步"
-        )
+        tips = [f"{'镜像' if key == 'mirror' else '备份'}实时 · {p.summary}"
+                for key, p in self.live_panels.items() if p.enabled]
+        if enabled and next_run:
+            tips.append(f"下次定时同步 {next_run:%H:%M}")
+        self.tray.setToolTip("ObManage · " + ("\n".join(tips) or "手动同步"))
 
     @Slot()
     def _timer_tick(self) -> None:
         if self._exit_requested:
             return
+        now = time.monotonic()
+        for panel in self.live_panels.values():
+            panel.observe(now)
         was_due = self.scheduler.next_run is not None and datetime.now() >= self.scheduler.next_run
         recovery_pending = bool(self._recovery_page_keys())
         occupied = self.busy or recovery_pending
@@ -1501,6 +1539,13 @@ class MainWindow(QMainWindow):
                 self._set_status("同步位置已变更，定时已暂停。", "warning")
             else:
                 self.analyze(scheduled=True)
+        if (not self.busy and not recovery_pending and QApplication.activeModalWidget() is None
+                and any(p.enabled and p.connected and p.pending for p in self.live_panels.values())
+                and not self._state_location_error()):
+            for key in sorted(self.live_panels, key=lambda k: k == self._last_live_page):
+                if self.live_panels[key].dispatch(now):
+                    self._last_live_page = key
+                    break
         self._refresh_schedule_controls()
         self._maybe_maintain_backups()
 
@@ -1566,6 +1611,12 @@ class MainWindow(QMainWindow):
         self.nav_cancel_button.setVisible(cancellable)
         self.nav_cancel_button.setEnabled(cancellable and not cancel_sent and not self._exit_requested)
         self.tray_sync_action.setEnabled(available and state_location_safe)
+        for panel in self.live_panels.values():
+            panel.refresh_actions()
+        if hasattr(self, "_timer"):
+            interval = 500 if any(p.enabled for p in self.live_panels.values()) else 1000
+            if self._timer.interval() != interval:
+                self._timer.setInterval(interval)
         for key, page in self.pages.items():
             if key != "mirror" and isinstance(page, FeaturePage):
                 page.set_global_busy(self.busy or self._exit_requested)
@@ -1601,6 +1652,13 @@ class MainWindow(QMainWindow):
             not self.settings.schedule_enabled
             or (source, target) != (self.settings.bound_source, self.settings.bound_target)
         ):
+            return
+        if intent is SyncIntent.SCHEDULED and any(
+                panel.enabled and automatic_overlap(source, target, panel.config["source"],
+                                                    panel.active_target or panel.config["target"])
+                for panel in self.live_panels.values()):
+            self.pause_schedule()
+            self._set_status("定时范围与实时同步重叠，定时已暂停。", "warning")
             return
         reviewed = self._reviewed_plan if intent is SyncIntent.MANUAL else None
         self._reviewed_plan = None
@@ -1795,6 +1853,7 @@ class MainWindow(QMainWindow):
             self.filter_tabs.setTabText(index, f"{name} {total:,}")
 
     def _accept_result(self, result: SyncResult, request: SyncRequest) -> None:
+        self.live_panels["mirror"].check_now()
         self.last_result = result
         self.plan = None  # A result never leaves an executable stale preview behind.
         source_name, target_name = request.source_name, request.target_name
@@ -2055,6 +2114,8 @@ class MainWindow(QMainWindow):
             return
         self._exit_requested = True
         self._timer.stop()
+        for panel in self.live_panels.values():
+            panel.close_watch()
         self._save_timer.stop()
         if self.busy:
             if self._feature_worker is not None:
@@ -2076,6 +2137,18 @@ class MainWindow(QMainWindow):
         self.hide()
         QApplication.instance().quit()
 
+    def nativeEvent(self, event_type, message):
+        if os.name == "nt" and any(p.enabled for p in getattr(self, "live_panels", {}).values()):
+            msg = wintypes.MSG.from_address(int(message))
+            device = msg.message == 0x219 and msg.wParam in (7, 0x8000, 0x8004)
+            resume = msg.message == 0x218 and msg.wParam in (7, 18)
+            if device or resume:
+                for panel in self.live_panels.values():
+                    if panel.enabled:
+                        panel.next_probe = 0
+                        panel.device_changed = True
+        return super().nativeEvent(event_type, message)
+
     def closeEvent(self, event: Any) -> None:
         if self._exit_requested:
             if self.busy:
@@ -2085,16 +2158,21 @@ class MainWindow(QMainWindow):
             return
         if any(getattr(worker, "confirmation_exchange", None) is not None
                for worker in (self._worker, self._feature_worker)):
-            event.ignore()
-            self.request_exit()
-            return
-        if self.busy or self.schedule_toggle.isChecked():
+            if any(p.enabled for p in self.live_panels.values()):
+                if self._worker_confirmation_dialog is not None:
+                    self.cancel_operation()
+                    self._dismiss_worker_confirmation()
+            else:
+                event.ignore()
+                self.request_exit()
+                return
+        if self.busy or self.schedule_toggle.isChecked() or any(p.enabled for p in self.live_panels.values()):
             event.ignore()
             self._persist()
             if self.tray.isVisible():
                 self.hide()
                 if not self._tray_close_notified:
-                    self._notify("ObManage 已进入托盘", "后台任务与定时同步将继续运行。需要停止时，请从托盘菜单选择「退出」。")
+                    self._notify("ObManage 已进入托盘", "后台同步继续运行。从托盘菜单选择「退出」可停止。")
                     self._tray_close_notified = True
             else:
                 self._set_status("系统托盘不可用，窗口保留以便管理后台任务。", "warning")

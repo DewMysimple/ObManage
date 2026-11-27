@@ -1116,6 +1116,21 @@ class SyncEngine:
         except (OSError, SyncError, sqlite3.Error):
             pass
 
+    def copy_observed_file(self, plan, item, store, cancel, progress, result,
+                           check_target, source_digest):
+        """Commit one live change with the same registered staging and readback as mirror."""
+        pending = self._start_copy(plan, item, store, cancel, lambda _: revalidate_roots(plan.context), None)
+        try:
+            totals = dict(total_copy_bytes=result.copied_bytes + item.size,
+                          total_copy_files=result.copied_files + 1)
+            self._await_copy_temp(pending, cancel, progress, result, **totals)
+            if pending.digest != source_digest:
+                raise SyncError(f"暂存期间来源内容已改变：{item.relative_path}")
+            return self._verify_commit_copy(plan, pending, store, cancel, progress, result,
+                                            lambda _: check_target(), **totals)
+        finally:
+            self._cleanup_pending_copy(pending, store)
+
     def _verify_target(self, plan: SyncPlan, expected: dict[str, dict],
                        cancel: threading.Event | None) -> None:
         scanned, _excluded = _scan(
@@ -1563,6 +1578,7 @@ class SyncEngine:
                     with phase("post_delete_target"):
                         self._verify_target(plan, expected_targets, cancel)
             result.status = "success"
+            result.target_root = target_root
             _emit(progress, "done", message="镜像同步完成", completed_bytes=result.copied_bytes,
                   total_bytes=total_copy_bytes)
         except SyncCancelled as exc:

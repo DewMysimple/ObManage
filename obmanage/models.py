@@ -80,3 +80,4 @@ class SyncResult:
     duration_seconds: float = 0.0
     renamed_items: int = 0
     preflight_failed: bool = False
+    target_root: dict | None = field(default=None, repr=False)
